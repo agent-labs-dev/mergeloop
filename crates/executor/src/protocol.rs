@@ -155,6 +155,10 @@ pub struct ApiAccess {
     pub base_url: String,
     /// Good until the job ends.
     pub token: String,
+    /// The proxy calls the model on a ChatGPT plan, which bills no tokens, so the run costs
+    /// nothing we can price.
+    #[serde(default)]
+    pub on_plan: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

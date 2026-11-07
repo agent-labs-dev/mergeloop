@@ -49,7 +49,8 @@ pub struct Spend {
     /// The conflicted files, comma-separated. Empty for a fix.
     pub files: String,
     pub turns: u32,
-    /// `None` when the agent's CLI did not say.
+    /// `None` when we have no price for its model, it ran on a ChatGPT plan, or it is from
+    /// before Codex runs were priced.
     pub cost_usd: Option<f64>,
     /// `None` in events from before the job named them.
     pub model: Option<String>,

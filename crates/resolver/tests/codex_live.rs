@@ -53,6 +53,7 @@ async fn codex_resolves_a_rename_conflict() {
         effort: "medium".into(),
         timeout: Duration::from_secs(300),
         max_turns: 20,
+        on_plan: false,
     };
     let files = vec!["greet.py".to_owned()];
     let outcome = resolver

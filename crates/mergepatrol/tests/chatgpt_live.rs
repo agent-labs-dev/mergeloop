@@ -111,6 +111,7 @@ async fn codex_resolves_a_conflict_on_a_chatgpt_plan() {
         effort: "low".into(),
         timeout: Duration::from_secs(300),
         max_turns: 20,
+        on_plan: true,
     };
     let files = vec!["greet.py".to_owned()];
     let transcript = wt.join("transcript.jsonl");

@@ -121,7 +121,8 @@ pub struct Totals {
     pub failed: usize,
     /// What the priced cases cost.
     pub cost_usd: f64,
-    /// The cases without a cost, such as Codex's, which reports tokens: `cost_usd` leaves them out.
+    /// The cases without a cost, such as one on a model we have no price for: `cost_usd` leaves
+    /// them out.
     pub unpriced: usize,
 }
 

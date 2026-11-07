@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use mergepatrol_core::Provider;
+use mergepatrol_core::{Provider, Usage};
 use serde_json::Value;
 
 use crate::cli::{self, Ended};
@@ -29,6 +29,8 @@ pub struct CodexResolver {
     pub timeout: Duration,
     /// Codex has no turn limit, so we count the agent's messages, commands and edits.
     pub max_turns: u32,
+    /// On a ChatGPT plan, which bills no tokens: its runs have no cost.
+    pub on_plan: bool,
 }
 
 impl CodexResolver {
@@ -79,7 +81,8 @@ impl CodexResolver {
             run.on(event, self.max_turns)
         })
         .await?;
-        Ok(run.end(ended))
+        let priced = (!self.on_plan).then_some(self.model.as_str());
+        Ok(run.end(ended, priced))
     }
 }
 
@@ -91,6 +94,8 @@ struct Run {
     last_message: String,
     completed: bool,
     failed: Option<String>,
+    /// From the turn's end, so `None` for a run that broke before it.
+    usage: Option<Usage>,
 }
 
 impl Run {
@@ -111,7 +116,19 @@ impl Run {
                     bail!("Codex went over {max_turns} turns");
                 }
             }
-            Some("turn.completed") => self.completed = true,
+            Some("turn.completed") => {
+                self.completed = true;
+                let u = &event["usage"];
+                let n = |k: &str| u[k].as_u64().unwrap_or(0);
+                // `input_tokens` counts the cache's reads and writes too, and `output_tokens` the
+                // reasoning. Codex sets no cache TTL, so its writes are OpenAI's default 30-minute.
+                let (read, write) = (n("cached_input_tokens"), n("cache_write_input_tokens"));
+                let usage = self.usage.get_or_insert_default();
+                usage.input += n("input_tokens").saturating_sub(read + write);
+                usage.cache_read += read;
+                usage.cache_write += write;
+                usage.output += n("output_tokens");
+            }
             Some("turn.failed") => {
                 self.failed = Some(
                     event["error"]["message"]
@@ -125,11 +142,12 @@ impl Run {
         Ok(())
     }
 
-    fn end(self, ended: Ended) -> Resolution {
+    /// `priced` is the model to price the run's tokens on, `None` when they bill nothing.
+    fn end(self, ended: Ended, priced: Option<&str>) -> Resolution {
         Resolution {
             turns: self.turns,
             // Codex reports tokens, not what they cost.
-            cost_usd: None,
+            cost_usd: self.usage.zip(priced).and_then(|(u, m)| u.cost_usd(m)),
             outcome: self.outcome(ended),
             text: self.last_message,
         }
@@ -203,6 +221,7 @@ mod tests {
             effort: "high".into(),
             timeout: Duration::from_secs(1),
             max_turns: 3,
+            on_plan: false,
         }
     }
 
@@ -281,11 +300,38 @@ mod tests {
         ] {
             run.on(&e, 10).unwrap();
         }
-        let r = run.end(ok(""));
+        let r = run.end(ok(""), Some("gpt-6.1-sol"));
         assert_eq!(
             (r.turns, r.cost_usd, r.outcome),
-            (3, None, Outcome::Resolved)
+            (3, Some(0.0), Outcome::Resolved)
         );
+    }
+
+    #[test]
+    fn a_run_is_priced_from_its_tokens() {
+        // A real review's usage: `input_tokens` counts the cached and the written ones.
+        let usage = json!({ "type": "turn.completed", "usage": {
+            "input_tokens": 620813, "cached_input_tokens": 560591,
+            "cache_write_input_tokens": 60177, "output_tokens": 4391,
+            "reasoning_output_tokens": 930,
+        }});
+        let mut run = Run::default();
+        run.on(&usage, 10).unwrap();
+        // 45 input at $2, 560,591 read at $0.10, 60,177 written at $2.50, 4,391 out at $10.
+        let cost = run.end(ok(""), Some("gpt-6.1-sol")).cost_usd.unwrap();
+        assert!((cost - 0.2505016).abs() < 1e-9, "{cost}");
+
+        let mut run = Run::default();
+        run.on(&usage, 10).unwrap();
+        assert_eq!(
+            run.end(ok(""), Some("some/openrouter-model")).cost_usd,
+            None
+        );
+
+        // On a ChatGPT plan.
+        let mut run = Run::default();
+        run.on(&usage, 10).unwrap();
+        assert_eq!(run.end(ok(""), None).cost_usd, None);
     }
 
     #[test]
@@ -299,7 +345,7 @@ mod tests {
         .unwrap();
         run.on(&json!({ "type": "turn.completed" }), 10).unwrap();
         assert_eq!(
-            run.end(ok("")).outcome,
+            run.end(ok(""), Some("gpt-6.1-sol")).outcome,
             Outcome::GaveUp("both sides rename it".into())
         );
     }
@@ -311,7 +357,7 @@ mod tests {
             run.on(&item("command_execution", ""), 3).unwrap();
         }
         let why = run.on(&item("command_execution", ""), 3).unwrap_err();
-        let r = run.end(Ended::Stopped(format!("{why:#}")));
+        let r = run.end(Ended::Stopped(format!("{why:#}")), Some("gpt-6.1-sol"));
         assert_eq!(r.turns, 4);
         assert_eq!(r.outcome, Outcome::Failed("Codex went over 3 turns".into()));
     }
@@ -325,11 +371,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            run.end(ok("")).outcome,
+            run.end(ok(""), Some("gpt-6.1-sol")).outcome,
             Outcome::Failed("codex: 401 Unauthorized".into())
         );
 
-        let Outcome::Failed(why) = Run::default().end(ok("boom")).outcome else {
+        let unfinished = Run::default().end(ok("boom"), Some("gpt-6.1-sol"));
+        assert_eq!(
+            unfinished.cost_usd, None,
+            "what it spent is unknown, not $0"
+        );
+        let Outcome::Failed(why) = unfinished.outcome else {
             panic!("an unfinished run failed");
         };
         assert!(why.contains("no result: boom"), "{why}");

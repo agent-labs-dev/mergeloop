@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use mergepatrol_core::Usage;
 use serde_json::Value;
 
 use crate::cli::{self, Ended};
@@ -105,7 +106,7 @@ impl ClaudeResolver {
         .await?;
         Ok(Resolution {
             turns,
-            cost_usd: result.as_ref().and_then(|r| r["total_cost_usd"].as_f64()),
+            cost_usd: result.as_ref().and_then(cost_usd),
             text: result
                 .as_ref()
                 .and_then(|r| r["result"].as_str())
@@ -114,6 +115,28 @@ impl ClaudeResolver {
             outcome: outcome(ended, result.as_ref()),
         })
     }
+}
+
+/// What the run cost, from the tokens the `result` event counts per model. `None` when it names a
+/// model we have no price for, or does not split its cache writes by lifetime. The CLI's own
+/// `total_cost_usd` is not used, so a run costs the same by our prices whichever CLI ran it.
+fn cost_usd(result: &Value) -> Option<f64> {
+    let models = result["modelUsage"].as_object().filter(|m| !m.is_empty())?;
+    models.iter().try_fold(0.0, |sum, (name, m)| {
+        let n = |k: &str| m[k].as_u64().unwrap_or(0);
+        let usage = Usage {
+            input: n("inputTokens"),
+            cache_read: n("cacheReadInputTokens"),
+            cache_write: n("cacheCreationEphemeral5mInputTokens"),
+            cache_write_long: n("cacheCreationEphemeral1hInputTokens"),
+            output: n("outputTokens"),
+        };
+        if usage.cache_write + usage.cache_write_long != n("cacheCreationInputTokens") {
+            return None;
+        }
+        let model = m["canonicalModel"].as_str().unwrap_or(name);
+        Some(sum + usage.cost_usd(model)?)
+    })
 }
 
 /// How the run ended, from the CLI's `result` event.
@@ -218,6 +241,53 @@ mod tests {
         assert_eq!(
             outcome(Ended::Stopped("Claude went over 3 turns".into()), None),
             Outcome::Failed("Claude went over 3 turns".into())
+        );
+    }
+
+    /// A `result` event's `modelUsage` entry, as Claude Code 2 writes it.
+    fn model_usage(input: u64, read: u64, write_5m: u64, write_1h: u64, output: u64) -> Value {
+        serde_json::json!({
+            "inputTokens": input, "outputTokens": output, "cacheReadInputTokens": read,
+            "cacheCreationInputTokens": write_5m + write_1h,
+            "cacheCreationEphemeral5mInputTokens": write_5m,
+            "cacheCreationEphemeral1hInputTokens": write_1h,
+            "costUSD": 99.0,
+        })
+    }
+
+    #[test]
+    fn a_run_is_priced_from_its_tokens_per_model() {
+        let result = serde_json::json!({ "type": "result", "total_cost_usd": 99.0, "modelUsage": {
+            // A real run, which the CLI priced at $0.00360255.
+            "claude-haiku-5-5": model_usage(1184, 62225, 0, 14067, 97),
+            // 1M input at $4, 1M 5-minute writes at $5.
+            "claude-opus-5-5": model_usage(1_000_000, 0, 1_000_000, 0, 0),
+        }});
+        let cost = cost_usd(&result).unwrap();
+        assert!((cost - 9.00360255).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn a_run_we_cannot_price_has_no_cost() {
+        let with = |models: Value| {
+            cost_usd(&serde_json::json!({ "total_cost_usd": 1.0, "modelUsage": models }))
+        };
+        assert_eq!(with(serde_json::json!({})), None);
+        assert_eq!(
+            cost_usd(&serde_json::json!({ "total_cost_usd": 1.0 })),
+            None
+        );
+        let opus = model_usage(1, 0, 0, 0, 1);
+        let other = model_usage(1, 0, 0, 0, 1);
+        assert_eq!(
+            with(serde_json::json!({ "claude-opus-5-5": opus, "claude-unknown-9": other })),
+            None
+        );
+        let mut unsplit = model_usage(1, 0, 0, 5, 1);
+        unsplit["cacheCreationEphemeral1hInputTokens"] = serde_json::json!(null);
+        assert_eq!(
+            with(serde_json::json!({ "claude-opus-5-5": unsplit })),
+            None
         );
     }
 

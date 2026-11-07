@@ -468,7 +468,8 @@ pub struct LlmRunsView {
     pub turns: u32,
     /// Of the runs whose CLI told their cost.
     pub cost_usd: f64,
-    /// The runs whose CLI did not, such as Codex's: `cost_usd` leaves them out.
+    /// The runs without a cost, such as one on a model we have no price for: `cost_usd` leaves
+    /// them out.
     pub unpriced: u32,
 }
 

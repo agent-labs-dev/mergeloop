@@ -282,6 +282,7 @@ fn resolver(spec: &ResolverSpec) -> Box<dyn Resolver> {
             effort: spec.effort.clone(),
             timeout,
             max_turns: spec.max_turns,
+            on_plan: spec.api.as_ref().is_some_and(|a| a.on_plan),
         }),
     }
 }

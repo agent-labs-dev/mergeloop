@@ -6,6 +6,7 @@ mod closing;
 mod hold;
 mod job;
 mod lane;
+mod price;
 mod repo_config;
 mod review;
 mod spend;
@@ -19,6 +20,7 @@ pub use lane::{
     BatchStep, Bisect, BuiltBatch, Candidate, Entry, EntryState, Lane, LaneChange, LayerHead,
     PendingMerge, Person, PrSummary, Review, Stage,
 };
+pub use price::{Price, Usage};
 pub use repo_config::{
     AgentSettings, ConfigPath, ConfigText, DEFAULT_LABEL, EFFORTS, FixCiSettings, LabelSpec,
     Labels, ModelOverrides, REPO_CONFIG_PATH, RepoSettings, TaskModel, WorkspaceDefaults,

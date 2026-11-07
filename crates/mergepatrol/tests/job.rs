@@ -286,7 +286,10 @@ fn with_fake_claude_running(dir: &Path, shell: &str, answer: &str) -> LocalExecu
     std::fs::create_dir(&bin).unwrap();
     let events = [
         serde_json::json!({ "type": "assistant" }),
-        serde_json::json!({ "type": "result", "result": answer, "total_cost_usd": 0.12 }),
+        // 10,000 input at $4 and 4,000 output at $20 per million on Claude Opus 5.5: $0.12.
+        serde_json::json!({ "type": "result", "result": answer, "modelUsage": {
+            "claude-opus-5-5": { "inputTokens": 10_000, "outputTokens": 4_000 },
+        }}),
     ];
     let lines: String = events.iter().map(|e| format!("echo '{e}'\n")).collect();
     let lines = format!("{shell}\n{lines}");
@@ -329,6 +332,7 @@ async fn a_fix_that_fails_still_tells_what_it_spent() {
         spec.resolver.api = Some(ApiAccess {
             base_url: "http://127.0.0.1:9".into(),
             token: "job-token".into(),
+            on_plan: false,
         });
         spec.task = Task::FixChecks {
             failures: vec![CheckFailure {
@@ -369,6 +373,7 @@ async fn a_fix_that_proposes_a_title_says_it_for_the_orchestrator_to_set() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::FixChecks {
         failures: vec![CheckFailure {
@@ -402,6 +407,7 @@ async fn a_rebase_agent_with_a_shell_may_regenerate_but_not_move_head() {
         spec.resolver.api = Some(ApiAccess {
             base_url: "http://127.0.0.1:9".into(),
             token: "job-token".into(),
+            on_plan: false,
         });
         let out = tmp.path().join("out");
         let result = with_fake_claude_running(tmp.path(), shell, "Resolved.")
@@ -444,6 +450,7 @@ async fn fixed_with(shell: &str, answer: &str, verify: &[&str]) -> (String, Stri
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::FixChecks {
         failures: vec![CheckFailure {
@@ -519,6 +526,7 @@ async fn a_fix_on_a_stack_layer_goes_on_top_of_that_layer() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::FixChecks {
         failures: vec![CheckFailure {
@@ -572,6 +580,7 @@ async fn a_review_since_an_approval_names_only_the_queues_commits() {
     spec.resolver.api = Some(mergepatrol_executor::protocol::ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "t".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
@@ -606,6 +615,7 @@ async fn review_prompt_after(
     spec.resolver.api = Some(mergepatrol_executor::protocol::ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "t".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
@@ -702,6 +712,7 @@ async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
@@ -778,6 +789,7 @@ async fn evidence_counts_only_once_the_job_saw_it_fail() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
@@ -858,6 +870,7 @@ async fn a_review_the_agent_cannot_give_fails_and_says_why() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
@@ -1045,6 +1058,7 @@ async fn an_openai_conflict_is_resolved_through_the_proxy() {
     spec.resolver.api = Some(ApiAccess {
         base_url: Api::of(Provider::OpenAi, &spec.resolver.model).base_url(&proxy_url),
         token: granted.token.clone(),
+        on_plan: false,
     });
     let out = tmp.path().join("out");
     let executor = LocalExecutor {
@@ -1248,6 +1262,7 @@ async fn a_merge_that_conflicts_has_the_agent_resolve_it_once() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     let out = tmp.path().join("out");
     let result = with_fake_claude_running(

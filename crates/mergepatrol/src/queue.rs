@@ -22,7 +22,7 @@ use mergepatrol_executor::protocol::{
     ApiAccess, BUNDLE_FILE, JobEvent, JobOutcome, JobSpec, MAX_BUNDLE_BYTES, ResolverSpec, Task,
     Update,
 };
-use mergepatrol_executor::proxy::{Api, ApiProxy, Granted, REQUESTS_PER_JOB};
+use mergepatrol_executor::proxy::{Api, ApiProxy, Credential, Granted, REQUESTS_PER_JOB};
 use mergepatrol_executor::{Executor, TimedOut};
 use mergepatrol_git::{Git, cache_path};
 use mergepatrol_github::{
@@ -3268,18 +3268,20 @@ pub(crate) async fn job_spec(
     let agent = &settings.agent;
     let (provider, model) = agent.model(task.spend_task());
     // A fork PR's job gets no agent: without access, a conflict fails the job.
-    let granted = match pr.is_cross_repository {
+    let credential = match pr.is_cross_repository {
         true => None,
-        false => ctx
-            .chatgpt
-            .credential(
-                &ctx.vault,
-                Scope::Installation(key.installation_id),
-                provider,
-            )
-            .await?
-            .map(|c| ctx.proxy.grant(provider, c, REQUESTS_PER_JOB)),
+        false => {
+            ctx.chatgpt
+                .credential(
+                    &ctx.vault,
+                    Scope::Installation(key.installation_id),
+                    provider,
+                )
+                .await?
+        }
     };
+    let on_plan = matches!(credential, Some(Credential::ChatGpt { .. }));
+    let granted = credential.map(|c| ctx.proxy.grant(provider, c, REQUESTS_PER_JOB));
     let spec = JobSpec {
         repo: key.repo.to_string(),
         clone_url: clone_url(&key.repo),
@@ -3304,6 +3306,7 @@ pub(crate) async fn job_spec(
             api: granted.as_ref().map(|g| ApiAccess {
                 base_url: Api::of(provider, model).base_url(&ctx.config.job_proxy_url),
                 token: g.token.clone(),
+                on_plan,
             }),
             settings_url: (!pr.is_cross_repository).then(|| {
                 let url = ctx.config.public_url.trim_end_matches('/');

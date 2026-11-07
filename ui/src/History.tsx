@@ -814,7 +814,7 @@ const all = (...rs: LlmRunsView[]): LlmRunsView => ({
   unpriced: rs.reduce((t, r) => t + r.unpriced, 0),
 });
 
-/** The known cost: "–" when no run told it, "$1.20+" when only some did, such as Codex's. */
+/** The known cost: "–" when no run had one, "$1.20+" when only some did, such as older Codex runs. */
 const cost = (r: LlmRunsView) =>
   r.unpriced === r.runs ? "–" : `${usd(r.cost_usd)}${r.unpriced > 0 ? "+" : ""}`;
 

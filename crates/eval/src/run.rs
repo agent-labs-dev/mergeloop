@@ -92,6 +92,7 @@ impl Runner {
         let api = ApiAccess {
             base_url: Api::of(*provider, model).base_url(proxy_url),
             token: granted.token.clone(),
+            on_plan: false,
         };
         let out = self.work.join(&case.id);
         eprintln!("{}: reviewing {}#{}", case.id, case.repo, case.pr);
@@ -224,6 +225,7 @@ mod tests {
         ApiAccess {
             base_url: "http://proxy/anthropic".into(),
             token: "job-token".into(),
+            on_plan: false,
         }
     }
 

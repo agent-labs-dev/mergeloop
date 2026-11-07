@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::{StreamExt, stream};
-use mergepatrol_core::{Provider, Spend};
+use mergepatrol_core::{Depth, Provider, Spend};
 use mergepatrol_executor::protocol::{
     ApiAccess, JobOutcome, JobResult, JobSpec, REVIEW_FILE, ResolverSpec, ReviewOutput, Task,
 };
@@ -25,12 +25,15 @@ const MAX_TURNS: u32 = 100;
 /// Longer than the resolver's and its evidence's own limits, as the orchestrator's.
 const JOB_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 
-/// Which agent reviews: what a repo's `agent:` config sets.
+/// Which agent reviews, and how hard: what a repo's `agent:` and `review.depth` config set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub provider: Provider,
     pub model: String,
     pub effort: String,
+    /// A run from before depth was recorded reviewed at the default.
+    #[serde(default)]
+    pub depth: Depth,
 }
 
 /// A run's file: what reviewed, and each case's review.
@@ -135,7 +138,7 @@ pub fn spec(case: &Case, agent: &Agent, api: ApiAccess) -> JobSpec {
             sent_back: Vec::new(),
             since: None,
             reviewed: None,
-            depth: mergepatrol_core::Depth::Standard,
+            depth: agent.depth,
         },
         update: Default::default(),
     }
@@ -208,11 +211,12 @@ mod tests {
         .unwrap()
     }
 
-    fn agent() -> Agent {
+    pub(crate) fn agent() -> Agent {
         Agent {
             provider: Provider::Anthropic,
             model: "m".into(),
             effort: "high".into(),
+            depth: Depth::Deep,
         }
     }
 
@@ -253,7 +257,7 @@ mod tests {
                 sent_back: Vec::new(),
                 since: None,
                 reviewed: None,
-                depth: mergepatrol_core::Depth::Standard,
+                depth: Depth::Deep,
             }
         );
         let r = s.resolver;
@@ -365,11 +369,7 @@ mod runner_tests {
         let work = dir.path().join("work");
         let runner = Runner {
             job_bin,
-            agent: Agent {
-                provider: Provider::Anthropic,
-                model: "m".into(),
-                effort: "medium".into(),
-            },
+            agent: crate::run::tests::agent(),
             key: "k".into(),
             jobs: 2,
             work: work.clone(),

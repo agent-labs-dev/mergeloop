@@ -44,8 +44,9 @@ It prints each case and the totals, and writes the run to `target/review-eval/<l
 `<label>.jobs/`.
 The provider's API key comes in on stdin, never in the environment: the job runs the evidence's
 commands, which must see only the token MergeLoop's proxy gives the job, as in production.
-`--case <id>` runs only some cases, `--jobs` how many at once (2), and `--provider` picks
-`openai` or `openrouter`, with that provider's key.
+`--case <id>` runs only some cases, `--jobs` how many at once (2), `--depth` how hard each review
+looks (`quick`, `standard` or `deep`, as a repo's `review.depth` sets; `standard`), and `--provider`
+picks `openai` or `openrouter`, with that provider's key.
 
 ## Compare two runs
 

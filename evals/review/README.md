@@ -65,7 +65,8 @@ missed, and says `keep B` only when B fails no more reviews than A and catches m
 more false positives, or as many with fewer. `report <run.json>` scores one run again, against
 the cases as they are now.
 
-A run costs real money: the totals say how much. An agent is not deterministic, so one bug won or
+A run costs real money: the totals say how much, but for Codex (`openai`), which reports tokens
+and no cost, they say `cost unknown`. An agent is not deterministic, so one bug won or
 lost may be noise; run both sides twice before you trust a close call.
 
 ## Add a case

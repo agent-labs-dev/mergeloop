@@ -119,7 +119,10 @@ pub struct Totals {
     pub false_positives: usize,
     pub unmatched: usize,
     pub failed: usize,
+    /// What the priced cases cost.
     pub cost_usd: f64,
+    /// The cases without a cost, such as Codex's, which reports tokens: `cost_usd` leaves them out.
+    pub unpriced: usize,
 }
 
 impl Totals {
@@ -135,7 +138,10 @@ impl Totals {
             t.false_positives += s.false_positives.len();
             t.unmatched += s.unmatched.len();
             t.failed += usize::from(s.failed);
-            t.cost_usd += s.cost_usd.unwrap_or(0.0);
+            match s.cost_usd {
+                Some(c) => t.cost_usd += c,
+                None => t.unpriced += 1,
+            }
         }
         t
     }
@@ -492,6 +498,7 @@ mod tests {
                 unmatched: 1,
                 failed: 1,
                 cost_usd: 4.0,
+                unpriced: 1,
             }
         );
         assert_eq!(t.recall(), Some(0.5));

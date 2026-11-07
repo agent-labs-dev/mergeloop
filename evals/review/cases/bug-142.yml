@@ -113,6 +113,7 @@ expected:
         - { file: crates/executor/src/remote.rs, lines: 133 }
         - { file: crates/executor/src/remote.rs, lines: 192 }
         - { file: crates/executor/src/protocol.rs, lines: 9-12 }
+        - { file: crates/mergepatrol/src/review.rs, lines: 191-193 }
       what: "The hosted executor's upload and mailbox lists omit review.json and answer.md, so every hosted review fails."
       fixed_by: "#144"
     - at:

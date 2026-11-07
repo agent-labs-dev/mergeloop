@@ -104,10 +104,11 @@ struct Run {
 /// defaults `cache_write_input_tokens` to 0, as its older versions leave it out.
 fn usage(u: &Value) -> Option<Usage> {
     let n = |k: &str| u[k].as_u64();
-    let (read, write) = (
-        n("cached_input_tokens")?,
-        n("cache_write_input_tokens").unwrap_or(0),
-    );
+    let write = match u.get("cache_write_input_tokens") {
+        None => 0,
+        Some(w) => w.as_u64()?,
+    };
+    let read = n("cached_input_tokens")?;
     Some(Usage {
         input: n("input_tokens")?.checked_sub(read + write)?,
         cache_read: read,
@@ -349,6 +350,24 @@ mod tests {
             run.on(&partial, 10).unwrap();
             let cost = run.end(ok(""), Some("gpt-6.1-sol")).cost_usd;
             assert_eq!(cost, None, "without {missing}");
+        }
+
+        // Left out, the cache writes are none; there but not a count, unknown.
+        let mut no_writes = usage.clone();
+        no_writes["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_input_tokens");
+        let mut run = Run::default();
+        run.on(&no_writes, 10).unwrap();
+        assert!(run.end(ok(""), Some("gpt-6.1-sol")).cost_usd.is_some());
+        for bad in [json!(null), json!("100"), json!(-1)] {
+            let mut partial = usage.clone();
+            partial["usage"]["cache_write_input_tokens"] = bad.clone();
+            let mut run = Run::default();
+            run.on(&partial, 10).unwrap();
+            let cost = run.end(ok(""), Some("gpt-6.1-sol")).cost_usd;
+            assert_eq!(cost, None, "with {bad}");
         }
 
         // On a ChatGPT plan.

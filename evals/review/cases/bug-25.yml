@@ -78,3 +78,17 @@ expected:
         - { file: .github/workflows/deploy.yml, lines: 30 }
       what: "Actions pinned to mutable tags, not SHAs; the org's policy refuses them, so the deploy never starts."
       fixed_by: "#26"
+    - at:
+        - { file: crates/executor/src/remote.rs, lines: 104-131 }
+      what: "A job's uploads have no total limit, and Cloud Run's disk is memory, so an untrusted job can exhaust the orchestrator's memory."
+      fixed_by: "#66"
+    - at:
+        - { file: crates/executor/src/remote.rs, lines: 232-234 }
+        - { file: crates/executor/src/remote.rs, lines: 323-334 }
+      what: "One failed execution poll ends the wait, and the job is marked as nothing to cancel first, so it runs on uncancelled."
+      fixed_by: "#66"
+    - at:
+        - { file: crates/executor/src/remote.rs, lines: 224 }
+        - { file: crates/executor/src/remote.rs, lines: 285-297 }
+      what: "The job's timeout starts after the launch request, which has no timeout of its own, so a hung launch hangs the job forever."
+      fixed_by: "#66"

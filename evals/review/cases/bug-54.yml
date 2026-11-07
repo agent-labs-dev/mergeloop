@@ -74,3 +74,8 @@ expected:
         - { file: crates/github/src/app.rs, lines: 378-384 }
       what: "Rate-limit detection misses GraphQL's limit: HTTP 200 with a RATE_LIMITED error, so it never retries."
       fixed_by: "#104"
+    - at:
+        - { file: crates/mergepatrol/src/queue.rs, lines: 405-409 }
+        - { file: crates/mergepatrol/src/queue.rs, lines: 1135 }
+      what: "A transient error re-runs the job, and each run starts its CI-fix count over, so retries grant the PR more fixes than `fix_ci` allows."
+      fixed_by: "#198"

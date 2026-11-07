@@ -58,4 +58,10 @@ body: |-
 
   <!-- codesmith:autofix:disabled -->
   <!-- /codesmith:footer -->
-expected: clean
+expected:
+  bugs:
+    - at:
+        - { file: README.md, lines: 112 }
+        - { file: compose.yml, lines: 63-66 }
+      what: "Under Compose the key is an environment-backed secret, which a restart or `up -d` does not reload: the rotation silently keeps the old key, and the next recreate loads only the new one, so stored secrets become unreadable."
+      fixed_by: "#293 (open)"

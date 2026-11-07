@@ -118,20 +118,20 @@ impl ClaudeResolver {
 }
 
 /// What the run cost, from the tokens the `result` event counts per model. `None` when it names a
-/// model we have no price for, or does not split its cache writes by lifetime. The CLI's own
+/// model we have no price for, or lacks a count we bill. The CLI's own
 /// `total_cost_usd` is not used, so a run costs the same by our prices whichever CLI ran it.
 fn cost_usd(result: &Value) -> Option<f64> {
     let models = result["modelUsage"].as_object().filter(|m| !m.is_empty())?;
     models.iter().try_fold(0.0, |sum, (name, m)| {
-        let n = |k: &str| m[k].as_u64().unwrap_or(0);
+        let n = |k: &str| m[k].as_u64();
         let usage = Usage {
-            input: n("inputTokens"),
-            cache_read: n("cacheReadInputTokens"),
-            cache_write: n("cacheCreationEphemeral5mInputTokens"),
-            cache_write_long: n("cacheCreationEphemeral1hInputTokens"),
-            output: n("outputTokens"),
+            input: n("inputTokens")?,
+            cache_read: n("cacheReadInputTokens")?,
+            cache_write: n("cacheCreationEphemeral5mInputTokens")?,
+            cache_write_long: n("cacheCreationEphemeral1hInputTokens")?,
+            output: n("outputTokens")?,
         };
-        if usage.cache_write + usage.cache_write_long != n("cacheCreationInputTokens") {
+        if usage.cache_write + usage.cache_write_long != n("cacheCreationInputTokens")? {
             return None;
         }
         let model = m["canonicalModel"].as_str().unwrap_or(name);

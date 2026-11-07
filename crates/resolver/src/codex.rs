@@ -98,6 +98,25 @@ struct Run {
     usage: Option<Usage>,
 }
 
+/// The tokens a `turn.completed` event counts, or `None` if it lacks one we bill.
+/// `input_tokens` counts the cache's reads and writes too, and `output_tokens` the reasoning.
+/// Codex sets no cache TTL, so its writes are OpenAI's default 30-minute ones. Codex itself
+/// defaults `cache_write_input_tokens` to 0, as its older versions leave it out.
+fn usage(u: &Value) -> Option<Usage> {
+    let n = |k: &str| u[k].as_u64();
+    let (read, write) = (
+        n("cached_input_tokens")?,
+        n("cache_write_input_tokens").unwrap_or(0),
+    );
+    Some(Usage {
+        input: n("input_tokens")?.checked_sub(read + write)?,
+        cache_read: read,
+        cache_write: write,
+        cache_write_long: 0,
+        output: n("output_tokens")?,
+    })
+}
+
 impl Run {
     fn on(&mut self, event: &Value, max_turns: u32) -> Result<()> {
         match event["type"].as_str() {
@@ -118,16 +137,8 @@ impl Run {
             }
             Some("turn.completed") => {
                 self.completed = true;
-                let u = &event["usage"];
-                let n = |k: &str| u[k].as_u64().unwrap_or(0);
-                // `input_tokens` counts the cache's reads and writes too, and `output_tokens` the
-                // reasoning. Codex sets no cache TTL, so its writes are OpenAI's default 30-minute.
-                let (read, write) = (n("cached_input_tokens"), n("cache_write_input_tokens"));
-                let usage = self.usage.get_or_insert_default();
-                usage.input += n("input_tokens").saturating_sub(read + write);
-                usage.cache_read += read;
-                usage.cache_write += write;
-                usage.output += n("output_tokens");
+                // `codex exec` runs one turn.
+                self.usage = usage(&event["usage"]);
             }
             Some("turn.failed") => {
                 self.failed = Some(
@@ -296,7 +307,9 @@ mod tests {
             item("command_execution", ""),
             item("file_change", ""),
             item("agent_message", "Done."),
-            json!({ "type": "turn.completed", "usage": {} }),
+            json!({ "type": "turn.completed", "usage": {
+                "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            }}),
         ] {
             run.on(&e, 10).unwrap();
         }
@@ -327,6 +340,16 @@ mod tests {
             run.end(ok(""), Some("some/openrouter-model")).cost_usd,
             None
         );
+
+        // A counter left out, as a change to Codex's events could.
+        for missing in ["input_tokens", "cached_input_tokens", "output_tokens"] {
+            let mut partial = usage.clone();
+            partial["usage"].as_object_mut().unwrap().remove(missing);
+            let mut run = Run::default();
+            run.on(&partial, 10).unwrap();
+            let cost = run.end(ok(""), Some("gpt-6.1-sol")).cost_usd;
+            assert_eq!(cost, None, "without {missing}");
+        }
 
         // On a ChatGPT plan.
         let mut run = Run::default();

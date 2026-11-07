@@ -288,7 +288,11 @@ fn with_fake_claude_running(dir: &Path, shell: &str, answer: &str) -> LocalExecu
         serde_json::json!({ "type": "assistant" }),
         // 10,000 input at $4 and 4,000 output at $20 per million on Claude Opus 5.5: $0.12.
         serde_json::json!({ "type": "result", "result": answer, "modelUsage": {
-            "claude-opus-5-5": { "inputTokens": 10_000, "outputTokens": 4_000 },
+            "claude-opus-5-5": {
+                "inputTokens": 10_000, "outputTokens": 4_000, "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0, "cacheCreationEphemeral5mInputTokens": 0,
+                "cacheCreationEphemeral1hInputTokens": 0,
+            },
         }}),
     ];
     let lines: String = events.iter().map(|e| format!("echo '{e}'\n")).collect();

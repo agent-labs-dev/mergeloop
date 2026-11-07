@@ -1270,6 +1270,6 @@ async fn a_merge_that_conflicts_has_the_agent_resolve_it_once() {
     assert_merge_of(&check, &head, &trunk);
     assert_eq!(git(&check, &["show", "result:a.ts"]), "main again\npr");
     let message = git(&check, &["log", "-1", "--format=%B", "result"]);
-    assert!(message.contains("Resolved-by: mergepatrol"), "{message}");
+    assert!(message.contains("Resolved-by: mergeloop"), "{message}");
     assert!(message.contains("Updated-by: mergeloop"), "{message}");
 }

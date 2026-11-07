@@ -43,7 +43,7 @@ async fn a_merge_resolution_leaves_untracked_check_output_out() {
     // The resolver edits the conflict and its checks leave an untracked coverage report.
     std::fs::write(wt.join("a.txt"), "trunk\npr\n").unwrap();
     std::fs::write(wt.join("coverage.out"), "check output\n").unwrap();
-    Git.commit_merge(wt, message, "Resolved-by: mergepatrol (test)")
+    Git.commit_merge(wt, message, "Resolved-by: mergeloop (test)")
         .await
         .unwrap();
 

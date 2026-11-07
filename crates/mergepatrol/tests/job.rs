@@ -479,7 +479,7 @@ async fn a_fix_is_committed_with_the_subject_the_agent_writes() {
     let answer = "MERGELOOP_COMMIT: fix(auth): stop exporting Session";
     let (message, _) = fixed_with("echo fixed > feature.txt", answer, &[]).await;
     assert!(
-        message.starts_with("fix(auth): stop exporting Session\n\nFixed-by: mergepatrol"),
+        message.starts_with("fix(auth): stop exporting Session\n\nFixed-by: mergeloop"),
         "{message}"
     );
 }
@@ -560,7 +560,7 @@ async fn a_review_since_an_approval_names_only_the_queues_commits() {
     git(&origin, &["add", "-A"]);
     git(
         &origin,
-        &["commit", "-qm", "Fix ci\n\nFixed-by: mergepatrol, a"],
+        &["commit", "-qm", "Fix ci\n\nFixed-by: mergeloop, a"],
     );
     let head = git(&origin, &["rev-parse", "HEAD"]);
 
@@ -1073,7 +1073,7 @@ async fn an_openai_conflict_is_resolved_through_the_proxy() {
         "{resolved}"
     );
     let log = git(&check, &["log", "-1", "--format=%B", "FETCH_HEAD"]);
-    assert!(log.contains("Resolved-by: mergepatrol, codex ("), "{log}");
+    assert!(log.contains("Resolved-by: mergeloop, codex ("), "{log}");
 }
 
 /// A branch kept up to date by merging, as #237's author does: `a.ts` conflicted with the trunk
@@ -1270,6 +1270,6 @@ async fn a_merge_that_conflicts_has_the_agent_resolve_it_once() {
     assert_merge_of(&check, &head, &trunk);
     assert_eq!(git(&check, &["show", "result:a.ts"]), "main again\npr");
     let message = git(&check, &["log", "-1", "--format=%B", "result"]);
-    assert!(message.contains("Resolved-by: mergepatrol"), "{message}");
+    assert!(message.contains("Resolved-by: mergeloop"), "{message}");
     assert!(message.contains("Updated-by: mergeloop"), "{message}");
 }

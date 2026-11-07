@@ -28,9 +28,14 @@ fn totals(t: &Totals) -> String {
     let recall = t
         .recall()
         .map_or("-".to_owned(), |r| format!("{:.0}%", r * 100.0));
+    let cost = match t.unpriced {
+        0 => format!("${:.2}", t.cost_usd),
+        n if n == t.cases => "cost unknown".to_owned(),
+        n => format!("${:.2}+, {n} without a cost,", t.cost_usd),
+    };
     format!(
         "recall {recall} ({}/{} bugs), false positives {} on {}/{} clean PRs, {} other changes \
-sent back, {} failed, ${:.2} over {} cases\n",
+sent back, {} failed, {cost} over {} cases\n",
         t.caught,
         t.bugs,
         t.false_positives,
@@ -38,7 +43,6 @@ sent back, {} failed, ${:.2} over {} cases\n",
         t.clean,
         t.unmatched,
         t.failed,
-        t.cost_usd,
         t.cases,
     )
 }
@@ -107,6 +111,21 @@ mod tests {
             lines[5],
             "recall 33% (1/3 bugs), false positives 1 on 1/2 clean PRs, 0 other changes sent \
 back, 1 failed, $1.00 over 4 cases"
+        );
+    }
+
+    #[test]
+    fn a_run_whose_agent_reports_no_cost_says_so_rather_than_nothing_spent() {
+        let unpriced = |id| Scored {
+            cost_usd: None,
+            ..scored(id, &[], &[], false)
+        };
+        let text = run("codex", &[unpriced("a"), unpriced("b")]);
+        assert!(text.ends_with("cost unknown over 2 cases\n"), "{text}");
+        let text = run("mixed", &[scored("a", &[], &[], false), unpriced("b")]);
+        assert!(
+            text.ends_with("$0.25+, 1 without a cost, over 2 cases\n"),
+            "{text}"
         );
     }
 

@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use mergepatrol_core::{Provider, ReviewSettings};
+use mergepatrol_core::{Depth, Provider, ReviewSettings};
 
 use crate::run::{Agent, RunFile, Runner};
 
 const USAGE: &str = "usage:
   review-eval run --label <name> --model <model> [--provider anthropic|openai|openrouter]
-                  [--effort medium] [--case <id>]... [--jobs 2] [--job-bin <mergepatrol>]
+                  [--effort medium] [--depth quick|standard|deep] [--case <id>]... [--jobs 2] [--job-bin <mergepatrol>]
                   [--out <run.json>] [--cases <dir>]       (the provider's key on stdin)
   review-eval report <run.json> [--cases <dir>]
   review-eval compare <a.json> <b.json> [--cases <dir>]";
@@ -102,7 +102,7 @@ impl Flags {
 }
 
 const RUN_FLAGS: &[&str] = &[
-    "label", "model", "provider", "effort", "case", "jobs", "job-bin", "out", "cases",
+    "label", "model", "provider", "effort", "depth", "case", "jobs", "job-bin", "out", "cases",
 ];
 
 fn parse(args: &[String]) -> Result<Command> {
@@ -127,6 +127,9 @@ fn parse(args: &[String]) -> Result<Command> {
 fn run_args(f: &Flags) -> Result<RunArgs> {
     let provider = f.get("provider").unwrap_or_else(|| "anthropic".into());
     let jobs = f.get("jobs").unwrap_or_else(|| "2".into());
+    let depth = f
+        .get("depth")
+        .unwrap_or_else(|| Depth::default().as_str().into());
     let label = f.get("label").context("run takes --label")?;
     Ok(RunArgs {
         agent: Agent {
@@ -134,6 +137,10 @@ fn run_args(f: &Flags) -> Result<RunArgs> {
                 .with_context(|| format!("{provider:?} is not a provider"))?,
             model: f.get("model").context("run takes --model")?,
             effort: f.get("effort").unwrap_or_else(|| "medium".into()),
+            depth: Depth::ALL
+                .into_iter()
+                .find(|d| d.as_str() == depth)
+                .with_context(|| format!("{depth:?} is not a depth"))?,
         },
         only: f.all("case"),
         jobs: jobs.parse().with_context(|| format!("--jobs {jobs:?}"))?,
@@ -266,7 +273,7 @@ mod tests {
     #[test]
     fn run_reads_its_agent_and_which_cases() {
         let c = parse(&args(
-            "run --label try --model gpt --provider openai --case a --case b --jobs 4 --out o.json",
+            "run --label try --model gpt --provider openai --depth deep --case a --case b --jobs 4 --out o.json",
         ))
         .unwrap();
         assert_eq!(
@@ -277,6 +284,7 @@ mod tests {
                     provider: Provider::OpenAi,
                     model: "gpt".into(),
                     effort: "medium".into(),
+                    depth: Depth::Deep,
                 },
                 only: vec!["a".into(), "b".into()],
                 jobs: 4,
@@ -296,6 +304,7 @@ mod tests {
         };
         assert_eq!(a.out, Path::new("target/review-eval/base.json"));
         assert_eq!((a.jobs, a.agent.provider), (2, Provider::Anthropic));
+        assert_eq!(a.agent.depth, Depth::Standard);
         assert!(a.only.is_empty());
     }
 

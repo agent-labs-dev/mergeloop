@@ -85,7 +85,7 @@ export function Queue({ workspace }: { workspace: number }) {
           <p className="font-medium">No queues yet</p>
           <p className="mt-1 max-w-xs text-muted">
             Set up a repo, then add the{" "}
-            <code className="rounded bg-sunken px-1 text-xs">mergepatrol</code> label to a PR.
+            <code className="rounded bg-sunken px-1 text-xs">mergeloop</code> label to a PR.
           </p>
           <Link to="/$account/settings" params={{ account }} className={`${primary} mt-4`}>
             Set up a repo
@@ -921,6 +921,8 @@ const pathSteps: Record<string, [string, boolean, boolean]> = {
   "rebase-skipped": ["Rebase skipped", false, false],
   conflict: ["Conflict", true, true],
   resolved: ["Conflict resolved", false, false],
+  "merging-base": ["Merging the base branch in instead", false, true],
+  "base-merged": ["Base branch merged in", false, false],
   unresolved: ["Could not resolve the conflict", true, false],
   fixing: ["Fixing the checks", true, true],
   fix: ["Fix committed", false, false],
@@ -931,9 +933,6 @@ const pathSteps: Record<string, [string, boolean, boolean]> = {
   "review-resolved": ["Review comments resolved", false, false],
   "review-sent-back": ["Review sent findings back", true, true],
   "review-asks": ["Review asks a human", true, true],
-  "review-fixing": ["Fixing the review's findings", false, false],
-  "review-fixed": ["Findings fixed", false, false],
-  "review-unfixed": ["Left the findings to the author", true, false],
   "prep-left": ["Left to the merge lane", true, true],
 };
 
@@ -959,13 +958,7 @@ function Path({
   const left = newest.findIndex((ev) => exitKinds.includes(ev.kind));
   const steps = (left < 0 ? newest : newest.slice(0, left))
     .filter((ev) => ev.kind in pathSteps)
-    .reverse()
-    // Findings only went back to the author if the agent's fix did not take them on.
-    .filter((ev, i, all) => {
-      if (ev.kind !== "review-sent-back") return true;
-      const next = all[i + 1];
-      return next ? next.kind !== "review-fixing" : e.hold?.reason === "review_changes";
-    });
+    .reverse();
   if (steps.length === 0) return null;
   return (
     <>

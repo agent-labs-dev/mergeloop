@@ -2,7 +2,7 @@
 //! The job writes `result.json`, and on success `result.bundle` (a review, `review.json`; an
 //! answer, `answer.md`), to its output directory.
 
-use mergepatrol_core::{Answered, CheckFailure, Finding, Provider, SentBack, SpendTask};
+use mergepatrol_core::{Answered, CheckFailure, Depth, Finding, Provider, SentBack, SpendTask};
 use serde::{Deserialize, Serialize};
 
 pub const RESULT_FILE: &str = "result.json";
@@ -47,6 +47,24 @@ pub struct JobSpec {
     pub resolver: ResolverSpec,
     #[serde(default)]
     pub task: Task,
+    /// How a `Task::Rebase` brings the branch up to date with `trunk_sha`.
+    #[serde(default)]
+    pub update: Update,
+}
+
+/// How a rebase job brings a branch up to date: replay its commits, or merge its base in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Update {
+    /// Replay the branch's commits onto the base. The default, for an orchestrator from before
+    /// merges, which publishes only replayed commits.
+    #[default]
+    Rebase,
+    /// Merge the base in when the branch already holds merges, so it keeps up by merging, or
+    /// when the merge is clean and the rebase conflicts. Rebase otherwise.
+    Either,
+    /// Merge the base in: a rebase of the branch ran out of time.
+    Merge,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,8 +78,6 @@ pub enum Task {
     /// Review what the PR changes since it left `trunk_sha`, and write `REVIEW_FILE`. Changes
     /// nothing. `answered` are what humans said about an earlier head; `sent_back` what the
     /// agent sent back to the author on the last one, to check the fix of.
-    /// Fix what the agent's review sent back, and commit it on top of the PR's head.
-    FixReview { findings: Vec<Finding> },
     Review {
         #[serde(default)]
         answered: Vec<Answered>,
@@ -71,6 +87,13 @@ pub enum Task {
         /// reading.
         #[serde(default)]
         since: Option<String>,
+        /// The head `sent_back` went back on: once the PR's head descends from it, only what
+        /// changed since needs reviewing.
+        #[serde(default)]
+        reviewed: Option<String>,
+        /// How hard it looks: how many reviewers, and which changes a panel checks.
+        #[serde(default)]
+        depth: Depth,
     },
     /// Answer a question about a finding of the review, and write `ANSWER_FILE`. `sent_back`:
     /// the finding went back to the author, and this is their reply, which it may withdraw on.
@@ -85,17 +108,14 @@ pub enum Task {
 impl Task {
     /// Whether the job returns code: a review or a question returns only what it wrote.
     pub fn returns_code(&self) -> bool {
-        matches!(
-            self,
-            Task::Rebase | Task::FixChecks { .. } | Task::FixReview { .. }
-        )
+        matches!(self, Task::Rebase | Task::FixChecks { .. })
     }
 
     /// The task the agent runs for: it picks the model, and counts the spend.
     pub fn spend_task(&self) -> SpendTask {
         match self {
             Task::Rebase => SpendTask::Rebase,
-            Task::FixChecks { .. } | Task::FixReview { .. } => SpendTask::Fix,
+            Task::FixChecks { .. } => SpendTask::Fix,
             Task::Review { .. } | Task::Question { .. } => SpendTask::Review,
         }
     }
@@ -135,6 +155,10 @@ pub struct ApiAccess {
     pub base_url: String,
     /// Good until the job ends.
     pub token: String,
+    /// The proxy calls the model on a ChatGPT plan, which bills no tokens, so the run costs
+    /// nothing we can price.
+    #[serde(default)]
+    pub on_plan: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

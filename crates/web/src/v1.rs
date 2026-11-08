@@ -36,7 +36,7 @@ pub struct PullStateView {
     /// or ejected.
     pub url: String,
     /// Whether the repo uses MergeLoop.
-    pub mergepatrol: RepoStatusView,
+    pub mergeloop: RepoStatusView,
     /// Its place in the queue. Null when it is not queued.
     pub queue: Option<QueueView>,
     /// It last left the queue merged. Null while it is queued.
@@ -52,7 +52,7 @@ pub struct RepoStatusView {
     pub state: RepoStateView,
     /// The MergeLoop GitHub App is installed on the repo.
     pub installed: bool,
-    /// The default branch has `.mergepatrol/mergepatrol.yml`, as of the last look.
+    /// The default branch has the config file, as of the last look.
     pub has_config: bool,
     /// Turned on or off in the dashboard, whatever the config file says. Null follows the file.
     #[serde(rename = "override")]
@@ -175,13 +175,6 @@ pub enum HoldReasonView {
     PrepChecks,
     /// Getting ready off the lane: the agent fixes its failed checks.
     PrepFixing,
-    /// It waits for the review by its author's agent (`agent.runs: local`).
-    AuthorReview,
-    /// Getting ready off the lane: it conflicts with its base branch, for the author's agent to
-    /// resolve (`agent.runs: local`).
-    AuthorRebase,
-    /// Getting ready off the lane: required checks failed, for the author's agent to fix.
-    AuthorFix,
     Reviewing,
     /// The agent's review asks a human about what it was not sure of.
     ReviewAsks,
@@ -237,10 +230,7 @@ impl From<&Hold> for HoldView {
             Hold::PrepRebasing => HoldReasonView::PrepRebasing,
             Hold::PrepChecks => HoldReasonView::PrepChecks,
             Hold::PrepFixing => HoldReasonView::PrepFixing,
-            Hold::AuthorRebase { .. } => HoldReasonView::AuthorRebase,
-            Hold::AuthorFix { .. } => HoldReasonView::AuthorFix,
             Hold::Reviewing => HoldReasonView::Reviewing,
-            Hold::AuthorReview => HoldReasonView::AuthorReview,
             Hold::ReviewAsks => HoldReasonView::ReviewAsks,
             Hold::ReviewChanges => HoldReasonView::ReviewChanges,
             Hold::UnresolvedThreads { .. } => HoldReasonView::UnresolvedThreads,
@@ -388,7 +378,7 @@ pub(crate) async fn statuses(
         ),
         None => (None, Vec::new(), Vec::new()),
     };
-    let mergepatrol = RepoStatusView::read(app, repo, installation, state.as_ref()).await?;
+    let mergeloop = RepoStatusView::read(app, repo, installation, state.as_ref()).await?;
     let lanes: Vec<_> = lanes
         .into_iter()
         .map(|(trunk, lane)| (trunk, lane.batch_pr, in_merge_order(lane.entries)))
@@ -430,7 +420,7 @@ pub(crate) async fn statuses(
                 repo: repo.to_string(),
                 number: number as u32,
                 url: permalink(app, repo, number),
-                mergepatrol: mergepatrol.clone(),
+                mergeloop: mergeloop.clone(),
                 merged: exit.filter(|e| e.outcome == "merged").map(|e| MergedView {
                     at: e.at.clone(),
                     sha: e.detail.clone(),

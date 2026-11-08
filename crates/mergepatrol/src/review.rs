@@ -9,22 +9,22 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_core::{
-    Answered, Event, Evidence, Finding, Judged, PrNumber, RepoName, RepoSettings, ReviewSettings,
-    ReviewStatus, Runs, SentBack, review_status, review_url,
+    Answered, Depth, Evidence, Finding, Judged, Lean, PrNumber, RepoName, RepoSettings,
+    ReviewSettings, ReviewStatus, SentBack, Verdict, Verification, review_status, review_url,
+    settled_by,
 };
 use mergepatrol_executor::protocol::{
     ANSWER_FILE, JobOutcome, JobSpec, REVIEW_FILE, ReviewOutput, Task,
 };
+use mergepatrol_github::setup::Verdict as ReviewVerdict;
 use mergepatrol_github::{App, CodeOwners, Installation, PullRequest, ReviewThread, ThreadComment};
-use mergepatrol_resolver::{ReviewRequest, Verify, author_review_brief, withdraws};
+use mergepatrol_resolver::withdraws;
 use mergepatrol_store::{LaneKey, ReviewDone, ReviewRecord};
 use mergepatrol_web::merge_requested;
 use tokio::task::JoinSet;
 
 use crate::github::GitHub;
-use crate::queue::{
-    Alive, Claim, Ctx, Unit, app_credentials, fix_findings, job_spec, record, units, unix_now,
-};
+use crate::queue::{Alive, Ctx, app_credentials, job_spec, record, unix_now};
 
 /// Reviews running at once, across workspaces. Each also takes one of the sandbox's job slots.
 const REVIEWS_AT_ONCE: usize = 4;
@@ -131,7 +131,7 @@ async fn settings(ctx: &Ctx, gh: &Installation, repo: &RepoName) -> Result<RepoS
         .store
         .inherited(GitHub::installation_id(gh), &ctx.config.repo_defaults)
         .await?;
-    Ok(RepoSettings::from_file(file.as_deref(), &defaults).unwrap_or(defaults))
+    Ok(file.settings(&defaults).unwrap_or(defaults))
 }
 
 fn lane_key(r: &ReviewRecord, pr: &PullRequest) -> LaneKey {
@@ -163,24 +163,14 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         .unwrap_or_default();
     let bars = workspace.with(&settings.review);
 
-    let by_author = settings.agent.runs == Runs::Local;
     let found = match pr.is_cross_repository {
         // A fork's code is not trusted: no agent reads it, as none rebases or fixes it.
         true => Err("The agent does not review PRs from forks.".to_owned()),
-        // The author's agent reviews, and posts what it found: this only judges that.
-        false if by_author => match &r.submitted {
-            Some(review) => posted_review(review),
-            None => {
-                let brief = author_brief(ctx, &gh, &pr, &settings, &r).await?;
-                return ctx.store.await_author(r.id, r.claim, &brief).await;
-            }
-        },
-        false => run_review(ctx, &gh, &key, &pr, &settings, &r).await,
+        false => run_review(ctx, &gh, &key, &pr, (&settings, bars.depth), &r).await,
     };
     let output = match found {
         Ok(output) => Ok(output),
-        // What the author's agent posted reads the same each time.
-        Err(why) if r.attempts + 1 < ATTEMPTS && !why.starts_with(NO_KEY) && !by_author => {
+        Err(why) if r.attempts + 1 < ATTEMPTS && !why.starts_with(NO_KEY) => {
             ctx.store
                 .retry_review(r.id, r.claim, &why, RETRY_AFTER)
                 .await?;
@@ -191,228 +181,45 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
     conclude(ctx, &gh, &key, &pr, &r, &settings, &bars, output).await
 }
 
-/// Ends the review, and posts it on GitHub only for what it leaves a person to do: what it sent
-/// back goes to the agent's fix first, and the author hears only of what the fix left them.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn conclude(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-    r: &ReviewRecord,
-    settings: &RepoSettings,
-    bars: &ReviewSettings,
-    output: std::result::Result<ReviewOutput, String>,
-) -> Result<()> {
-    let Some((held, done)) = finish(ctx, gh, key, pr, r, settings, bars, output).await? else {
-        return Ok(());
-    };
-    let fix = fix_sent_back(ctx, gh, key, pr, settings, r.id, held)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(repo = %r.repo, pr = r.number, error = %format!("{e:#}"), "could not fix the review's findings");
-            Fix::Unfixed
-        });
-    match fix {
-        Fix::Pushed => ctx.store.settle_review(r.id, r.claim).await,
-        Fix::Superseded => ctx.store.stale_review(r.id, r.claim).await,
-        Fix::Unfixed => match left_to_author(ctx, gh, key, r, settings, &done).await {
-            Ok(()) => Ok(()),
-            // The author has not heard of it: the review runs again rather than hold the PR.
-            Err(e) => {
-                tracing::warn!(repo = %r.repo, pr = r.number, error = %format!("{e:#}"), "could not post what the fix left");
-                ctx.store.rerun_review(r.id, r.claim, RETRY_AFTER).await
-            }
-        },
-    }
-}
-
-/// Posts what the fix left the author, on the PR as it is now. A PR that moved while the fix ran
-/// gets nothing: a pushed or retargeted head gets its own review, and one no longer queued gets
-/// none.
-async fn left_to_author(
+/// The PR as GitHub has it now, if it is still the one the review is of: the head it reviewed,
+/// into the same trunk, told to merge. A pushed or retargeted head gets its own review, and one
+/// no longer queued gets none.
+async fn as_reviewed(
     ctx: &Ctx,
     gh: &Installation,
     key: &LaneKey,
     r: &ReviewRecord,
     settings: &RepoSettings,
-    done: &ReviewDone,
-) -> Result<()> {
+) -> Result<Option<PullRequest>> {
     let now = GitHub::pull_request(gh, &r.repo, r.number).await?;
-    if (!now.is_cross_repository && now.head_ref_oid != r.head_sha)
+    // A fork PR's head is its pull ref's, which its GraphQL lags behind.
+    let moved = !now.is_cross_repository && now.head_ref_oid != r.head_sha;
+    if moved
         || now.merges_into() != key.trunk
         || !merge_requested(ctx.store.as_ref(), gh, &r.repo, &now, &settings.label).await?
     {
-        return ctx.store.stale_review(r.id, r.claim).await;
-    }
-    publish(ctx, gh, key, &now, r, done).await?;
-    ctx.store.settle_review(r.id, r.claim).await
-}
-
-/// What the agent's fix can take on from a review: what it sent back to the author, not what a
-/// human asked for, and not on a PR from a fork. Empty otherwise.
-fn fixable(r: &ReviewRecord, fork: bool) -> Vec<Finding> {
-    if r.status != ReviewStatus::Changes || r.answered_by.is_some() || fork {
-        return Vec::new();
-    }
-    r.findings
-        .iter()
-        .filter(|f| f.sent_back)
-        .map(|f| f.finding.clone())
-        .collect()
-}
-
-/// The PR, or the stack it is a layer of, held for the agent's fix of what a review sent back.
-pub(crate) struct HeldForFix {
-    /// Whose budget the fix shares, and whose layers above it move.
-    unit: Unit,
-    _claim: Claim,
-}
-
-/// Holds the PR for the agent's fix, as its review ends, so it goes from reviewing to fixing:
-/// `None` on a fork's, or while a job has it, as a fix of its checks on this head.
-pub(crate) async fn hold_for_fix(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-) -> Result<Option<HeldForFix>> {
-    if pr.is_cross_repository {
         return Ok(None);
     }
-    let Some(unit) = units(gh, &key.repo, std::slice::from_ref(pr)).await?.pop() else {
-        return Ok(None);
-    };
-    Ok(ctx.prep.claim(key, unit.number).map(|claim| HeldForFix {
-        unit,
-        _claim: claim,
-    }))
-}
-
-/// How the agent's fix of what a review sent back ended.
-#[derive(Debug, PartialEq)]
-pub(crate) enum Fix {
-    Pushed,
-    /// The PR's branch moved under the fix: the review is of a head it no longer has.
-    Superseded,
-    /// No fix: the findings wait for the author.
-    Unfixed,
-}
-
-/// While the PR has fixes left, the agent's fix goes first, while `held`. Without one, or if the
-/// agent cannot fix it, the findings wait for the author, as they would anyway.
-pub(crate) async fn fix_sent_back(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-    settings: &RepoSettings,
-    review: i64,
-    held: HeldForFix,
-) -> Result<Fix> {
-    let Some(r) = ctx.store.review(review).await? else {
-        return Ok(Fix::Unfixed);
-    };
-    let findings = fixable(&r, pr.is_cross_repository);
-    if findings.is_empty() {
-        return Ok(Fix::Unfixed);
-    }
-    // The review took a while: the PR may have moved on.
-    let to_fix = held.unit.to_fix(gh, key, settings, r.number, &r.head_sha);
-    let Some((now, layer)) = to_fix.await? else {
-        return Ok(Fix::Unfixed);
-    };
-    let what = format!("{} sent back", findings.len());
-    record(ctx, key, r.number, "review-fixing", &what).await?;
-    let event = fix_findings(ctx, gh, key, &now, layer, settings, findings).await;
-    let fix = match event {
-        Ok(Event::Fixed { .. }) => Fix::Pushed,
-        Ok(Event::HeadMoved) => Fix::Superseded,
-        _ => Fix::Unfixed,
-    };
-    let (kind, message) = match event {
-        Ok(Event::Fixed { head }) => {
-            ctx.store.mark_agent_fixed(r.id).await?;
-            ("review-fixed", head)
-        }
-        Ok(Event::FixFailed(why) | Event::FixGaveUp(why)) => ("review-unfixed", why),
-        Ok(event) => ("review-unfixed", format!("{event:?}")),
-        Err(e) => ("review-unfixed", format!("{e:#}")),
-    };
-    record(ctx, key, r.number, kind, &message).await?;
-    ctx.reviews.notify_one();
-    Ok(fix)
+    Ok(Some(now))
 }
 
 const NO_KEY: &str = "No model API key";
 
-/// What the review of the author's agent asks of it: the prompt of MergeLoop's own, with what
-/// humans answered and what the last review sent back.
-async fn author_brief(
-    ctx: &Ctx,
-    gh: &Installation,
-    pr: &PullRequest,
-    settings: &RepoSettings,
-    r: &ReviewRecord,
-) -> Result<String> {
-    let (answered, sent_back) = earlier(ctx, gh, r).await?;
-    let verify = match settings.verify.is_empty() {
-        true => {
-            let ci =
-                mergepatrol_core::verify_from_ci(&gh.workflows_at(&r.repo, &r.head_sha).await?);
-            match ci.is_empty() {
-                true => Verify::None,
-                false => Verify::Ci(ci),
-            }
-        }
-        false => Verify::Configured(settings.verify.clone()),
-    };
-    let base = format!("$(git merge-base origin/{} HEAD)", pr.merges_into());
-    let req = ReviewRequest {
-        workdir: std::path::Path::new("."),
-        base: &base,
-        pr_title: &pr.title,
-        pr_body: &pr.body,
-        trunk: pr.merges_into(),
-        answered: &answered,
-        sent_back: &sent_back,
-        verify: &verify,
-        queue_commits: &[],
-        transcript: std::path::Path::new("."),
-    };
-    let repo = r.repo.to_string();
-    Ok(author_review_brief(&req, &repo, r.number, &r.head_sha))
+/// What a review goes on from: what humans answered on earlier heads, and what the last review
+/// sent back, with the author's replies in its threads, and the head it was of.
+struct Earlier {
+    answered: Vec<Answered>,
+    sent_back: Vec<SentBack>,
+    reviewed: Option<String>,
 }
 
-/// The review the author's agent posted, as MergeLoop's own job would have written it. Its
-/// evidence is the agent's word that the command failed: nothing runs it again.
-fn posted_review(review: &serde_json::Value) -> std::result::Result<ReviewOutput, String> {
-    let mut output: ReviewOutput = serde_json::from_value(review.clone())
-        .map_err(|e| format!("The review the author's agent posted does not read: {e}."))?;
-    if let Some(by) = review["by"].as_str() {
-        output.summary = format!("`{by}`'s agent reviewed this. {}", output.summary);
-    }
-    for (i, f) in output.findings.iter_mut().enumerate() {
-        f.id = format!("f{}", i + 1);
-        f.confidence = f.confidence.min(100);
-        if let Some(e) = &mut f.evidence {
-            e.failed = !e.command.trim().is_empty();
-        }
-    }
-    Ok(output)
-}
-
-/// What humans answered on earlier heads, and what the last review sent back, with the author's
-/// replies in its threads.
-async fn earlier(
-    ctx: &Ctx,
-    gh: &Installation,
-    r: &ReviewRecord,
-) -> Result<(Vec<Answered>, Vec<SentBack>)> {
+async fn earlier(ctx: &Ctx, gh: &Installation, r: &ReviewRecord) -> Result<Earlier> {
     let earlier = earlier_reviews(ctx, r).await?;
     let answered = answered_before(&earlier);
     let threads = threads(gh, r).await;
-    let sent_back = sent_back_before(&earlier)
+    let (reviewed, findings) = sent_back_before(&earlier).unzip();
+    let sent_back = findings
+        .unwrap_or_default()
         .into_iter()
         .map(|finding| {
             let thread = threads
@@ -421,7 +228,7 @@ async fn earlier(
             SentBack {
                 reply: thread
                     .and_then(|t| t.reply.as_ref())
-                    .filter(|(_, body)| !body.contains(REPLY_MARK))
+                    .filter(|(_, body)| !REPLY_MARKS.iter().any(|m| body.contains(m)))
                     .map(|(_, body)| body.clone())
                     .unwrap_or_default(),
                 resolved: thread.is_some_and(|t| t.resolved),
@@ -429,7 +236,11 @@ async fn earlier(
             }
         })
         .collect();
-    Ok((answered, sent_back))
+    Ok(Earlier {
+        answered,
+        sent_back,
+        reviewed: reviewed.map(str::to_owned),
+    })
 }
 
 /// Runs the review in the sandbox. `Err` says why the agent could not review.
@@ -438,10 +249,14 @@ async fn run_review(
     gh: &Installation,
     key: &LaneKey,
     pr: &PullRequest,
-    settings: &RepoSettings,
+    (settings, depth): (&RepoSettings, Depth),
     r: &ReviewRecord,
 ) -> std::result::Result<ReviewOutput, String> {
-    let (answered, sent_back) = earlier(ctx, gh, r).await.map_err(|e| format!("{e:#}"))?;
+    let Earlier {
+        answered,
+        sent_back,
+        reviewed,
+    } = earlier(ctx, gh, r).await.map_err(|e| format!("{e:#}"))?;
     let job_id = format!(
         "{}-{}-{}-review-{}",
         r.repo.owner,
@@ -455,6 +270,8 @@ async fn run_review(
             answered,
             sent_back,
             since: r.since_head.clone(),
+            reviewed,
+            depth,
         };
         let (spec, granted) =
             job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
@@ -516,10 +333,7 @@ async fn earlier_reviews(ctx: &Ctx, r: &ReviewRecord) -> Result<Vec<ReviewRecord
             && e.head_sha != r.head_sha
             && !matches!(
                 e.status,
-                ReviewStatus::Pending
-                    | ReviewStatus::Running
-                    | ReviewStatus::Author
-                    | ReviewStatus::Stale
+                ReviewStatus::Pending | ReviewStatus::Running | ReviewStatus::Stale
             )
     });
     Ok(earlier)
@@ -544,29 +358,23 @@ fn answered_before(earlier: &[ReviewRecord]) -> Vec<Answered> {
         .collect()
 }
 
-/// What the last review sent back to the author and still held the PR for: the next checks
-/// the fix.
-fn sent_back_before(earlier: &[ReviewRecord]) -> Vec<Finding> {
-    earlier
-        .first()
-        .map(|last| {
-            last.findings
-                .iter()
-                .filter(|j| j.sent_back)
-                .map(|j| j.finding.clone())
-                .collect()
-        })
-        .unwrap_or_default()
+/// What the last review sent back to the author and still held the PR for, and the head it was
+/// of: the next checks the fix, and reads only what changed since.
+fn sent_back_before(earlier: &[ReviewRecord]) -> Option<(&str, Vec<Finding>)> {
+    let last = earlier.first()?;
+    let findings: Vec<_> = last
+        .findings
+        .iter()
+        .filter(|j| j.sent_back)
+        .map(|j| j.finding.clone())
+        .collect();
+    (!findings.is_empty()).then_some((last.head_sha.as_str(), findings))
 }
 
 /// Whether the author has had their rounds: the last `ROUNDS` reviews each sent findings back to
-/// them, and no human stepped in. A round the queue's agent fixed was not theirs.
+/// them, and no human stepped in.
 fn rounds_spent(earlier: &[ReviewRecord]) -> bool {
-    let rounds: Vec<_> = earlier
-        .iter()
-        .filter(|e| !e.agent_fixed)
-        .take(ROUNDS)
-        .collect();
+    let rounds: Vec<_> = earlier.iter().take(ROUNDS).collect();
     rounds.len() == ROUNDS
         && rounds
             .iter()
@@ -575,10 +383,9 @@ fn rounds_spent(earlier: &[ReviewRecord]) -> bool {
 
 /// Ends the review: approved when it holds nothing, sent back to the author when it found what
 /// they should fix, else it asks the people who own the code in question. `Err` is why the
-/// agent could not review: a human reviews the whole PR. A review the agent's fix may take on
-/// is not posted: it comes back held for the fix, which goes first.
+/// agent could not review: a human reviews the whole PR. Then posts it on GitHub.
 #[allow(clippy::too_many_arguments)]
-async fn finish(
+pub(crate) async fn conclude(
     ctx: &Ctx,
     gh: &Installation,
     key: &LaneKey,
@@ -587,94 +394,100 @@ async fn finish(
     settings: &RepoSettings,
     bars: &ReviewSettings,
     output: std::result::Result<ReviewOutput, String>,
-) -> Result<Option<(HeldForFix, ReviewDone)>> {
-    // The merge request may have gone while the agent ran: then the review posts nothing and the
-    // PR ends no hold. It is dropped, for a review of a later head to take its place. `pr` is from
-    // before the run, so the gate reads the PR anew.
-    let now = GitHub::pull_request(gh, &r.repo, r.number).await?;
-    if !merge_requested(ctx.store.as_ref(), gh, &r.repo, &now, &settings.label).await? {
-        ctx.store.stale_review(r.id, r.claim).await?;
-        return Ok(None);
+) -> Result<()> {
+    // The PR may have moved while the agent ran: then the review posts nothing and the PR ends no
+    // hold. It is dropped, for a review of a later head to take its place.
+    let Some(now) = as_reviewed(ctx, gh, key, r, settings).await? else {
+        return ctx.store.stale_review(r.id, r.claim).await;
+    };
+    let done = judge(ctx, gh, pr, r, bars, output).await?;
+    if !ctx.store.finish_review(r.id, r.claim, &done).await? {
+        return Ok(());
     }
+    settle_earlier(ctx, r, &done).await?;
+    let (kind, message) = ended(&done);
+    record(ctx, key, r.number, kind, &message).await?;
+    publish(ctx, gh, key, &now, r, &done).await
+}
+
+/// What the review holds the PR for, and who it asks: what the agent found, judged by the
+/// workspace's bars, or why it could not review.
+async fn judge(
+    ctx: &Ctx,
+    gh: &Installation,
+    pr: &PullRequest,
+    r: &ReviewRecord,
+    bars: &ReviewSettings,
+    output: std::result::Result<ReviewOutput, String>,
+) -> Result<ReviewDone> {
     let (summary, mut findings, error) = match output {
         Ok(o) => (o.summary, bars.judge(o.findings), None),
         Err(why) => (String::new(), Vec::new(), Some(why)),
     };
+    let earlier = earlier_reviews(ctx, r).await?;
     // The author had their rounds and it still finds what to send back: a human decides.
-    if findings.iter().any(|f| f.sent_back) && rounds_spent(&earlier_reviews(ctx, r).await?) {
+    if findings.iter().any(|f| f.sent_back) && rounds_spent(&earlier) {
         for f in findings.iter_mut().filter(|f| f.sent_back) {
             f.sent_back = false;
             f.asked = true;
         }
     }
-    let asks = findings.iter().filter(|f| f.asked).count();
-    let sent = findings.iter().filter(|f| f.sent_back).count();
     let status = review_status(&findings, error.is_some());
     let asked = match status {
         ReviewStatus::Asks => askees(gh, &r.repo, pr, &findings).await,
         _ => Vec::new(),
     };
-    let done = ReviewDone {
+    Ok(ReviewDone {
         status,
-        error: error.clone(),
+        error,
         summary,
         findings,
         asked,
-    };
-    // Held before the review ends: the PR goes from reviewing to fixing, never by "sent back".
-    // The author's agent fixes what its own review sent back, as the author.
-    let held = match status {
-        ReviewStatus::Changes if settings.agent.runs == Runs::Local => None,
-        ReviewStatus::Changes => hold_for_fix(ctx, gh, key, &now)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(repo = %r.repo, pr = r.number, error = %format!("{e:#}"), "could not hold the PR for a fix");
-                None
-            }),
-        _ => None,
-    };
-    if !ctx
-        .store
-        .finish_review(r.id, r.claim, &done, held.is_some())
-        .await?
-    {
-        return Ok(None);
+    })
+}
+
+/// What became of what earlier reviews held the PR for, as this one says. Each earlier review
+/// is matched on its own: the last may have settled nothing, as when it asked a human or failed.
+/// An outcome already given stands.
+async fn settle_earlier(ctx: &Ctx, r: &ReviewRecord, done: &ReviewDone) -> Result<()> {
+    let found: Vec<Finding> = done.findings.iter().map(|j| j.finding.clone()).collect();
+    for earlier in earlier_reviews(ctx, r).await? {
+        let settled = settled_by(&earlier.findings, &earlier.answers, &found);
+        if !settled.is_empty() {
+            ctx.store.settle_findings(earlier.id, &settled).await?;
+        }
     }
-    let (kind, message) = match (&error, status) {
+    Ok(())
+}
+
+/// How the review ended, as the PR's activity says it.
+fn ended(done: &ReviewDone) -> (&'static str, String) {
+    let all = done.findings.len();
+    let count = |of: fn(&Judged) -> bool| done.findings.iter().filter(|f| of(f)).count();
+    match (&done.error, done.status) {
         (Some(why), _) => ("review-failed", why.clone()),
-        (None, ReviewStatus::Approved) => (
-            "review-approved",
-            format!("cleared {} things alone", done.findings.len()),
-        ),
+        (None, ReviewStatus::Approved) => {
+            ("review-approved", format!("cleared {all} things alone"))
+        }
         (None, ReviewStatus::Changes) => (
             "review-sent-back",
             format!(
-                "sent {sent} of {} things back to the author",
-                done.findings.len()
+                "sent {} of {all} things back to the author",
+                count(|f| f.sent_back)
             ),
         ),
         (None, _) => (
             "review-asks",
-            format!(
-                "asks a human about {asks} of {} things",
-                done.findings.len()
-            ),
+            format!("asks a human about {} of {all} things", count(|f| f.asked)),
         ),
-    };
-    record(ctx, key, r.number, kind, &message).await?;
-    match held {
-        Some(held) => Ok(Some((held, done))),
-        None => {
-            publish(ctx, gh, key, pr, r, &done).await?;
-            Ok(None)
-        }
     }
 }
 
 /// GitHub hears of the review where the PR's people are: each finding that holds the PR in a
 /// thread on its line, which its author resolves. Failing to post loses no state, but a finding
-/// with no thread waits for a push. A comment, never an approval: an App's approval could meet a
-/// rule that asks for a human's.
+/// with no thread waits for a push. What it sends back requests changes, so GitHub holds the PR
+/// too; anything else is a comment, never an approval: an App's approval could meet a rule that
+/// asks for a human's.
 async fn publish(
     ctx: &Ctx,
     gh: &Installation,
@@ -710,19 +523,7 @@ async fn askees(
     let author = pr.summary().author.map(|a| a.login.to_lowercase());
     let mut logins: Vec<String> = Vec::new();
     if let Some(owners) = codeowners(gh, repo).await {
-        for f in findings.iter().filter(|f| f.asked) {
-            let Some(file) = &f.finding.file else {
-                continue;
-            };
-            logins.extend(
-                owners
-                    .owners(file)
-                    .iter()
-                    // `@login`, or a team as `@org/team`; not an email address.
-                    .filter_map(|o| o.strip_prefix('@'))
-                    .map(str::to_owned),
-            );
-        }
+        logins = owners_of(&owners, findings);
     }
     if logins.is_empty() {
         logins = pr
@@ -737,6 +538,20 @@ async fn askees(
     logins
 }
 
+/// The code owners of the files the asks are about, at every place: users, and teams as
+/// `org/team`.
+fn owners_of(owners: &CodeOwners, findings: &[Judged]) -> Vec<String> {
+    let files = findings
+        .iter()
+        .filter(|f| f.asked)
+        .flat_map(|f| f.finding.locations().map(|(file, _)| file));
+    files
+        .flat_map(|file| owners.owners(file))
+        // `@login`, or a team as `@org/team`; not an email address.
+        .filter_map(|o| o.strip_prefix('@').map(str::to_owned))
+        .collect()
+}
+
 async fn codeowners(gh: &Installation, repo: &RepoName) -> Option<CodeOwners> {
     for path in CODEOWNERS {
         if let Ok(file) = gh.default_branch_file(repo, path).await
@@ -749,9 +564,17 @@ async fn codeowners(gh: &Installation, repo: &RepoName) -> Option<CodeOwners> {
 }
 
 /// Starts each of MergeLoop's threads, with the finding's title, so the next review finds it.
-const MARK: &str = "<!-- mergepatrol-finding: ";
-/// Ends each of MergeLoop's replies in a thread, so a reply is not taken for the author's.
-const REPLY_MARK: &str = "<!-- mergepatrol-reply -->";
+/// Each mark after the first is how MergeLoop wrote it as Mergepatrol, on threads still open.
+const MARKS: [&str; 2] = ["<!-- mergeloop-finding: ", "<!-- mergepatrol-finding: "];
+const MARK: &str = MARKS[0];
+/// End the body of each of MergeLoop's reviews, so its request for changes is dismissed once
+/// what it sent back no longer holds.
+pub(crate) const REVIEW_MARKS: [&str; 2] =
+    ["<!-- mergeloop-review -->", "<!-- mergepatrol-review -->"];
+const REVIEW_MARK: &str = REVIEW_MARKS[0];
+/// End each of MergeLoop's replies in a thread, so a reply is not taken for the author's.
+const REPLY_MARKS: [&str; 2] = ["<!-- mergeloop-reply -->", "<!-- mergepatrol-reply -->"];
+const REPLY_MARK: &str = REPLY_MARKS[0];
 
 /// A title as threads match it: as bounded as the comment that carries it.
 fn norm(title: &str) -> String {
@@ -777,13 +600,15 @@ fn clip(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
 
 /// The title of the finding a thread of MergeLoop's is about.
 fn title_of(t: &ReviewThread) -> Option<String> {
-    let rest = &t.body[t.body.find(MARK)? + MARK.len()..];
+    let rest = MARKS
+        .iter()
+        .find_map(|m| Some(&t.body[t.body.find(m)? + m.len()..]))?;
     Some(rest[..rest.find(" -->")?].to_owned())
 }
 
 /// MergeLoop's threads on the PR. None when GitHub could not say.
 async fn threads(gh: &Installation, r: &ReviewRecord) -> Vec<ReviewThread> {
-    gh.threads_marked(&r.repo, r.number, MARK)
+    gh.threads_marked(&r.repo, r.number, &MARKS)
         .await
         .inspect_err(|e| {
             tracing::warn!(repo = %r.repo, pr = r.number, error = %format!("{e:#}"), "could not read the review threads");
@@ -793,8 +618,9 @@ async fn threads(gh: &Installation, r: &ReviewRecord) -> Vec<ReviewThread> {
 
 /// Posts the review: a summary, and a thread for each finding that holds the PR. A finding a
 /// thread is already about gets a reply there, and its thread opens again; a thread whose
-/// finding no longer holds is resolved. A review that leaves nobody anything to do posts no
-/// summary. Returns the ids of the findings that have a thread.
+/// finding no longer holds is resolved, and a request for changes of an earlier review that no
+/// longer holds is dismissed. A review that leaves nobody anything to do posts no summary.
+/// Returns the ids of the findings that have a thread.
 async fn post(
     ctx: &Ctx,
     gh: &Installation,
@@ -835,9 +661,14 @@ async fn post(
             body: thread_body(f, short),
         });
     }
+    let sent_back = held.iter().any(|f| f.sent_back);
     if done.error.is_some() || !held.is_empty() {
-        let body = github_body(ctx, key, r.number, done);
-        gh.review_lines(&r.repo, r.number, &r.head_sha, &body, &new)
+        let body = format!("{}\n\n{REVIEW_MARK}", github_body(ctx, key, r.number, done));
+        let verdict = match sent_back {
+            true => ReviewVerdict::RequestChanges,
+            false => ReviewVerdict::Comment,
+        };
+        gh.review_lines(&r.repo, r.number, &r.head_sha, verdict, &body, &new)
             .await?;
     }
     // Which new threads GitHub took: one turned down went in the body, and has none.
@@ -858,6 +689,13 @@ async fn post(
             gh.reply_in_thread(&r.repo, r.number, t.comment_id, &body)
                 .await?;
             gh.resolve_thread(&t.id, true).await?;
+        }
+    }
+    if !sent_back {
+        let why = format!("Nothing it asked for holds since the review of `{short}`.");
+        let dismissed = gh.dismiss_reviews_marked(&r.repo, r.number, &REVIEW_MARKS, &why);
+        if let Err(e) = dismissed.await {
+            tracing::warn!(repo = %r.repo, pr = r.number, error = %format!("{e:#}"), "could not dismiss the review's request for changes");
         }
     }
     Ok(threaded)
@@ -916,12 +754,63 @@ fn shows_it(e: &Evidence, head: &str, patch: bool) -> String {
     text
 }
 
-/// What a finding's evidence showed on `head`, if MergeLoop saw it fail.
+/// What showed a finding's change is needed on `head`: its evidence, if MergeLoop saw it fail,
+/// else its panel's votes.
 fn shown(f: &Judged, head: &str, patch: bool) -> String {
-    match &f.finding.evidence {
-        Some(e) if e.failed => shows_it(e, head, patch),
+    match (&f.finding.evidence, &f.finding.verified) {
+        (Some(e), _) if e.failed => shows_it(e, head, patch),
+        (_, Some(v)) => voted(v),
         _ => String::new(),
     }
+}
+
+/// What a finding's panel said of it.
+fn voted(v: &Verification) -> String {
+    let n = v.votes.len();
+    let whys: String = v
+        .votes
+        .iter()
+        .map(|v| {
+            format!(
+                "\n- {}: {}",
+                verdict(v.verdict),
+                clip(v.why.trim(), TEXT_CHARS)
+            )
+        })
+        .collect();
+    format!(
+        "**Checked:** MergeLoop had {n} fresh agents check it, each given only this finding and the code: {} of {n} say it holds, and {} had to.\n\n<details><summary>What each said</summary>\n{whys}\n\n</details>\n\n",
+        v.holds(),
+        v.needed,
+    )
+}
+
+fn verdict(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Holds => "holds",
+        Verdict::DoesNotHold => "does not hold",
+        Verdict::Abstained => "no vote",
+    }
+}
+
+/// The other places a bug that recurs is, for its author to fix at each.
+fn also_at(f: &Judged) -> String {
+    let others = f.finding.also_at.iter().map(|p| p.to_string());
+    places("Also at", others.collect())
+}
+
+/// `places` under `label`, each in code, asking for a fix at each when there are more than one.
+fn places(label: &str, places: Vec<String>) -> String {
+    let each = match places.len() {
+        0 => return String::new(),
+        1 => "",
+        _ => " Fix it at each place.",
+    };
+    let places: Vec<String> = places.iter().map(|p| format!("`{p}`")).collect();
+    format!(
+        "**{label}:** {}.{each}\n\n",
+        clip(&places.join(", "), TEXT_CHARS)
+    )
 }
 
 /// The reply in a finding's thread when a later head's review finds it again, with the evidence
@@ -929,8 +818,9 @@ fn shown(f: &Judged, head: &str, patch: bool) -> String {
 fn still_holds(f: &Judged, head: &str) -> String {
     fitted(|patch| {
         format!(
-            "Still holds on `{head}`: {}\n\n{}{}\n\n{REPLY_MARK}",
+            "Still holds on `{head}`: {}\n\n{}{}{}\n\n{REPLY_MARK}",
             clip(&f.finding.finding, TEXT_CHARS),
+            places("Still at", f.finding.places()),
             shown(f, head, patch),
             still(f)
         )
@@ -949,12 +839,13 @@ fn thread_body(f: &Judged, head: &str) -> String {
     };
     fitted(|patch| {
         format!(
-            "**{to}** · `{}` · {} · {}% sure{whole}\n\n**{}**\n\n{}\n\n{}{}\n\n{MARK}{} -->",
+            "**{to}** · `{}` · {} · {}% sure{whole}\n\n**{}**\n\n{}\n\n{}{}{}\n\n{MARK}{} -->",
             f.finding.id,
             f.finding.kind.as_str(),
             f.finding.confidence,
             clip(&f.finding.title, TITLE_CHARS),
             clip(&f.finding.finding, TEXT_CHARS),
+            also_at(f),
             shown(f, head, patch),
             still(f),
             norm(&f.finding.title),
@@ -966,11 +857,26 @@ fn thread_body(f: &Judged, head: &str) -> String {
 /// a thread on its line, and what it cleared.
 fn github_body(ctx: &Ctx, key: &LaneKey, number: PrNumber, done: &ReviewDone) -> String {
     let url = review_url(&ctx.config.public_url, &key.repo, &key.trunk, number);
-    review_body(&url, done)
+    review_body(&url, &key.repo, number, done)
+}
+
+/// Why a change the review cleared is only a note. Empty for one it found fine.
+fn cleared_note(f: &Finding) -> String {
+    match (f.lean, f.shows_the_change(), &f.verified) {
+        (Lean::Fine | Lean::PreExisting, ..) => String::new(),
+        (Lean::Change, true, _) => ", a note under the bar".into(),
+        (Lean::Change, false, Some(v)) => format!(
+            ", a note: {} of {} fresh agents said it holds, and {} had to",
+            v.holds(),
+            v.votes.len(),
+            v.needed
+        ),
+        (Lean::Change, false, None) => ", a note: nothing showed the change was needed".into(),
+    }
 }
 
 /// The review's summary, with `url` where a human answers it: bounded, whatever the agent wrote.
-fn review_body(url: &str, done: &ReviewDone) -> String {
+fn review_body(url: &str, repo: &RepoName, number: PrNumber, done: &ReviewDone) -> String {
     let mut body = String::from("**MergeLoop's review**");
     if let Some(why) = &done.error {
         body.push_str(&format!(
@@ -984,48 +890,74 @@ fn review_body(url: &str, done: &ReviewDone) -> String {
     }
     let sent = done.findings.iter().filter(|f| f.sent_back).count();
     let asks = done.findings.iter().filter(|f| f.asked).count();
-    let cleared: Vec<&Judged> = done
-        .findings
-        .iter()
-        .filter(|f| !f.asked && !f.sent_back)
-        .collect();
+    // Of the rest, a bug the PR did not bring is one to file; the others it cleared.
+    let (mut noted, mut cleared) = (Vec::new(), Vec::new());
+    for f in done.findings.iter().filter(|f| !f.asked && !f.sent_back) {
+        match f.finding.issue_url(repo, number) {
+            Some(issue) => noted.push((f, issue)),
+            None => cleared.push(f),
+        }
+    }
     if sent > 0 {
         body.push_str(&format!(
             "\n\nIt sent {sent} back to the author, each in a thread on its line. For each, fix it and push, or reply with why it doesn't apply, then resolve the thread. Once every thread is resolved, the PR goes on to the merge queue with no human approval."
         ));
     }
     if asks > 0 {
-        let who = match done.asked.as_slice() {
-            [] => "Anyone who may approve this PR".to_owned(),
-            logins => logins
-                .iter()
-                .map(|l| format!("@{l}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-        };
-        body.push_str(&format!(
-            "\n\nIt asks a human about {asks}, each in a thread on its line. {who}: [answer them in MergeLoop]({url}), or approve the PR here on GitHub if they are all fine as they are. The PR keeps its place in the queue meanwhile."
+        body.push_str(&asks_section(asks, &done.asked, url));
+    }
+    body.push_str(&cleared_section(&cleared));
+    body.push_str(&noted_section(&noted));
+    body
+}
+
+/// Who it asks about how many findings, and where they answer.
+fn asks_section(asks: usize, asked: &[String], url: &str) -> String {
+    let who = match asked {
+        [] => "Anyone who may approve this PR".to_owned(),
+        logins => logins
+            .iter()
+            .map(|l| format!("@{l}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    format!(
+        "\n\nIt asks a human about {asks}, each in a thread on its line. {who}: [answer them in MergeLoop]({url}), or approve the PR here on GitHub if they are all fine as they are. The PR keeps its place in the queue meanwhile."
+    )
+}
+
+/// What it cleared, folded away, each with why when it leaned to a change. Nothing when none.
+fn cleared_section(cleared: &[&Judged]) -> String {
+    if cleared.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n<details><summary>What it cleared</summary>\n");
+    for f in cleared {
+        let note = cleared_note(&f.finding);
+        section.push_str(&format!(
+            "\n- {} ({}%{note})",
+            clip(&f.finding.title, TITLE_CHARS),
+            f.finding.confidence
         ));
     }
-    if !cleared.is_empty() {
-        body.push_str("\n\n<details><summary>What it cleared</summary>\n");
-        for f in cleared {
-            let note = match (f.finding.lean, f.finding.shows_the_change()) {
-                (mergepatrol_core::Lean::Change, false) => {
-                    ", a note: nothing showed the change was needed"
-                }
-                (mergepatrol_core::Lean::Change, true) => ", a note under the bar",
-                (mergepatrol_core::Lean::Fine, _) => "",
-            };
-            body.push_str(&format!(
-                "\n- {} ({}%{note})",
-                clip(&f.finding.title, TITLE_CHARS),
-                f.finding.confidence
-            ));
-        }
-        body.push_str("\n\n</details>");
+    section + "\n\n</details>"
+}
+
+/// The bugs it found that the PR did not bring, each with its link to file it. Nothing when none.
+fn noted_section(noted: &[(&Judged, String)]) -> String {
+    if noted.is_empty() {
+        return String::new();
     }
-    body
+    let mut section = String::from(
+        "\n\n**Already there before this PR**: bugs in code it did not bring. They are not this PR's to fix, and hold nothing.\n",
+    );
+    for (f, issue) in noted {
+        section.push_str(&format!(
+            "\n- {} · [file an issue]({issue})",
+            clip(&f.finding.title, TITLE_CHARS)
+        ));
+    }
+    section
 }
 
 async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> Result<()> {
@@ -1086,7 +1018,11 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
         anyhow::Ok(text)
     };
     let answer = answer.await.map_err(|e| format!("{e:#}"));
-    let withdrawn = sent_back && answer.as_deref().is_ok_and(withdraws);
+    let withdrawn = answer
+        .as_deref()
+        .ok()
+        .filter(|_| sent_back)
+        .and_then(withdraws);
     if !ctx
         .store
         .answer_question(r.id, r.claim, &q.id, answer)
@@ -1094,7 +1030,12 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
     {
         return Ok(());
     }
-    if withdrawn && let Some(status) = ctx.store.withdraw_finding(r.id, &q.finding).await? {
+    if let Some(outcome) = withdrawn
+        && let Some(status) = ctx
+            .store
+            .withdraw_finding(r.id, &q.finding, outcome)
+            .await?
+    {
         tracing::info!(repo = %r.repo, pr = r.number, finding = %q.finding, status = status.as_str(), "the agent withdrew a finding");
         if let Some(key) = &lane {
             let message = format!("withdrew {} on the author's reply", q.finding);
@@ -1107,31 +1048,7 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mergepatrol_core::{Bar, Kind, Lean};
-
-    #[test]
-    fn a_posted_review_is_numbered_and_its_evidence_counts_as_failed() {
-        let posted = serde_json::json!({
-            "summary": "s",
-            "findings": [
-                { "kind": "other", "title": "a", "confidence": 120, "lean": "change", "finding": "x",
-                  "evidence": { "command": "cargo test a" } },
-                { "kind": "other", "title": "b", "confidence": 90, "lean": "fine", "finding": "y" },
-            ],
-        });
-        let output = posted_review(&posted).unwrap();
-        let ids: Vec<&str> = output.findings.iter().map(|f| f.id.as_str()).collect();
-        assert_eq!(ids, ["f1", "f2"]);
-        assert_eq!(output.findings[0].confidence, 100);
-        assert!(output.findings[0].shows_the_change());
-        assert!(posted_review(&serde_json::json!({ "findings": "no" })).is_err());
-        // Whoever posted it is named, in code so GitHub pings no one, as any writer of the repo may review for its author.
-        let by = serde_json::json!({ "summary": "s", "findings": [], "by": "octo" });
-        assert_eq!(
-            posted_review(&by).unwrap().summary,
-            "`octo`'s agent reviewed this. s"
-        );
-    }
+    use mergepatrol_core::{Bar, Kind};
 
     fn review(id: i64, sent_back: bool, answered_by: Option<&str>) -> ReviewRecord {
         let finding = Finding {
@@ -1153,12 +1070,14 @@ mod tests {
                 ..Default::default()
             }),
             needs_human: false,
+            verified: None,
+            settled: None,
             code: Vec::new(),
             related: Vec::new(),
+            also_at: Vec::new(),
         };
         ReviewRecord {
             since_head: None,
-            agent_fixed: false,
             claim: 0,
             id,
             installation_id: 1,
@@ -1176,14 +1095,14 @@ mod tests {
                 withdrawn: false,
                 threaded: false,
                 bar: Bar::From(80),
+                outcome: None,
             }],
             asked: Vec::new(),
             answers: Default::default(),
             answered_by: answered_by.map(str::to_owned),
             note: String::new(),
             questions: Vec::new(),
-            brief: None,
-            submitted: None,
+            waited_secs: None,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -1235,6 +1154,39 @@ mod tests {
             "{reply}"
         );
         assert!(reply.contains("FAILED again"), "{reply}");
+        // A bug that recurs names every other place it is, here and in each later reply.
+        f.finding.also_at = vec![
+            mergepatrol_core::Place {
+                file: "b.rs".into(),
+                line: Some(9),
+                code: Vec::new(),
+            },
+            mergepatrol_core::Place {
+                file: "c.rs".into(),
+                line: None,
+                code: Vec::new(),
+            },
+        ];
+        let thread = thread_body(&f, "def5678");
+        assert!(
+            thread.contains("**Also at:** `b.rs:9`, `c.rs`. Fix it at each place."),
+            "{thread}"
+        );
+        // A later reply names every place it still holds, its own too: the thread sits on the
+        // first place it held, which a fix there moves on from.
+        f.finding.file = Some("b.rs".into());
+        f.finding.line = Some(9);
+        f.finding.also_at.remove(0);
+        let reply = still_holds(&f, "def5678");
+        assert!(
+            reply.contains("**Still at:** `b.rs:9`, `c.rs`. Fix it at each place."),
+            "{reply}"
+        );
+        f.finding.also_at.clear();
+        let reply = still_holds(&f, "def5678");
+        assert!(reply.contains("**Still at:** `b.rs:9`.\n"), "{reply}");
+        f.finding.file = None;
+        assert!(!still_holds(&f, "def5678").contains("Still at"));
         // A comment with a test too long for it goes without the test, never with part of it.
         let e = f.finding.evidence.as_mut().unwrap();
         e.patch = format!("+{}", "x".repeat(BODY_CHARS));
@@ -1245,8 +1197,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_security_findings_thread_and_note_say_what_its_panel_voted() {
+        use mergepatrol_core::{Panel, Verdict, Vote};
+        let vote = |verdict| Vote {
+            verdict,
+            why: "The header reaches it.".into(),
+        };
+        let mut f = review(1, true, None).findings.remove(0);
+        f.finding.kind = Kind::Security;
+        f.finding.evidence = None;
+        let cast = vec![
+            vote(Verdict::Holds),
+            vote(Verdict::Holds),
+            vote(Verdict::DoesNotHold),
+        ];
+        f.finding.verified = Some(Panel::FINDING.verdict(cast.clone()));
+        let body = thread_body(&f, "abc1234");
+        assert!(
+            body.contains("MergeLoop had 3 fresh agents check it, each given only this finding and the code: 2 of 3 say it holds, and 2 had to."),
+            "{body}"
+        );
+        assert!(body.contains("The header reaches it."));
+        // Voted down, it is a note that says so.
+        let down = vec![
+            vote(Verdict::Holds),
+            vote(Verdict::DoesNotHold),
+            vote(Verdict::Abstained),
+        ];
+        f.finding.verified = Some(Panel::FINDING.verdict(down));
+        f.sent_back = false;
+        let done = ReviewDone {
+            status: ReviewStatus::Approved,
+            error: None,
+            summary: String::new(),
+            findings: vec![f],
+            asked: Vec::new(),
+        };
+        let body = review_body("https://m.test", &RepoName::parse("o/r").unwrap(), 7, &done);
+        assert!(
+            body.contains("a note: 1 of 3 fresh agents said it holds, and 2 had to"),
+            "{body}"
+        );
+    }
+
     /// However long what the agent wrote, a comment fits GitHub without its test, and with it
     /// only whole: the thread, a reply in it, and the review's summary.
+    #[test]
+    fn a_pre_existing_bug_is_a_note_to_file_not_one_the_review_cleared() {
+        let repo = RepoName::parse("o/r").unwrap();
+        let mut old = review(1, false, None).findings.remove(0).finding;
+        old.title = "The retry never stops".into();
+        old.lean = Lean::PreExisting;
+        let findings = ReviewSettings::default().judge(vec![old.clone()]);
+        let done = ReviewDone {
+            status: review_status(&findings, false),
+            error: None,
+            summary: String::new(),
+            findings,
+            asked: Vec::new(),
+        };
+        assert_eq!(done.status, ReviewStatus::Approved);
+        let body = review_body("https://m.test", &repo, 7, &done);
+        let issue = old.issue_url(&repo, 7).unwrap();
+        assert!(
+            body.contains(&format!(
+                "- The retry never stops · [file an issue]({issue})"
+            )),
+            "{body}"
+        );
+        assert!(!body.contains("What it cleared"), "{body}");
+    }
+
+    /// However long what the agent wrote, a comment fits GitHub without its test, and with it
+    /// only whole: the thread, a reply in it, and the review's summary.
+    #[test]
+    fn a_human_is_asked_by_the_code_owners_of_every_place_a_finding_is() {
+        let owners = CodeOwners::parse("main", "/a.rs @ann\n/b.rs @org/bees\n/c.rs bo@x.io\n");
+        let mut asked = review(1, false, None).findings.remove(0);
+        asked.asked = true;
+        asked.finding.file = Some("a.rs".into());
+        asked.finding.also_at = ["b.rs", "c.rs"]
+            .map(|file| mergepatrol_core::Place {
+                file: file.into(),
+                line: None,
+                code: Vec::new(),
+            })
+            .to_vec();
+        let mut sent = asked.clone();
+        sent.asked = false;
+        sent.finding.file = Some("z.rs".into());
+        assert_eq!(owners_of(&owners, &[asked, sent]), ["ann", "org/bees"]);
+    }
+
     #[test]
     fn every_comment_fits_github_however_long_what_the_agent_wrote() {
         let huge = "y".repeat(200_000);
@@ -1292,25 +1335,27 @@ mod tests {
             findings: std::iter::repeat_n(cleared, 25).chain([f]).collect(),
             asked: Vec::new(),
         };
-        assert!(review_body("https://m.test", &done).chars().count() <= BODY_CHARS);
+        assert!(
+            review_body("https://m.test", &RepoName::parse("o/r").unwrap(), 7, &done)
+                .chars()
+                .count()
+                <= BODY_CHARS
+        );
         let failed = ReviewDone {
             error: Some(huge),
             ..done
         };
-        assert!(review_body("https://m.test", &failed).chars().count() <= BODY_CHARS);
-    }
-
-    #[test]
-    fn the_agent_fixes_only_what_it_sent_back_on_the_authors_own_pr() {
-        let r = review(1, true, None);
-        assert_eq!(fixable(&r, false).len(), 1);
-        assert!(fixable(&r, true).is_empty(), "a fork");
-        assert!(fixable(&review(1, false, None), false).is_empty());
-        let asked = review(1, true, Some("ann"));
-        assert!(fixable(&asked, false).is_empty(), "a human's call");
-        let mut approved = review(1, true, None);
-        approved.status = ReviewStatus::Approved;
-        assert!(fixable(&approved, false).is_empty());
+        assert!(
+            review_body(
+                "https://m.test",
+                &RepoName::parse("o/r").unwrap(),
+                7,
+                &failed
+            )
+            .chars()
+            .count()
+                <= BODY_CHARS
+        );
     }
 
     #[test]
@@ -1325,21 +1370,11 @@ mod tests {
             review(2, true, Some("mona")),
             back(1)
         ]));
-        // The agent's own rounds are not the author's.
-        let fixed = |id| ReviewRecord {
-            agent_fixed: true,
-            claim: 0,
-            ..back(id)
-        };
-        assert!(!rounds_spent(&[fixed(3), fixed(2), fixed(1)]));
-        assert!(rounds_spent(&[
-            back(5),
-            fixed(4),
-            back(3),
-            fixed(2),
-            back(1)
-        ]));
-        assert_eq!(sent_back_before(&[back(3)]).len(), 1);
-        assert!(sent_back_before(&[]).is_empty());
+        // The next review checks the fix, and reads only what changed since the head it was of.
+        let earlier = [back(3), back(2)];
+        let (head, findings) = sent_back_before(&earlier).unwrap();
+        assert_eq!((head, findings.len()), ("head3", 1));
+        assert!(sent_back_before(&[review(3, false, None), back(2)]).is_none());
+        assert!(sent_back_before(&[]).is_none());
     }
 }

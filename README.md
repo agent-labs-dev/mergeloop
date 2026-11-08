@@ -6,9 +6,11 @@ Status: early. Expect rough edges, and [tell us](https://github.com/agent-labs-d
 
 This README is also the website's docs, at [mergeloop.ai/docs](https://mergeloop.ai/docs). `DOCS` in `crates/web/src/docs.rs` picks its `##` sections by heading, and a test fails when one is renamed.
 
-MergeLoop was previously called Mergepatrol. Existing queue labels, `.mergepatrol/mergepatrol.yml`,
-installed `mergepatrol` agent skills, environment variables and API fields retain their names
-so existing repos and clients continue to work. The source repo is now `agent-labs-dev/mergeloop`; GitHub redirects the old name.
+MergeLoop was previously called Mergepatrol. A repo set up before the rename keeps working as
+it is: MergeLoop still reads its config file at `.mergepatrol/mergepatrol.yml`, where the label
+the file leaves out stays `mergepatrol`, and updating the repo's skill moves it from
+`skills/mergepatrol` to `skills/mergeloop`. Self-hosting still reads the `MERGEPATROL_*`
+environment variables. The source repo is now `agent-labs-dev/mergeloop`; GitHub redirects the old name.
 
 ## Try it
 
@@ -16,9 +18,9 @@ The hosted MergeLoop at https://mergeloop.ai runs the public GitHub App [Merge L
 
 1. Sign in with GitHub at https://mergeloop.ai.
 2. Install the App on your organization or account, and choose its repos. GitHub sends you back to the dashboard.
-3. In **Settings**, pick a repo and **Set up**. MergeLoop opens a PR that adds its config file, [`.mergepatrol/mergepatrol.yml`](#repo-settings). Merge it, and the repo queues.
+3. In **Settings**, pick a repo and **Set up**. MergeLoop opens a PR that adds its config file, [`.mergeloop/mergeloop.yml`](#repo-settings). Merge it, and the repo queues.
 4. In **Settings**, add an Anthropic or OpenAI API key. Create one for MergeLoop alone, with a spend limit.
-5. Add the `mergepatrol` label to a PR, or queue it from the dashboard's **Queue** page, which lists the open PRs below the queue, and shows each queued PR's stage and the path it took. The dashboard puts the label on as you, so it takes triage access to the repo.
+5. Add the `mergeloop` label to a PR, or queue it from the dashboard's **Queue** page, which lists the open PRs below the queue, and shows each queued PR's stage and the path it took. The dashboard puts the label on as you, so it takes triage access to the repo.
 6. In **You**, see your open PRs in every repo, by whose move it is, and the PRs that ask for your review or your team's, those the queue holds first. Approve, request changes or comment there, as you. A review waits 5 seconds before it goes to GitHub, so you can undo it.
 
 Public repos are free. Private repos cost $15 a seat a month, after a free trial: see [Pricing](#pricing). To run your own, see [Run it](#run-it).
@@ -41,25 +43,33 @@ Then it runs alone or tested in a [batch](#batches), and merges once its checks 
 
 When a rebase has conflicts, an agent resolves them. Claude is the default. A plain `git rebase` runs first, so the agent runs only on real conflicts. A conflict found in the queue goes back to getting ready, keeping its place, so the agent holds up no other PR.
 
-When a PR's required checks fail, an agent fixes them too. It reads what GitHub shows of the failure, commits a fix on top of the PR, and the checks run again. After three fixes that do not make the checks pass, the PR is ejected. A PR gets three fixes in all, for its checks and its review together, and a push from its author earns new ones. When the agent gives up because the failure is not the PR's to fix, as with a flaky test, an outage or a title since changed, an empty commit runs the checks once more, and a failure then ejects the PR. When what fails is a check of the PR's title, the agent sets a title that meets it, and the checks run the same way. A failure found in the queue goes back to getting ready, keeping its place, so the agent holds up no other PR.
+A PR that keeps up with its base branch by merging, as when its author never force-pushes, is brought up to date the same way: MergeLoop merges the base branch into it and pushes that merge commit without force. A rebase would replay each of its commits and conflict again in files its merges already resolve. A PR whose rebase conflicts while a merge of the base branch is clean is merged too. A conflict in the merge goes to the agent once, on the merge, and the same checks hold: no file outside the PR, no conflict markers left. A repo that merges PRs by rebasing them always gets a rebase, as GitHub would replay the merge's commits too. A rebase that runs out of time merges the base branch in instead; the time running out is never a reason to eject the PR.
+
+When a PR's required checks fail, MergeLoop first runs their failed GitHub Actions jobs again, once for each head, since a failure such as a dropped network request may pass on the next run. That needs the App's `actions: write` permission: an App created before this permission existed must be given it on GitHub, and until then the checks go straight to the fix. A check that is not a GitHub Actions job is not run again. If the checks still fail, an agent fixes them. It reads what GitHub shows of the failure, commits a fix on top of the PR, and the checks run again. After three fixes that do not make the checks pass, the PR is ejected. A PR gets three fixes in all, and a push from its author earns new ones. When the agent gives up because the failure is not the PR's to fix, as with a flaky test, an outage or a title since changed, an empty commit runs the checks once more, and a failure then ejects the PR. When what fails is a check of the PR's title, the agent sets a title that meets it, and the checks run the same way. A failure found in the queue goes back to getting ready, keeping its place, so the agent holds up no other PR. Without a model API key in the workspace's settings, no agent can fix the checks: a PR whose checks still fail after they run again is ejected, and its comment says to add a key.
 
 ### Automatic review
 
 Automatic review is on for every workspace with a model key: an agent reviews every queued PR before it takes its place in line. It reads the change and the code around it, and reports each thing it looked at with how sure it is.
 
-**The reviewer must show a check that actually fails before sending a non-security change back.** For every non-security finding marked `change`, the reviewer names a runnable evidence command and, when needed, writes a focused test. MergeLoop then runs that command itself on the PR's head, with only the files the finding names. Only a failure MergeLoop saw in its own run counts; the reviewer's claim that it ran something does not. A passing command, a timeout or a command that could not start does not qualify. A repo whose author's agent reviews, with [`agent.runs: local`](#repo-settings), is the exception: nothing runs its evidence again, so MergeLoop takes the agent's word that the command failed.
+The reviewer holds a PR to your repo's own instructions. It reads `AGENTS.md` and `CLAUDE.md`, and the docs they point to, and reports code that breaks a convention they state, citing the line, and a change that leaves a line in them out of date. A `REVIEW.md` tells it what matters in a review of your repo: what failure looks like there, paths to skip, how many small findings are worth reporting. It reads each of these files at the repo's root and in every directory the PR changes, a deeper one adding to those above it, as they are on the PR's base: a PR that edits `REVIEW.md` is reviewed by the old one. MergeLoop's own agent loads no other copy. `REVIEW.md` steers what the reviewer reports; it cannot lift the evidence rule below.
 
-Without that failure, the finding is cleared as a note and holds nothing. Cleared findings remain visible in MergeLoop's review. When a review is posted on GitHub, they appear under **What it cleared**. A review that clears everything posts nothing on GitHub. Nothing is silently dropped.
+**The reviewer must show a check that actually fails before sending a non-security change back**, unless the repo's **Review depth** is **Deep**. For every non-security finding marked `change`, the reviewer names a runnable evidence command and, when needed, writes a focused test. MergeLoop then runs that command itself on the PR's head, with only the files the finding names. Only a failure MergeLoop saw in its own run counts; the reviewer's claim that it ran something does not. A passing command, a timeout or a command that could not start does not qualify.
 
-Security findings can still ask for a change on the code alone. A change marked `needs_human` still goes to a human, as do kinds configured to always ask, such as migrations. Those paths do not require a failing command.
+Without that failure, the finding is cleared as a note and holds nothing; at **Deep**, a panel votes on it instead, as below for a security change. Cleared findings remain visible in MergeLoop's review. When a review is posted on GitHub, they appear under **What it cleared**. A review that clears everything posts no summary on GitHub. Nothing is silently dropped.
 
-A change that meets these rules and its confidence bar goes to the agent's fix first, while the PR has fixes left: it pushes a commit, which the next review checks, and nothing is posted. That is on with **Fix attempts**, and leaves out forks. On a stack, the fix goes on the layer the review read, and the layers above it are rebased onto it. If it cannot fix it, or the PR has no fixes left, the change goes back to the PR's author, often the agent that built it, as a review comment on its line: one thread per finding, saying what to change. **Shows it** gives the command MergeLoop ran, what it printed and any test patch; a test too large for the GitHub comment is available in full from MergeLoop's review. The author works each thread: fix it and push, or reply with why it doesn't apply, then resolve it. Once every thread is resolved, the PR goes on to the merge queue with no human approval.
+**A security change with no failing command goes back only if fresh agents agree it holds.** A hole often shows in the code alone, with no test to fail, so MergeLoop has three fresh agents check each such finding, at once, each in a checkout of the PR's head of its own. Each sees only what the finding claims and the code, not how the reviewer got there, nor the others' answers, and votes on whether it holds. It goes back to the author only when two of the three say it holds. Otherwise it is cleared as a note that says how the vote went. The votes, and why each agent cast its own, show on the finding in MergeLoop's review and in its thread on GitHub.
 
-A push gets a new review, which checks each finding sent back, with the author's replies in front of it. A finding still there gets a reply in its own thread, which opens again, never a new comment. A thread whose finding is fixed, or whose reply holds up in the code, is resolved. After three rounds that still send findings back, the next review asks a human instead. An author can also reply to a finding with `ask_agent_about_review`: the agent reads the code again, and withdraws the finding if the reply holds up.
+A change marked `needs_human` still goes to a human, as do kinds configured to always ask, such as migrations. Those paths do not require a failing command or a vote.
+
+A change that meets these rules and its confidence bar goes back to the PR's author, often the agent that built it, never to a fix of MergeLoop's own: the author decides what to make of each finding. It comes as a GitHub review that requests changes, with a thread on its line for each finding, saying what to change, so GitHub too holds the PR until the review clears. A review that only asks a human is a comment. **Shows it** gives the command MergeLoop ran, what it printed and any test patch; a test too large for the GitHub comment is available in full from MergeLoop's review. The author works each thread: fix it and push, or reply with why it doesn't apply, then resolve it. Once every thread is resolved, MergeLoop dismisses its request for changes and the PR goes on to the merge queue with no human approval.
+
+A push gets a new review, which checks each finding sent back, with the author's replies in front of it. It reads only the commits pushed since the head it sent them back on, and reports nothing about the rest of the PR unless those commits break it; after a rebase, or a merge of the base branch into the PR, it reads the whole PR again. A finding still there gets a reply in its own thread, which opens again, never a new comment. A thread whose finding is fixed, or whose reply holds up in the code, is resolved, and a review that sends nothing back dismisses the request for changes of the last. After three rounds that still send findings back, the next review asks a human instead. An author can also reply to a finding with `ask_agent_about_review`: the agent reads the code again, and withdraws the finding if the reply holds up.
 
 A human is asked only about what the author cannot settle from the PR: a call on scope, product or design, access it lacks, a change outside the repo, or a kind the workspace always asks about. The agent then requests a review from the code owners of the lines in question, comments on the PR, and lists those findings on the dashboard, each with its code, why it needs a human, and what the agent already checked. The human answers each one, fine as is or needs a change, or asks the agent to dig further. A change asked for is a review with the change on its line: the PR keeps its place, and the agent reviews it again on the next push, knowing what was answered. The agent never approves on GitHub itself.
 
-Each kind of change has a bar: how sure the agent must be to send a change back to the author. A lower bar sends back more. The defaults: 60% for security, 70% for dependencies and for public APIs, 80% for everything else, and migrations always go to a human. A change under the bar shows as a note and holds nothing. For a non-security change, confidence alone never replaces the evidence requirement.
+Each kind of change has a bar: how sure the agent must be to send a change back to the author. A lower bar sends back more. The defaults: 60% for security, 70% for dependencies and for public APIs, 80% for everything else, and migrations always go to a human. A change under the bar shows as a note and holds nothing. Confidence alone never replaces the evidence requirement, nor a panel's vote.
+
+**Review depth** sets how hard the review looks, and so what it spends. **Standard**, the default, is one reviewer, as above. **Quick** is one reviewer that reports only what could be wrong, leaving out what it checked and found sound. **Deep** is for code where one missed bug costs more than the extra review: three reviewers look at once, each fresh, in a checkout of the head of its own, and their findings merge, one per issue: two of the same kind about the same place, a few lines apart, are one. Then a panel of three fresh agents votes on every change, of any kind, that no failing command shows, as it does on a security change at any depth: it goes back to the author when two agree it holds. A deep review spends several times what a standard one does, which shows in each run's spend on the dashboard. A repo sets it in its config file as `review.depth`.
 
 **Require resolved comments**, on by default, makes the gate wait for every review thread on the PR to be resolved, whoever started it: the agent's, a human's or a bot's. It is the same rule as GitHub's "Require conversation resolution before merging", so a repo can turn that on in its branch protection too, to hold merges made outside the queue. A repo sets it in its config file as `review.require_resolved`. The App hears of a resolved thread from the `pull_request_review_thread` event: an App created before the event was added must subscribe to it on GitHub, or the queue sees the thread resolved only on its next read of the PR. **Settings** shows how the agent's confidence has held up against the humans' answers, to set each bar by. A workspace can turn automatic review off. It does not review PRs from forks: a human reviews those. A clean rebase by the queue keeps the approval. A fix by the queue's agent, or a conflict it resolved, does not: the PR merges once the agent has reviewed that change, on its own.
 
@@ -71,7 +81,7 @@ An error outside the PR's job does not eject it. That covers GitHub being down, 
 
 ### Branches
 
-The default branch has a queue, and so does each branch that `branches` in [`.mergepatrol/mergepatrol.yml`](#repo-settings) lists, `release` say. A labeled PR joins the queue of the branch it targets, and is rebased onto that branch. A PR into any other branch is held, as is a PR stacked by hand on another PR's branch: a stack made with `gh stack` joins the queue of the branch the whole stack merges into. The queues of a repo take turns, one job each, so a busy branch does not hold another up; they share the repo's git cache, so two never run a job at once. A batch holds PRs into one branch only.
+The default branch has a queue, and so does each branch that `branches` in [`.mergeloop/mergeloop.yml`](#repo-settings) lists, `release` say. A labeled PR joins the queue of the branch it targets, and is rebased onto that branch. A PR into any other branch is held, as is a PR stacked by hand on another PR's branch: a stack made with `gh stack` joins the queue of the branch the whole stack merges into. The queues of a repo take turns, one job each, so a busy branch does not hold another up; they share the repo's git cache, so two never run a job at once. A batch holds PRs into one branch only.
 
 A PR retargeted to another branch leaves its queue, and joins the other branch's at the back. Deleting a branch closes the PRs into it, which leave its queue. A branch taken off the list holds its PRs. The settings in the file, on the default branch, apply to every branch's queue.
 
@@ -79,7 +89,7 @@ A PR retargeted to another branch leaves its queue, and joins the other branch's
 
 A queue that runs CI once per PR merges a few PRs an hour. So when several queued PRs have passed their own checks, MergeLoop tests them together:
 
-1. It merges them, in queue order, onto a branch `mergepatrol/batch-<PRs>` at the base branch, and opens a draft PR from it, so the repo's `pull_request` CI runs on the combination. The draft's title is the first PR's title, plus a note, so a PR title check passes.
+1. It merges them, in queue order, onto a branch `mergeloop/batch-<PRs>` at the base branch, and opens a draft PR from it, so the repo's `pull_request` CI runs on the combination. The draft's title is the first PR's title, plus a note, so a PR title check passes.
 2. When the required checks pass, it merges the PRs one by one, as they are: no rebase, and no second CI run. Each merge must leave the base branch at the tree that the batch tested, else it stops.
 3. It deletes the branch, which closes the draft PR.
 
@@ -94,7 +104,7 @@ A stack of PRs, made with `gh stack`, is one item of the queue: the label on any
 - The stack gets ready as one item, off the queue, like a single PR: a conflict on any layer rebases the whole stack, and it waits for each layer's checks. A failed check is fixed on the lowest layer it failed on, and the layers above it are rebased onto the fix. The layers share one fix budget.
 - The stack waits while any of its PRs is a draft or waits for a review.
 - In a batch, the stack is one step: its top PR holds every layer below it.
-- Alone, MergeLoop rebases each layer onto the one below it, the bottom onto the base branch, and waits for each layer's checks. A failed check is fixed on the layer it failed on, and the layers above it are rebased onto the fix.
+- Alone, MergeLoop rebases each layer onto the one below it, the bottom onto the base branch, and waits for each layer's checks. A layer that keeps up by merging, over a layer below that did too, has the layer below merged into it instead. Over a rebased layer, a layer is rebased. A failed check is fixed on the layer it failed on, and the layers above it are rebased onto the fix.
 - A failed stack is ejected whole.
 
 Every merge goes through the asynchronous merge API, stacked or not. A merge still pending when MergeLoop restarts is waited for, not requested again.
@@ -106,7 +116,7 @@ A maintainer queues a PR from a fork with the label, as any other. Its author is
 - It merges the PR only as it was when the label went on. MergeLoop reads that head from the `labeled` webhook, or, without webhooks, from when it first sees the PR. If the author pushes after that, the PR leaves the queue, and a maintainer adds the label again to queue the new commits.
 - It never tests the PR in a batch, whose draft PR runs CI with the repo's secrets. The PR runs alone, with the fork's own CI.
 - It skips getting ready. No agent runs on it, and running alone, it is rebased and its checks run again in the queue anyway.
-- It runs no agent on the PR: a plain `git rebase` only. A conflict, or a failed required check, ejects the PR, for its author to fix.
+- It runs no agent on the PR: a plain `git rebase`, or merge of the base branch, only. A conflict, or a failed required check, ejects the PR, for its author to fix.
 - It pushes the rebase to the fork, which GitHub allows while the author allows edits by maintainers. Without that, a PR that needs a rebase waits on hold until they allow it. GitHub does not let the App push to a fork that an organization owns, nor push changes to workflow files to a fork: such a PR that needs a rebase is ejected, for its author to rebase.
 - While GitHub waits for a maintainer to approve the fork's workflow runs, the PR waits on hold.
 
@@ -138,7 +148,7 @@ GitHub webhooks wake a queue as soon as something changes, but GitHub only deliv
 
    ```bash
    docker compose up --build -d
-   docker compose logs mergepatrol | grep setup_token
+   docker compose logs mergeloop | grep setup_token
    ```
 
    Or without Docker for MergeLoop itself, with Rust (`rust-toolchain.toml` picks the version) and Node 24 with pnpm:
@@ -159,7 +169,7 @@ GitHub webhooks wake a queue as soon as something changes, but GitHub only deliv
    4. In **Repos**, set up the repos to queue. Each gets a PR that adds its config file: see [Repo settings](#repo-settings). Merge it, and the repo queues.
    5. In **Settings**, add your Anthropic or OpenAI API key. MergeLoop checks it with the provider, then stores it encrypted. Create a key for MergeLoop alone, with a spend limit (for Anthropic, in a workspace with one), so a leaked key costs at most the limit. For OpenAI, you can **Sign in with ChatGPT** instead, and Codex runs on your ChatGPT plan. MergeLoop signs in the way the Codex CLI does, which OpenAI does not support for other apps and could stop at any time: keep an API key to switch back to.
 
-4. Add the `mergepatrol` label to a PR to queue it. MergeLoop creates the queue labels on each repo it queues.
+4. Add the `mergeloop` label to a PR to queue it. MergeLoop creates the queue labels on each repo it queues.
 
 Anyone with a GitHub account can sign in. Each installation of the App is a workspace, with its own repos and its own model API keys. A user sees the workspaces that GitHub lets them access. A session reads them from GitHub again every hour, so a new installation shows up, and a lost one goes, within the hour. A session lasts 30 days from its last use, and ends when GitHub stops taking the user's token: when they revoke it, or after 6 months, when GitHub's refresh token expires.
 
@@ -173,7 +183,7 @@ If you reach MergeLoop at another address than http://localhost:8080, set `MERGE
 | `MERGEPATROL_SECRET_KEY` | (required) | Encrypts the stored secrets. 32 bytes, base64. To rotate it, see [Rotate the secret key](#rotate-the-secret-key) |
 | `MERGEPATROL_SECRET_KEY_FILE` | | A file that holds the secret key, instead of `MERGEPATROL_SECRET_KEY`. Compose uses one |
 | `MERGEPATROL_PUBLIC_URL` | `http://localhost:8080` | Where users reach the dashboard |
-| `MERGEPATROL_LABEL` | `mergepatrol` | The default trigger label. `<label>:priority` jumps the queue, and ejected PRs get `<label>:failed` |
+| `MERGEPATROL_LABEL` | `mergeloop` | The default trigger label. `<label>:priority` jumps the queue, and ejected PRs get `<label>:failed` |
 | `MERGEPATROL_POLL_SECS` | `60` | How often to poll GitHub, in case a webhook is lost |
 | `MERGEPATROL_BATCH_SIZE` | `8` | The default batch size: the most PRs tested together. `1` merges one PR at a time |
 | `MERGEPATROL_MAX_JOBS` | `4` | The most rebase and fix jobs that run at once, across every queue |
@@ -195,7 +205,7 @@ The hosted MergeLoop uses one public GitHub App, which we create by hand on GitH
 | `MERGEPATROL_GITHUB_CLIENT_SECRET` | The OAuth client secret |
 | `MERGEPATROL_GITHUB_WEBHOOK_SECRET` | The webhook secret. Optional: without it, MergeLoop only polls |
 
-The App needs the permissions in `crates/github/src/setup.rs` (`manifest`), each with the reason it is there, the callback URL `<public URL>/auth/callback`, the setup URL `<public URL>/setup/installed`, and the webhook URL `<public URL>/webhooks/github`, subscribed to the events in `WEBHOOK_EVENTS` in the same file. An App created before `workflows: write` joined the manifest must be given it on GitHub, or the push of a rebase or fix of a PR that changes `.github/workflows` is refused.
+The App needs the permissions in `crates/github/src/setup.rs` (`manifest`), each with the reason it is there, the callback URL `<public URL>/auth/callback`, the setup URL `<public URL>/setup/installed`, and the webhook URL `<public URL>/webhooks/github`, subscribed to the events in `WEBHOOK_EVENTS` in the same file. An App created before `workflows: write` joined the manifest must be given it on GitHub, or the push of a rebase or fix of a PR that changes `.github/workflows` is refused. An App created before the `repository` event joined `WEBHOOK_EVENTS` must be subscribed to it on GitHub (the App's settings, **Permissions & events**, **Repository**). Until then, a change to a repo's merge settings reaches MergeLoop at its next merge or within 15 minutes.
 
 ### Rotate the secret key
 
@@ -210,14 +220,13 @@ On GCP, a deploy runs the old revision beside the new one for a while, and each 
 
 ## Repo settings
 
-Each repo sets its queue in `.mergepatrol/mergepatrol.yml` on its default branch. MergeLoop reads the file from there, so a PR cannot change its own settings. A setting the file leaves out follows the workspace, so an empty file is valid, and inherits everything. **Settings** sets the workspace's defaults for the label, batch size, model, effort, task models and CI fixes. They apply at once, with no PR, to every repo that follows them. A workspace that has set none follows the instance: on a self-hosted MergeLoop, the `MERGEPATROL_*` variables in [Environment variables](#environment-variables).
+Each repo sets its queue in `.mergeloop/mergeloop.yml` on its default branch. MergeLoop reads the file from there, so a PR cannot change its own settings. A setting the file leaves out follows the workspace, so an empty file is valid, and inherits everything. **Settings** sets the workspace's defaults for the label, batch size, model, effort, task models and CI fixes. They apply at once, with no PR, to every repo that follows them. A workspace that has set none follows the instance: on a self-hosted MergeLoop, the `MERGEPATROL_*` variables in [Environment variables](#environment-variables).
 
 ```yaml
 version: 1
-label: mergepatrol
+label: mergeloop
 batch_size: 8
 agent:                  # the default model, which every task runs unless it overrides it
-  runs: hosted          # or local: the PR's author's agent resolves conflicts, fixes checks, reviews
   provider: anthropic   # or openai
   model: claude-opus-5-5
   effort: medium        # low, medium, high, xhigh or max
@@ -233,7 +242,7 @@ verify:
   - cargo check
 fix_ci:
   enabled: true    # an agent fixes failed required checks
-  attempts: 3      # 1 to 5 fixes, for its checks and its review, before the PR is ejected
+  attempts: 3      # 1 to 5 fixes of its checks before the PR is ejected
 branches:          # queues besides the default branch's: exact names
   - release
 review:            # over the workspace's automatic review settings
@@ -242,25 +251,24 @@ review:            # over the workspace's automatic review settings
     security: always_ask
     dependencies: 95
   require_resolved: true   # wait for every review thread to be resolved
+  depth: deep              # quick, standard or deep: how hard the review looks
 ```
 
 The agent runs Claude Code for Anthropic's models, and Codex for OpenAI's, with the workspace's key for the provider from **Settings**. A workspace signed in to ChatGPT runs Codex on its plan instead of the OpenAI key. A file that sets another provider than the instance's default must set its model too.
 
 The agent has three tasks: resolving a rebase's conflicts, fixing failed checks, and reviewing. Each runs the default model unless `agent.overrides` gives it its own. A task that sets another provider than the default's must set its model too. The dashboard offers each provider's current models by name; the file takes the model's API id, and may name any model the provider serves. A file that still says `resolver:`, the section's old name, reads as `agent:`.
 
-`agent.runs: local` leaves a PR's conflicts and failed checks to the agent of its author, such as Claude Code or Codex on their machine, which runs [`mergeloop`](#the-mergeloop-command). While a PR gets ready, a conflict with its base branch or a failed required check holds it, keeping its place, and MergeLoop's agent does not run on it: `mergeloop` tells the author's agent what to rebase or which checks to fix, and the push settles it. The fix budget of `fix_ci` counts only MergeLoop's fixes, so it does not bound the author's. The review, too, waits for the author's agent: `mergeloop` hands it the prompt MergeLoop's own agent would run, with what the last review sent back, to run in a fresh subagent on a checkout of the PR's head, and the agent posts what it found with `post_review`. Anyone who may write to the repo may run it for the author, so the review names whose agent ran it. MergeLoop judges each finding against the repo's bars as it does its own, sends what must change back to the author as review threads, and starts no fix of its own. An `evidence` command counts as failed on the agent's word, as nothing runs it again. Answering a question about a finding still takes the workspace's model key. MergeLoop's agent still resolves conflicts for a self-hosted MergeLoop that sets `MERGEPATROL_PREP=false`, which gets PRs ready in the queue instead. The default, `hosted`, runs MergeLoop's agent, as above.
+The `verify` commands declared in `.mergeloop/mergeloop.yml` run after an agent resolution or fix, before the publish. They must pass for that resolution or fix to land.
 
-The `verify` commands declared in `.mergepatrol/mergepatrol.yml` run after an agent resolution or fix, before the publish. They must pass for that resolution or fix to land.
-
-A repo with no `verify` commands, whether the setting is omitted or `verify: []`, gets commands derived from the `run` steps of its `.github/workflows/*.yml` and `*.yaml` workflows that run on `pull_request`. MergeLoop reads those files from its own checkout, or from GitHub at the PR's head when the author's agent reviews, and gives the commands to the reviewer and fixer. The reviewer uses them to build a failing check, and the fixer runs them after its change. The [review evidence requirement](#automatic-review) still applies: MergeLoop must see the evidence command fail itself before sending a non-security change back, unless the author's agent reviewed.
+A repo with no `verify` commands, whether the setting is omitted or `verify: []`, gets commands derived from the `run` steps of its `.github/workflows/*.yml` and `*.yaml` workflows that run on `pull_request`. MergeLoop reads those files from its own checkout, and gives the commands to the reviewer and fixer. The reviewer uses them to build a failing check, and the fixer runs them after its change. The [review evidence requirement](#automatic-review) still applies: MergeLoop must see the evidence command fail itself before sending a non-security change back.
 
 Derived commands guide the agents; they never eject a PR. Only commands declared in `verify` gate a resolution or fix, so set that list to pin what must pass. GitHub's required checks still gate merging as usual. A workflow step that needs the workflow's context, a secret or another host is left out: the job has the toolchains, not your CI's services. If no usable commands remain, the reviewer follows the repo's docs to build a check; it still needs a failure MergeLoop can reproduce.
 
-A fix runs in the sandbox, like a rebase, while the PR keeps its place at the head of the queue. It may change any file except those under `.github/` and `.mergepatrol/`. The agent gets each failed check's output and annotations, and for a GitHub Actions job, the end of its log. The log needs the App's `actions: read` permission: an App created before this permission existed must be given it on GitHub, or the agent works from the output alone.
+A fix runs in the sandbox, like a rebase, while the PR keeps its place at the head of the queue. It may change any file except those under `.github/` and `.mergeloop/`. The agent gets each failed check's output and annotations, and for a GitHub Actions job, the end of its log. The log needs the App's `actions: read` permission: an App created before this permission existed must be given it on GitHub, or the agent works from the output alone.
 
 A repo queues once its default branch has the file. MergeLoop looks for it in every repo every 5 minutes, and at once when a push webhook adds or removes it. **Turn on** and **Turn off** in **Settings** override the file, until you choose **Follow the config file**.
 
-The dashboard edits the file through PRs. **Set up** opens a PR that adds a file with nothing but its version, and the `mergepatrol` agent skill at `.agents/skills/mergepatrol/SKILL.md` and `.claude/skills/mergepatrol/SKILL.md`, so coding agents in the repo queue their PRs rather than merge them. A change to a repo's settings opens one that writes only what differs from the workspace. Both come from the branch `mergepatrol/config`: a second change updates the open PR. A repo that queues gets the PR queued too, as does the PR that updates its skill, so it goes through review and checks like any other PR. The queue uses the new settings once the PR merges.
+The dashboard edits the file through PRs. **Set up** opens a PR that adds a file with nothing but its version, and the `mergeloop` agent skill at `.agents/skills/mergeloop/SKILL.md` and `.claude/skills/mergeloop/SKILL.md`, so coding agents in the repo queue their PRs rather than merge them. A change to a repo's settings opens one that writes only what differs from the workspace. Both come from the branch `mergeloop/config`: a second change updates the open PR. A repo that queues gets the PR queued too, as does the PR that updates its skill, so it goes through review and checks like any other PR. The queue uses the new settings once the PR merges.
 
 **Update all** in **Settings** brings every queuing repo up to date at once, and says what it did to each. For a repo behind, it opens a PR that rewrites the config file the way MergeLoop writes it now, keeping only what differs from the workspace, and a PR that writes the current skill, then queues them, so they go through the repo's review and checks like any other PR. It skips a repo with no config file, or one that does not parse. It leaves alone an open settings PR that changes the settings or would lose comments, and opens but does not queue a new PR that would drop comments from the file. Run it again as often as you like: a repo up to date gets no PR.
 
@@ -318,6 +326,7 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `get_fix` | The diff of a commit the fix agent pushed | |
 | `list_history` | The PRs that left the queue: merged, ejected, or removed | Yes |
 | `get_history_stats` | The queue's numbers over a window | Yes |
+| `get_review_stats` | How the agent's review did over a window: what became of each change it asked for, reviews to pass, time asked of people | Yes |
 | `list_repos` | The workspace's repos, and whether each queues | Yes |
 | `set_repo` | Turns a repo's queue on or off, or back to following its config file | Or a token with admin on the repo |
 | `list_open_pulls` | A repo's open PRs that are not queued | |
@@ -334,15 +343,14 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `answer_agent_review` | Answers what the agent's review asks, as your review on GitHub | |
 | `ask_agent_about_review` | Asks the agent about one of its findings, or replies to one it sent back | |
 | `ask_agent_review_reviewers` | Asks others to answer the agent's review | |
-| `post_review` | Posts the review a PR's author's agent ran, where the repo sets `agent.runs: local` | |
 | `mark_pull_seen` | Marks a PR read in your inbox | Yes |
 | `snooze_pull` | Puts a PR out of your inbox for a while | Yes |
 | `unsnooze_pull` | Puts a snoozed PR back in your inbox | Yes |
 | `nudge_reviewers` | Mentions reviewers in a comment, asking them to review | |
 | `get_repo_config` | A repo's queue settings | |
 | `propose_repo_config` | Opens a PR that changes a repo's queue settings | Yes |
-| `get_repo_skill` | Whether a repo has the current `mergepatrol` agent skill | |
-| `update_repo_skill` | Opens a PR that updates a repo's `mergepatrol` agent skill | Yes |
+| `get_repo_skill` | Whether a repo has the current `mergeloop` agent skill | |
+| `update_repo_skill` | Opens a PR that updates a repo's `mergeloop` agent skill | Yes |
 | `update_repo` | Opens and queues the PRs that bring a queuing repo up to the latest settings and agent skill | Yes |
 | `get_repo_defaults` | What the workspace's repos follow where their config files say nothing | Yes |
 | `set_repo_defaults` | Sets what the workspace's repos follow, at once and with no PR | Yes |
@@ -353,7 +361,7 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `delete_chatgpt_login` | Removes the ChatGPT login | Yes |
 | `poll_chatgpt_login` | Finishes the ChatGPT sign-in once the user entered the code | Yes |
 | `get_review_settings` | The agent's review settings, and its track record | Yes |
-| `set_review_settings` | Turns the agent's review on or off, and sets how sure it must be | Yes |
+| `set_review_settings` | Turns the agent's review on or off, and sets how hard it looks and how sure it must be | Yes |
 | `get_billing` | The workspace's plan and seats | Yes |
 | `start_checkout` | A Stripe page to subscribe | Yes |
 | `open_billing_portal` | A Stripe page to manage the subscription | Yes |
@@ -385,7 +393,7 @@ The second form reads up to 100 PRs of one repo, as `{ "pulls": [...] }` in the 
   "repo": "acme/widgets",
   "number": 42,
   "url": "https://mergeloop.ai/acme/widgets/pull/42",
-  "mergepatrol": {
+  "mergeloop": {
     "state": "on",
     "installed": true,
     "has_config": true,
@@ -415,10 +423,10 @@ The second form reads up to 100 PRs of one repo, as `{ "pulls": [...] }` in the 
 | Field | Says |
 | --- | --- |
 | `url` | The PR in the dashboard. It opens the PR's lane while queued, its history once merged or ejected, the repo's settings while MergeLoop is off there, and the repo's open PRs otherwise |
-| `mergepatrol.state` | `on`, `off` (no App on the repo, no config file, or turned off), or `paused` (the config file does not parse: `config_error` says why) |
-| `mergepatrol.override` | `on` or `off` when turned so in the dashboard, whatever the config file says. `null` follows the file |
-| `mergepatrol.hold` | Why any PR queued now goes on hold, before it is queued: `{ reason, layer, message }` as in `queue.hold`, with `reason` `no_subscription` (a private repo on the hosted MergeLoop, without a subscription) or `fair_use_limit`. `null` when nothing about the repo holds it |
-| `mergepatrol.missing_key` | The agent's tasks on this repo that the workspace has no model key for: `{ tasks, message, settings_url }`, each task `{ task, provider }` with `task` `rebase` (resolving a rebase's conflicts), `fix` (fixing failed checks) or `review`. Without the key, a conflict or a failed check ejects the PR. `settings_url` is where to add the key. `null` when the workspace has a key for each task |
+| `mergeloop.state` | `on`, `off` (no App on the repo, no config file, or turned off), or `paused` (the config file does not parse: `config_error` says why) |
+| `mergeloop.override` | `on` or `off` when turned so in the dashboard, whatever the config file says. `null` follows the file |
+| `mergeloop.hold` | Why any PR queued now goes on hold, before it is queued: `{ reason, layer, message }` as in `queue.hold`, with `reason` `no_subscription` (a private repo on the hosted MergeLoop, without a subscription) or `fair_use_limit`. `null` when nothing about the repo holds it |
+| `mergeloop.missing_key` | The agent's tasks on this repo that the workspace has no model key for: `{ tasks, message, settings_url }`, each task `{ task, provider }` with `task` `rebase` (resolving a rebase's conflicts), `fix` (fixing failed checks) or `review`. Without the key, a conflict or a failed check ejects the PR. `settings_url` is where to add the key. `null` when the workspace has a key for each task |
 | `queue` | `null` unless queued. `state` is `waiting`, `running` or `held`. `position` counts from 1 in the order the queue takes PRs. `stack` is `{ number, layers }` for a stack. `batch_pr` is the draft PR testing it, while it runs in a batch |
 | `queue.hold.reason` | `draft`, `review_required`, `changes_requested`, `workflow_approval` (a fork PR's runs wait for approval), `fork_edits_off` (a fork PR behind its trunk that does not allow edits by maintainers), `no_queue` (it targets a branch without a queue), `no_subscription`, `fair_use_limit`, `reviewing` (the agent's automatic review runs), `review_asks` (that review waits for a human's answers) `review_changes` (it sent findings back to the author, or a human answering it asked for changes, and it waits for the author) or `unresolved_threads` (review threads on it are unresolved, and the gate waits for them all). `layer` is the stack's PR that holds it |
 | `merged`, `ejected` | How it last left the queue: `{ at, sha }` or `{ at, reason }`. Both `null` while it is queued, and when it left otherwise |

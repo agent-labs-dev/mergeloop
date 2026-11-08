@@ -7,8 +7,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use mergepatrol_core::{
-    Answer, Bar, CodeLine, Judged, Kind, Lean, LineKind, PrNumber, Question, Related, RepoName,
-    ReviewOverrides, ReviewSettings, ReviewStatus,
+    Answer, Bar, CodeLine, Depth, Judged, Kind, Lean, LineKind, Outcome, PrNumber, Question,
+    Related, RepoName, ReviewOverrides, ReviewSettings, ReviewStatus,
 };
 use mergepatrol_github::setup::{self, LineComment, Verdict};
 use mergepatrol_store::{ReviewAnswers, ReviewRecord};
@@ -90,6 +90,10 @@ pub struct RepoReviewView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub require_resolved: Option<bool>,
+    /// How hard its review looks. Unset follows the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "\"quick\" | \"standard\" | \"deep\"")]
+    pub depth: Option<Depth>,
 }
 
 impl From<ReviewOverrides> for RepoReviewView {
@@ -98,6 +102,7 @@ impl From<ReviewOverrides> for RepoReviewView {
             enabled: o.enabled,
             bars: bar_views(&o.bars),
             require_resolved: o.require_resolved,
+            depth: o.depth,
         }
     }
 }
@@ -108,6 +113,7 @@ impl From<RepoReviewView> for ReviewOverrides {
             enabled: v.enabled,
             bars: bars_of(&v.bars),
             require_resolved: v.require_resolved,
+            depth: v.depth,
         }
     }
 }
@@ -122,6 +128,9 @@ pub struct ReviewSettingsView {
     pub bars: Vec<BarView>,
     /// Whether the gate waits for every review thread on a PR to be resolved.
     pub require_resolved: bool,
+    /// How hard the review looks, unless a repo's config file says otherwise.
+    #[ts(type = "\"quick\" | \"standard\" | \"deep\"")]
+    pub depth: Depth,
     pub defaults: Vec<BarView>,
     /// Each kind's findings over `days`, by confidence.
     pub history: Vec<KindHistoryView>,
@@ -160,6 +169,10 @@ pub struct SetReviewSettings {
     #[serde(default)]
     #[ts(optional)]
     pub require_resolved: Option<bool>,
+    /// Unset keeps what is saved.
+    #[serde(default)]
+    #[ts(optional, type = "\"quick\" | \"standard\" | \"deep\"")]
+    pub depth: Option<Depth>,
 }
 
 /// How far back the track record goes.
@@ -182,6 +195,7 @@ async fn settings_view(app: &AppState, id: u64) -> Result<Json<ReviewSettingsVie
         enabled: full.enabled,
         bars: bar_views(&full.bars),
         require_resolved: full.require_resolved,
+        depth: full.depth,
         defaults: bar_views(&ReviewSettings::default().bars),
         history: history(&reviews),
         days: HISTORY_DAYS,
@@ -236,19 +250,27 @@ pub(crate) async fn set_review_settings(
 ) -> Result<Json<ReviewSettingsView>, ApiError> {
     let id = caller.workspace(id)?;
     let saved = app.store.review_settings(id).await?.unwrap_or_default();
-    let mut settings = ReviewSettings {
-        enabled: body.enabled,
-        require_resolved: body.require_resolved.unwrap_or(saved.require_resolved),
-        ..ReviewSettings::default()
-    };
-    settings.bars.extend(bars_of(&body.bars));
+    let settings = settings_from(body, &saved);
     app.store.set_review_settings(id, &settings).await?;
     tracing::info!(
         installation = id,
         enabled = settings.enabled,
+        depth = settings.depth.as_str(),
         "set the review settings"
     );
     settings_view(&app, id).await
+}
+
+/// The settings a PUT saves: what it sets, over the defaults, and what it leaves unset as saved.
+fn settings_from(body: SetReviewSettings, saved: &ReviewSettings) -> ReviewSettings {
+    let mut settings = ReviewSettings {
+        enabled: body.enabled,
+        require_resolved: body.require_resolved.unwrap_or(saved.require_resolved),
+        depth: body.depth.unwrap_or(saved.depth),
+        ..ReviewSettings::default()
+    };
+    settings.bars.extend(bars_of(&body.bars));
+    settings
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
@@ -257,8 +279,6 @@ pub(crate) async fn set_review_settings(
 pub enum AgentReviewStatusView {
     Pending,
     Running,
-    /// Waiting for the author's agent to post its review.
-    Author,
     Asks,
     Approved,
     Changes,
@@ -270,7 +290,6 @@ impl From<ReviewStatus> for AgentReviewStatusView {
         match s {
             ReviewStatus::Pending => Self::Pending,
             ReviewStatus::Running => Self::Running,
-            ReviewStatus::Author => Self::Author,
             ReviewStatus::Asks => Self::Asks,
             ReviewStatus::Approved => Self::Approved,
             ReviewStatus::Changes => Self::Changes,
@@ -320,26 +339,46 @@ pub struct FindingView {
     /// What showed the change is needed, as MergeLoop ran it: the whole test, also when a
     /// comment on GitHub had no room for it.
     pub evidence: Option<EvidenceView>,
+    /// What a panel of fresh agents voted on it, for a security change that shows no evidence.
+    pub verified: Option<VerificationView>,
     pub code: Vec<CodeLineView>,
     pub related: Vec<RelatedView>,
+    /// The other places the same bug is, past `file` and `line`: a fix settles every one.
+    pub also_at: Vec<PlaceView>,
     /// The agent asks a human about it.
     pub asked: bool,
     /// Sent back to the PR's author: the PR waits for a push that fixes it.
     pub sent_back: bool,
     /// The agent withdrew it after the author's reply.
     pub withdrawn: bool,
+    /// For a bug the PR did not bring: a link that opens an issue for it on GitHub.
+    pub issue: Option<String>,
     /// The change needs a call the author cannot make from the PR.
     pub needs_human: bool,
     /// It has a review thread on the PR, which its author resolves.
     pub threaded: bool,
     #[ts(type = "number | \"always_ask\"")]
     pub bar: Bar,
+    /// What became of a change it asked for, once known.
+    #[ts(type = "\"fixed\" | \"wrong\" | \"intended\" | \"dismissed\" | null")]
+    pub outcome: Option<Outcome>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, TS)]
+#[derive(Clone, Copy, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum LeanView {
+    Fine,
+    Change,
+    /// A bug in code the PR did not bring: a note, to file as an issue.
+    PreExisting,
+}
+
+/// A human's call on a finding the agent asks about.
+#[derive(Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CallView {
     Fine,
     Change,
 }
@@ -361,12 +400,55 @@ pub struct EvidenceView {
 
 #[derive(Serialize, TS)]
 #[ts(export)]
+pub struct VerificationView {
+    /// How many had to say it holds.
+    pub needed: u32,
+    /// Enough did: the finding shows its change.
+    pub upheld: bool,
+    pub votes: Vec<VoteView>,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct VoteView {
+    #[ts(type = "\"holds\" | \"does_not_hold\" | \"abstained\"")]
+    pub verdict: mergepatrol_core::Verdict,
+    pub why: String,
+}
+
+impl From<mergepatrol_core::Verification> for VerificationView {
+    fn from(v: mergepatrol_core::Verification) -> Self {
+        VerificationView {
+            needed: v.needed.into(),
+            upheld: v.upheld(),
+            votes: v
+                .votes
+                .into_iter()
+                .map(|v| VoteView {
+                    verdict: v.verdict,
+                    why: v.why,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize, TS)]
+#[ts(export)]
 pub struct CodeLineView {
     pub number: Option<u32>,
     /// `context`, `added` or `removed`.
     pub kind: String,
     pub text: String,
     pub hot: bool,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct PlaceView {
+    pub file: String,
+    pub line: Option<u32>,
+    pub code: Vec<CodeLineView>,
 }
 
 #[derive(Serialize, TS)]
@@ -383,7 +465,7 @@ pub struct RelatedView {
 pub struct AnswerView {
     /// The finding's id.
     pub finding: String,
-    pub call: LeanView,
+    pub call: CallView,
     /// What to change. Required with `change`.
     #[serde(default)]
     pub note: String,
@@ -417,10 +499,13 @@ fn code_view(lines: Vec<CodeLine>) -> Vec<CodeLineView> {
         .collect()
 }
 
-impl From<Judged> for FindingView {
-    fn from(j: Judged) -> Self {
+impl FindingView {
+    /// A finding of the review of `repo`'s PR `number`.
+    fn new(j: Judged, repo: &RepoName, number: PrNumber) -> Self {
+        let issue = j.finding.issue_url(repo, number);
         let f = j.finding;
         FindingView {
+            issue,
             id: f.id,
             kind: f.kind.into(),
             title: f.title,
@@ -430,6 +515,7 @@ impl From<Judged> for FindingView {
             lean: match f.lean {
                 Lean::Fine => LeanView::Fine,
                 Lean::Change => LeanView::Change,
+                Lean::PreExisting => LeanView::PreExisting,
             },
             finding: f.finding,
             unsure: f.unsure,
@@ -444,6 +530,7 @@ impl From<Judged> for FindingView {
                 failed: e.failed,
             }),
             needs_human: f.needs_human,
+            verified: f.verified.map(VerificationView::from),
             code: code_view(f.code),
             related: f
                 .related
@@ -455,11 +542,21 @@ impl From<Judged> for FindingView {
                     code: code_view(r.code),
                 })
                 .collect(),
+            also_at: f
+                .also_at
+                .into_iter()
+                .map(|p| PlaceView {
+                    file: p.file,
+                    line: p.line,
+                    code: code_view(p.code),
+                })
+                .collect(),
             asked: j.asked,
             sent_back: j.sent_back,
             withdrawn: j.withdrawn,
             threaded: j.threaded,
             bar: j.bar,
+            outcome: j.outcome,
         }
     }
 }
@@ -487,7 +584,10 @@ impl From<ReviewRecord> for AgentReviewView {
             head_sha: r.head_sha,
             error: r.error,
             summary: r.summary,
-            findings: findings.into_iter().map(FindingView::from).collect(),
+            findings: findings
+                .into_iter()
+                .map(|j| FindingView::new(j, &r.repo, r.number))
+                .collect(),
             asked: r.asked,
             answers: r
                 .answers
@@ -495,12 +595,12 @@ impl From<ReviewRecord> for AgentReviewView {
                 .map(|(finding, a)| match a {
                     Answer::Fine => AnswerView {
                         finding,
-                        call: LeanView::Fine,
+                        call: CallView::Fine,
                         note: String::new(),
                     },
                     Answer::Change { note } => AnswerView {
                         finding,
-                        call: LeanView::Change,
+                        call: CallView::Change,
                         note,
                     },
                 })
@@ -542,10 +642,14 @@ pub struct AnswerAgentReview {
     pub request_changes: bool,
 }
 
-/// Hidden in answers so deliveries are not read as new replies. Keep the pre-rebrand markers:
-/// an old revision still serves webhooks while the new revision rolls out.
-pub(crate) const ANSWERED_MARK: &str = "Answered Mergepatrol's review.";
-pub(crate) const LINE_MARK: &str = "<sub>On Mergepatrol's review:";
+/// Hidden in answers so deliveries are not read as new replies. Each after the first is how
+/// MergeLoop marked them as Mergepatrol, which a revision from then still writes while the new
+/// one rolls out.
+pub(crate) const ANSWERED_MARKS: [&str; 2] =
+    ["mergeloop:answered", "Answered Mergepatrol's review."];
+pub(crate) const LINE_MARKS: [&str; 2] = ["mergeloop:line-answer", "<sub>On Mergepatrol's review:"];
+const ANSWERED_MARK: &str = ANSWERED_MARKS[0];
+const LINE_MARK: &str = LINE_MARKS[0];
 
 /// Answers what the review asks: posts a review of the PR as the caller, with each change asked
 /// for on its line, and lets the PR on in the queue, or holds it for a push.
@@ -736,11 +840,11 @@ fn answers_of(
             )));
         }
         let answer = match a.call {
-            LeanView::Fine => Answer::Fine,
-            LeanView::Change if a.note.trim().is_empty() => {
+            CallView::Fine => Answer::Fine,
+            CallView::Change if a.note.trim().is_empty() => {
                 return Err(ApiError::bad_request("Say what to change."));
             }
-            LeanView::Change => Answer::Change {
+            CallView::Change => Answer::Change {
                 note: a.note.trim().to_owned(),
             },
         };
@@ -753,71 +857,6 @@ fn answers_of(
         )));
     }
     Ok(answers)
-}
-
-/// The review the author's agent ran, as MergeLoop's own agent writes one.
-#[derive(Deserialize)]
-pub struct PostReview {
-    pub head_sha: String,
-    pub review: serde_json::Value,
-}
-
-/// What a posted review must hold for the worker to judge it.
-#[derive(Deserialize)]
-struct Posted {
-    #[expect(dead_code, reason = "only read to check its shape")]
-    summary: String,
-    findings: Vec<mergepatrol_core::Finding>,
-}
-
-/// What MergeLoop does with a review the author's agent posted.
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct PostedView {
-    pub findings: usize,
-    pub next: String,
-}
-
-/// The author's agent posts its review of a head the queue asked it to review, in a repo whose
-/// agent runs on the author's side. The worker judges it within seconds, as it does its own.
-pub(crate) async fn post_review(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<PostReview>,
-) -> Result<Json<PostedView>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let posted = match serde_json::from_value::<Posted>(body.review.clone()) {
-        Ok(posted) => posted,
-        Err(e) => {
-            return Err(ApiError::bad_request(&format!(
-                "The review is not in the shape its brief gives: {e}."
-            )));
-        }
-    };
-    let by = reviewer(&caller, &app, &repo).await?;
-    // Whose agent reviewed, for the review to say: anyone who may write to the repo may.
-    let mut review = body.review;
-    review["by"] = by.into();
-    let taken = app
-        .store
-        .submit_review(id, &repo, number, &body.head_sha, &review)
-        .await?;
-    if !taken {
-        return Err(ApiError::Status(
-            StatusCode::CONFLICT,
-            "No review of that head waits for your agent: the PR moved on, MergeLoop's agent reviews this repo, or a review was posted already.".into(),
-        ));
-    }
-    Ok(Json(PostedView {
-        findings: posted.findings.len(),
-        next: format!(
-            "MergeLoop judges each finding within seconds: one that must change goes back to the \
-author as a review thread, one only a human can settle goes to a human, and the rest are cleared. \
-`mergeloop {repo}#{number}` says what comes of it."
-        ),
-    }))
 }
 
 #[derive(Deserialize, TS)]
@@ -956,6 +995,35 @@ mod tests {
     use super::*;
     use mergepatrol_core::Finding;
 
+    #[test]
+    fn a_review_depth_saves_and_reads_back_and_unset_keeps_what_is_saved() {
+        let saved = ReviewSettings {
+            depth: Depth::Deep,
+            require_resolved: false,
+            ..ReviewSettings::default()
+        };
+        let body: SetReviewSettings =
+            serde_json::from_value(serde_json::json!({ "enabled": true, "bars": [] })).unwrap();
+        let kept = settings_from(body, &saved);
+        assert_eq!((kept.depth, kept.require_resolved), (Depth::Deep, false));
+        let body: SetReviewSettings = serde_json::from_value(
+            serde_json::json!({ "enabled": true, "bars": [], "depth": "quick" }),
+        )
+        .unwrap();
+        assert_eq!(settings_from(body, &saved).depth, Depth::Quick);
+        // A repo's config file sets it over the workspace's, as the dashboard edits it.
+        let repo: RepoReviewView = serde_json::from_value(
+            serde_json::json!({ "enabled": null, "bars": [], "depth": "deep" }),
+        )
+        .unwrap();
+        let o = ReviewOverrides::from(repo);
+        assert_eq!(o.depth, Some(Depth::Deep));
+        let back = serde_json::to_value(RepoReviewView::from(o)).unwrap();
+        assert_eq!(back["depth"], "deep");
+        let unset = serde_json::to_value(RepoReviewView::from(ReviewOverrides::default())).unwrap();
+        assert!(unset.get("depth").is_none(), "{unset}");
+    }
+
     fn judged(id: &str, confidence: u8, lean: Lean, asked: bool) -> Judged {
         Judged {
             finding: Finding {
@@ -977,21 +1045,24 @@ mod tests {
                     ..Default::default()
                 }),
                 needs_human: false,
+                verified: None,
+                settled: None,
                 code: Vec::new(),
                 related: Vec::new(),
+                also_at: Vec::new(),
             },
             asked,
             sent_back: false,
             withdrawn: false,
             threaded: false,
             bar: Bar::From(90),
+            outcome: None,
         }
     }
 
     fn record(findings: Vec<Judged>, answers: BTreeMap<String, Answer>) -> ReviewRecord {
         ReviewRecord {
             since_head: None,
-            agent_fixed: false,
             claim: 0,
             id: 1,
             installation_id: 1,
@@ -1008,11 +1079,65 @@ mod tests {
             answered_by: None,
             note: String::new(),
             questions: Vec::new(),
-            brief: None,
-            submitted: None,
+            waited_secs: None,
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn a_finding_shows_its_panels_votes_and_whether_they_carried_it() {
+        use mergepatrol_core::{Panel, Verdict, Vote};
+        let mut j = judged("a", 90, Lean::Change, false);
+        j.finding.evidence = None;
+        let vote = |verdict| Vote {
+            verdict,
+            why: "w".into(),
+        };
+        let cast = vec![
+            vote(Verdict::Holds),
+            vote(Verdict::Abstained),
+            vote(Verdict::Holds),
+        ];
+        j.finding.verified = Some(Panel::FINDING.verdict(cast));
+        let repo = RepoName::parse("o/r").unwrap();
+        let view = serde_json::to_value(FindingView::new(j, &repo, 1)).unwrap();
+        assert_eq!(
+            view["verified"],
+            serde_json::json!({
+                "needed": 2, "upheld": true,
+                "votes": [
+                    { "verdict": "holds", "why": "w" },
+                    { "verdict": "abstained", "why": "w" },
+                    { "verdict": "holds", "why": "w" },
+                ],
+            })
+        );
+        let none = FindingView::new(judged("b", 90, Lean::Change, false), &repo, 1);
+        assert_eq!(
+            serde_json::to_value(none).unwrap()["verified"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_finding_shows_every_other_place_its_bug_is_with_its_code() {
+        let mut j = judged("a", 90, Lean::Change, false);
+        j.finding.also_at = vec![mergepatrol_core::Place {
+            file: "b.rs".into(),
+            line: Some(9),
+            code: vec![CodeLine {
+                number: Some(9),
+                kind: LineKind::Added,
+                text: "x".into(),
+                hot: true,
+            }],
+        }];
+        let view = FindingView::new(j, &RepoName::parse("o/r").unwrap(), 1);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["also_at"][0]["file"], "b.rs");
+        assert_eq!(json["also_at"][0]["line"], 9);
+        assert_eq!(json["also_at"][0]["code"][0]["text"], "x");
     }
 
     #[test]
@@ -1065,21 +1190,40 @@ mod tests {
         assert!(
             answers_of(
                 &r,
-                &body(vec![a("a", LeanView::Fine, ""), a("c", LeanView::Fine, "")])
+                &body(vec![a("a", CallView::Fine, ""), a("c", CallView::Fine, "")])
             )
             .is_err(),
             "not asked"
         );
         assert!(
-            answers_of(&r, &body(vec![a("a", LeanView::Change, " ")])).is_err(),
+            answers_of(&r, &body(vec![a("a", CallView::Change, " ")])).is_err(),
             "a change says what"
         );
-        let Ok(got) = answers_of(&r, &body(vec![a("a", LeanView::Change, "fix")])) else {
+        let Ok(got) = answers_of(&r, &body(vec![a("a", CallView::Change, "fix")])) else {
             panic!("a change that says what is an answer");
         };
         assert_eq!(
             got,
             BTreeMap::from([("a".into(), Answer::Change { note: "fix".into() })])
         );
+    }
+
+    #[test]
+    fn a_pre_existing_bug_shows_as_one_and_no_answer_can_call_one() {
+        let repo = RepoName::parse("o/r").unwrap();
+        let old = judged("a", 90, Lean::PreExisting, false);
+        let issue = old.finding.issue_url(&repo, 1).unwrap();
+        let view = serde_json::to_value(FindingView::new(old, &repo, 1)).unwrap();
+        assert_eq!(view["lean"], "pre_existing");
+        // A link to file it, which no other finding has.
+        assert_eq!(view["issue"], issue.as_str());
+        let change = FindingView::new(judged("b", 90, Lean::Change, false), &repo, 1);
+        assert_eq!(
+            serde_json::to_value(change).unwrap()["issue"],
+            serde_json::Value::Null
+        );
+        // A human answers only what the agent asks, and it never asks about one.
+        let answer = serde_json::json!({ "finding": "a", "call": "pre_existing", "note": "" });
+        assert!(serde_json::from_value::<AnswerView>(answer).is_err());
     }
 }

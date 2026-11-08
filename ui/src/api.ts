@@ -28,6 +28,7 @@ import type { RepoUpdateView } from "./api/RepoUpdateView";
 import type { RepoView } from "./api/RepoView";
 import type { ReviewPull } from "./api/ReviewPull";
 import type { ReviewSettingsView } from "./api/ReviewSettingsView";
+import type { ReviewStatsView } from "./api/ReviewStatsView";
 import type { SessionView } from "./api/SessionView";
 import type { SetRepo } from "./api/SetRepo";
 import type { SetReviewSettings } from "./api/SetReviewSettings";
@@ -115,6 +116,9 @@ export const fetchHistoryStats = (
   q: { repo?: string; author?: string; days: number },
 ) => get<HistoryStatsView>(w(id, `/history/stats?${query(q)}`));
 
+export const fetchReviewStats = (id: number, q: { repo?: string; days: number }) =>
+  get<ReviewStatsView>(w(id, `/history/review?${query(q)}`));
+
 export const fetchRepos = (id: number) => get<RepoView[]>(w(id, "/repos"));
 
 export const setRepo = (id: number, repo: string, body: SetRepo) =>
@@ -127,7 +131,7 @@ export const fetchRepoConfig = (id: number, repo: string) =>
 export const proposeRepoConfig = (id: number, repo: string, body: RepoSettingsView) =>
   send<UpdatePullView>("PUT", w(id, `/repos/${repo}/config`), body);
 
-/** Whether the repo has the current `mergepatrol` agent skill. */
+/** Whether the repo has the current `mergeloop` agent skill. */
 export const fetchRepoSkill = (id: number, repo: string) =>
   get<SkillView>(w(id, `/repos/${repo}/skill`));
 
@@ -208,7 +212,7 @@ export const queuePull = (id: number, repo: string, pr: number, priority: boolea
 
 /** What a PR just queued will run into, whatever the PR: a hold, or no model key for the agent. */
 export const queuedWarning = (q: QueuedView): string | undefined =>
-  q.mergepatrol.hold || q.mergepatrol.missing_key ? q.message : undefined;
+  q.mergeloop.hold || q.mergeloop.missing_key ? q.message : undefined;
 
 /** Takes the PR, and its stack, out of the queue, as the user. */
 export const dequeuePull = (id: number, repo: string, pr: number) =>

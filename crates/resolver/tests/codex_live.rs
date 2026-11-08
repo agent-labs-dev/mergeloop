@@ -53,6 +53,7 @@ async fn codex_resolves_a_rename_conflict() {
         effort: "medium".into(),
         timeout: Duration::from_secs(300),
         max_turns: 20,
+        on_plan: false,
     };
     let files = vec!["greet.py".to_owned()];
     let outcome = resolver
@@ -61,7 +62,9 @@ async fn codex_resolves_a_rename_conflict() {
             conflicted_files: &files,
             pr_title: "Friendlier greeting",
             pr_body: "Adds a comma and an exclamation mark.",
-            commit_message: "Add punctuation to the greeting",
+            stopped: mergepatrol_resolver::Stopped::Replay {
+                commit_message: "Add punctuation to the greeting",
+            },
             trunk: "main",
             verify: &mergepatrol_resolver::Verify::None,
             transcript: &wt.join("transcript.jsonl"),

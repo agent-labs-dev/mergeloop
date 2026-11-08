@@ -34,7 +34,7 @@ async fn commits_with_a_trailer_are_listed_from_a_base() {
     let wt = tmp.path();
     sh(wt, &["init", "-q", "-b", "main"]);
     let root = commit(wt, "a.txt", "one\n", "root");
-    commit(wt, "a.txt", "two\n", "first\n\nFixed-by: mergepatrol, a");
+    commit(wt, "a.txt", "two\n", "first\n\nFixed-by: mergeloop, a");
     let approved = commit(wt, "a.txt", "three\n", "the author's");
     commit(
         wt,
@@ -44,7 +44,7 @@ async fn commits_with_a_trailer_are_listed_from_a_base() {
     );
 
     let listed = |base| async move {
-        let trailers = ["Fixed-by: mergepatrol", "Resolved-by: mergepatrol"];
+        let trailers = ["Fixed-by: mergeloop", "Resolved-by: mergepatrol"];
         let commits = Git.commits_with(wt, base, "HEAD", &trailers).await.unwrap();
         commits
             .iter()
@@ -75,7 +75,7 @@ async fn conflict_is_resolved_committed_and_listed_with_its_trailer() {
     // What the resolver does.
     std::fs::write(wt.join("a.txt"), "trunk\npr\n").unwrap();
     assert_eq!(
-        git.continue_resolution(wt, "Resolved-by: mergepatrol (test)")
+        git.continue_resolution(wt, "Resolved-by: mergeloop (test)")
             .await
             .unwrap(),
         RebaseStep::Done
@@ -86,13 +86,88 @@ async fn conflict_is_resolved_committed_and_listed_with_its_trailer() {
     assert!(
         commits[0]
             .message
-            .ends_with("Resolved-by: mergepatrol (test)"),
+            .ends_with("Resolved-by: mergeloop (test)"),
         "{}",
         commits[0].message
     );
     assert_eq!(commits[0].author, "Ada <ada@example.com>");
     assert_eq!(commits[1].changes.len(), 1);
     assert_eq!(commits[1].changes[0].path, "b.txt");
+}
+
+#[tokio::test]
+async fn resolution_leaves_untracked_files_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path();
+    sh(wt, &["init", "-q", "-b", "main"]);
+    let root = commit(wt, "a.txt", "one\n", "root");
+    let trunk = commit(wt, "a.txt", "trunk\n", "trunk change");
+    sh(wt, &["checkout", "-q", "--detach", &root]);
+    commit(wt, "a.txt", "pr\n", "pr change");
+    let git = Git;
+
+    let RebaseStep::Conflict { .. } = git.rebase(wt, &trunk, None).await.unwrap() else {
+        panic!("expected a conflict");
+    };
+    // What the resolver's checks leave behind, as a binary run as a shell script does.
+    std::fs::write(wt.join("a.txt"), "trunk\npr\n").unwrap();
+    std::fs::write(wt.join("\u{1}\u{b0}@@0D@8"), "").unwrap();
+    assert_eq!(
+        git.continue_resolution(wt, "Resolved-by: mergeloop (test)")
+            .await
+            .unwrap(),
+        RebaseStep::Done
+    );
+
+    assert_eq!(
+        git.changed_files(wt, &trunk, "HEAD").await.unwrap(),
+        ["a.txt"]
+    );
+}
+
+#[tokio::test]
+async fn a_path_git_would_quote_is_listed_as_it_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path();
+    sh(wt, &["init", "-q", "-b", "main"]);
+    let root = commit(wt, "café.txt", "one\n", "root");
+    let trunk = commit(wt, "café.txt", "trunk\n", "trunk change");
+    sh(wt, &["checkout", "-q", "--detach", &root]);
+    commit(wt, "café.txt", "pr\n", "pr change");
+    let git = Git;
+
+    assert_eq!(
+        git.changed_files(wt, &root, "HEAD").await.unwrap(),
+        ["café.txt"]
+    );
+    let RebaseStep::Conflict { files, .. } = git.rebase(wt, &trunk, None).await.unwrap() else {
+        panic!("expected a conflict");
+    };
+    assert_eq!(files, ["café.txt"]);
+    assert_eq!(git.unmerged_files(wt).await.unwrap(), ["café.txt"]);
+}
+
+#[tokio::test]
+async fn a_commit_takes_tracked_changes_and_only_the_new_files_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path();
+    sh(wt, &["init", "-q", "-b", "main"]);
+    let root = commit(wt, "a.txt", "one\n", "root");
+    commit(wt, "gone.txt", "bye\n", "add gone");
+    let git = Git;
+
+    std::fs::write(wt.join("a.txt"), "fixed\n").unwrap();
+    std::fs::remove_file(wt.join("gone.txt")).unwrap();
+    std::fs::write(wt.join("new.txt"), "the fix's\n").unwrap();
+    let new = git.untracked_files(wt).await.unwrap();
+    assert_eq!(new, ["new.txt"]);
+    std::fs::write(wt.join("coverage.out"), "a check's\n").unwrap();
+    git.commit(wt, &new, "Fix it").await.unwrap();
+
+    let mut changed = git.changed_files(wt, &root, "HEAD").await.unwrap();
+    changed.sort();
+    assert_eq!(changed, ["a.txt", "new.txt"]);
+    assert_eq!(git.untracked_files(wt).await.unwrap(), ["coverage.out"]);
 }
 
 #[tokio::test]
@@ -115,7 +190,7 @@ async fn resolution_that_keeps_the_trunk_drops_the_commit() {
 
     std::fs::write(wt.join("a.txt"), "pr\nsquashed\n").unwrap();
     assert_eq!(
-        git.continue_resolution(wt, "Resolved-by: mergepatrol (test)")
+        git.continue_resolution(wt, "Resolved-by: mergeloop (test)")
             .await
             .unwrap(),
         RebaseStep::Done

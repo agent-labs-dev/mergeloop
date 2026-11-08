@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use hmac::{Hmac, KeyInit, Mac};
 use mergepatrol_analytics::{Analytics, WorkspaceInfo};
-use mergepatrol_core::{REPO_CONFIG_PATH, RepoName};
+use mergepatrol_core::{ConfigPath, RepoName};
 use mergepatrol_store::{BRANCH_RULES, Change};
 use serde_json::Value;
 use sha2::Sha256;
@@ -229,6 +229,14 @@ fn changed(event: Option<&str>, payload: &Value) -> Vec<Change> {
             changes
         }
         Some("workflow_run") => vec![value("approval", &payload["workflow_run"]["head_sha"])],
+        // The repo's settings, as which merge methods it allows, and whether it is private.
+        Some("repository") => vec![
+            matches!(
+                payload["action"].as_str(),
+                Some("edited" | "privatized" | "publicized")
+            )
+            .then_some(Change::Repo),
+        ],
         // The checks a branch requires, and the reviews.
         Some("branch_protection_rule" | "repository_ruleset") => vec![
             Some(Change::ValuesUnder(BRANCH_RULES.into())),
@@ -239,27 +247,42 @@ fn changed(event: Option<&str>, payload: &Value) -> Vec<Change> {
     changes.into_iter().flatten().collect()
 }
 
-/// Whether a push to the default branch leaves it with the config file, if the push touched the
-/// file. The periodic look at every repo catches what this misses.
+/// Whether a push to the default branch leaves it with the config file, if the push says. It
+/// has one when the last touch of either path left a file there, and none when the last touch of
+/// each removed it. The periodic look at every repo catches what this misses.
 fn config_after_push(payload: &Value) -> Option<bool> {
     let default = payload["repository"]["default_branch"].as_str()?;
     if payload["ref"].as_str()? != format!("refs/heads/{default}") {
         return None;
     }
-    let has = |commit: &Value, list: &str| {
+    let commits = payload["commits"].as_array()?;
+    let has = |commit: &Value, list: &str, path: &str| {
         commit[list]
             .as_array()
-            .is_some_and(|files| files.iter().any(|f| f == REPO_CONFIG_PATH))
+            .is_some_and(|files| files.iter().any(|f| f == path))
     };
-    payload["commits"].as_array()?.iter().rev().find_map(|c| {
-        if has(c, "removed") {
-            Some(false)
-        } else if has(c, "added") || has(c, "modified") {
-            Some(true)
-        } else {
-            None
-        }
-    })
+    // Each path's state after the push: `None` where the push left it alone.
+    let after: Vec<Option<bool>> = ConfigPath::ALL
+        .iter()
+        .map(|at| {
+            commits.iter().rev().find_map(|c| {
+                if has(c, "added", at.path()) || has(c, "modified", at.path()) {
+                    Some(true)
+                } else if has(c, "removed", at.path()) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    if after.contains(&Some(true)) {
+        Some(true)
+    } else if after.iter().all(|a| *a == Some(false)) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// A label went on a fork PR: the PR, the label, and the head it had then. The queue first sees
@@ -327,5 +350,15 @@ mod tests {
             let changes = changed(Some(event), &json!({}));
             assert!(changes.contains(&Change::ValuesUnder(BRANCH_RULES.into())));
         }
+    }
+
+    #[test]
+    fn a_change_to_the_repos_settings_reads_the_repo_again() {
+        let edited = changed(Some("repository"), &json!({ "action": "edited" }));
+        assert_eq!(edited, [Change::Repo]);
+        let private = changed(Some("repository"), &json!({ "action": "privatized" }));
+        assert_eq!(private, [Change::Repo]);
+        let renamed = changed(Some("repository"), &json!({ "action": "renamed" }));
+        assert!(renamed.is_empty(), "{renamed:?}");
     }
 }

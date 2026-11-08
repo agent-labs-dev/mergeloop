@@ -11,6 +11,7 @@ import type { StatsView } from "./api/StatsView";
 import type { StepStatsView } from "./api/StepStatsView";
 import type { StepTimeView } from "./api/StepTimeView";
 import type { StepView } from "./api/StepView";
+import { ReviewStats } from "./ReviewStats";
 import { Avatar, duration, llmName, RepoIcon, secondary, timeAgo, usd } from "./ui";
 
 export const WINDOWS = [7, 30, 90] as const;
@@ -178,6 +179,7 @@ export function History({ workspace }: { workspace: number }) {
             days={days}
           />
           <Steps steps={steps} />
+          {!author && <ReviewStats workspace={workspace} repo={repo} days={days} />}
           {byRepo ? (
             <Breakdown
               title={repo ? "Developers in this repo" : "Developers"}
@@ -812,7 +814,7 @@ const all = (...rs: LlmRunsView[]): LlmRunsView => ({
   unpriced: rs.reduce((t, r) => t + r.unpriced, 0),
 });
 
-/** The known cost: "–" when no run told it, "$1.20+" when only some did, such as Codex's. */
+/** The known cost: "–" when no run had one, "$1.20+" when only some did, such as older Codex runs. */
 const cost = (r: LlmRunsView) =>
   r.unpriced === r.runs ? "–" : `${usd(r.cost_usd)}${r.unpriced > 0 ? "+" : ""}`;
 

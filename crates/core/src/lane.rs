@@ -41,7 +41,7 @@ pub struct PrSummary {
     /// The head commit's combined checks: `SUCCESS`, `FAILURE`, `ERROR`, `PENDING` or
     /// `EXPECTED`. `None` without checks.
     pub checks: Option<String>,
-    /// The fixes the PR has used, for its checks and its review.
+    /// The fixes the PR has used, for its checks.
     #[serde(default)]
     pub fixes: u32,
     /// The fixes it gets.
@@ -115,8 +115,8 @@ impl EntryState {
         match self {
             EntryState::Waiting | EntryState::Active => Some(Stage::Lane),
             EntryState::Held(hold) => match hold.innermost() {
-                Hold::PrepRebasing | Hold::AuthorRebase { .. } => Some(Stage::Rebase),
-                Hold::PrepChecks | Hold::PrepFixing | Hold::AuthorFix { .. } => Some(Stage::Checks),
+                Hold::PrepRebasing => Some(Stage::Rebase),
+                Hold::PrepChecks | Hold::PrepFixing => Some(Stage::Checks),
                 hold if hold.of_review() => Some(Stage::Review),
                 _ => None,
             },

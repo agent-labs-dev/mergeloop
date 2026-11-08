@@ -8,6 +8,7 @@ import type { CodeLineView } from "./api/CodeLineView";
 import type { EntryView } from "./api/EntryView";
 import type { FindingView } from "./api/FindingView";
 import type { KindView } from "./api/KindView";
+import type { VerificationView } from "./api/VerificationView";
 import { ErrorText, field, primary, secondary, timeAgo } from "./ui";
 
 /*
@@ -56,14 +57,8 @@ export function reviewBadge(e: Gated): [string, string] | null {
       return ["Checks", reviewTones.reviewing];
     case "prep_fixing":
       return ["Fixing", reviewTones.reviewing];
-    case "author_rebase":
-      return ["Conflict", reviewTones.sentBack];
-    case "author_fix":
-      return ["Checks failed", reviewTones.sentBack];
     case "reviewing":
       return ["Reviewing", reviewTones.reviewing];
-    case "author_review":
-      return ["Author's agent reviews", reviewTones.reviewing];
     case "review_asks":
       return ["Needs a human", reviewTones.asks];
     case "review_changes":
@@ -269,6 +264,45 @@ function Evidence({ f }: { f: FindingView }) {
   );
 }
 
+const said = { holds: "Holds", does_not_hold: "Does not hold", abstained: "No vote" } as const;
+
+/** How many of a finding's panel said it holds. */
+function tally(v: VerificationView) {
+  const holds = v.votes.filter((x) => x.verdict === "holds").length;
+  return `${holds} of ${v.votes.length} said it holds; ${v.needed} needed`;
+}
+
+/**
+ * What a panel of fresh agents voted on a security finding with no failing command: each saw only
+ * the finding and the code.
+ */
+function Votes({ f }: { f: FindingView }) {
+  const v = f.verified;
+  if (!v || f.evidence?.failed) return null;
+  return (
+    <div className="mt-2 overflow-hidden rounded-md border border-line bg-surface text-xs">
+      <p className="border-b border-line bg-sunken px-3 py-1.5 text-muted">
+        Fresh agents checked it, each with only the finding and the code: {tally(v)}
+      </p>
+      <ul className="divide-y divide-line-soft">
+        {v.votes.map((x, i) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: votes have no id, and never reorder
+          <li key={i} className="flex gap-3 px-3 py-1.5">
+            <span
+              className={`w-24 shrink-0 ${x.verdict === "abstained" ? "text-faint" : "font-medium text-fg-2"}`}
+            >
+              {said[x.verdict]}
+            </span>
+            <span className="text-fg-2">
+              <Md>{x.why}</Md>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function Kbd({ children }: { children: ReactNode }) {
   return (
     <kbd className="rounded border border-line-strong bg-surface px-1 font-mono text-[10px] text-muted shadow-xs">
@@ -345,12 +379,49 @@ function ClearedList({
               <span className="text-ok">✓</span>
               <span className="flex-1 text-fg-2">
                 <Md>{f.title}</Md>
+                {f.verified && !f.verified.upheld && (
+                  <span className="block text-xs text-faint">{tally(f.verified)}</span>
+                )}
               </span>
               <span className="text-xs text-faint tabular-nums">{pct(f.confidence)}</span>
             </li>
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+/** Bugs the agent found in code the PR did not bring: notes to file, which hold nothing. */
+function PreExistingList({ findings }: { findings: FindingView[] }) {
+  if (findings.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-line bg-surface px-4 py-2.5 text-sm">
+      <p className="font-medium">Already there before this PR</p>
+      <p className="mt-0.5 text-muted">
+        Bugs the agent found in code this PR didn't bring. They aren't this PR's to fix, and hold
+        nothing.
+      </p>
+      <ul className="mt-1">
+        {findings.map((f) => (
+          <li key={f.id} className="flex items-center gap-3 py-1">
+            <span className="flex-1 text-fg-2">
+              <Md>{f.title}</Md>
+              <AlsoAt f={f} />
+            </span>
+            {f.issue && (
+              <a
+                href={f.issue}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-medium text-muted hover:underline"
+              >
+                File an issue
+              </a>
+            )}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -381,7 +452,7 @@ export function Gate({
   const waits = reason === "review_asks" || reason === "review_changes";
   const asks = r.findings.filter((f) => f.asked);
   const back = r.findings.filter((f) => f.sent_back || f.withdrawn);
-  const cleared = r.findings.filter((f) => !f.asked && !f.sent_back && !f.withdrawn);
+  const cleared = r.findings.filter((f) => !f.asked && !f.sent_back && !f.withdrawn && !f.issue);
   return (
     <section className="mt-5 space-y-4">
       {reason === "reviewing" && (
@@ -420,7 +491,29 @@ export function Gate({
       )}
       {waits && r.answers.length > 0 && <Answered review={r} />}
       {waits && <ClearedList findings={cleared} />}
+      <PreExistingList findings={r.findings.filter((f) => f.issue)} />
     </section>
+  );
+}
+
+/** A place in the code, as `file:line`, or `file` without a line. */
+function placeOf(p: { file: string; line: number | null }) {
+  return p.line ? `${p.file}:${p.line}` : p.file;
+}
+
+/** The other places a bug that recurs is: the fix settles every one. */
+function AlsoAt({ f }: { f: FindingView }) {
+  if (f.also_at.length === 0) return null;
+  return (
+    <p className="mt-1 text-xs text-muted">
+      Also at{" "}
+      {f.also_at.map((p, i) => (
+        <span key={`${p.file}:${p.line}`}>
+          {i > 0 && ", "}
+          <span className="font-mono">{placeOf(p)}</span>
+        </span>
+      ))}
+    </p>
   );
 }
 
@@ -449,7 +542,13 @@ function SentBackList({ findings }: { findings: FindingView[] }) {
           )}
           {!f.withdrawn && (
             <div className="pl-5">
+              <AlsoAt f={f} />
+            </div>
+          )}
+          {!f.withdrawn && (
+            <div className="pl-5">
               <Evidence f={f} />
+              <Votes f={f} />
             </div>
           )}
         </li>
@@ -940,11 +1039,18 @@ function Answering({
             </p>
             {f.file && (
               <div className="mt-4">
-                <Code lines={f.code} file={f.line ? `${f.file}:${f.line}` : f.file} />
+                <Code lines={f.code} file={placeOf({ file: f.file, line: f.line })} />
               </div>
             )}
+            {f.also_at.map((p) => (
+              <div key={`${p.file}:${p.line}`} className="mt-3">
+                <p className="mb-1 text-sm text-muted">The same bug, also at</p>
+                <Code lines={p.code} file={placeOf(p)} />
+              </div>
+            ))}
             <div className="mt-2 max-w-3xl">
               <Evidence f={f} />
+              <Votes f={f} />
             </div>
             {f.related.length > 0 && (
               <>
@@ -962,7 +1068,7 @@ function Answering({
                         <p className="mb-1 text-sm text-muted">
                           <Md>{x.why}</Md>
                         </p>
-                        <Code lines={x.code} file={x.line ? `${x.file}:${x.line}` : x.file} />
+                        <Code lines={x.code} file={placeOf(x)} />
                       </div>
                     ))}
                   </div>

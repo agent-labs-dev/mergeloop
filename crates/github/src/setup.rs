@@ -33,7 +33,7 @@ impl AppCredentials {
 
 /// The webhook events that wake a repo's queue: its PRs, reviews, checks, and trunk moves. And
 /// what the You tab keeps of each PR: its comments, and who is on which team.
-pub const WEBHOOK_EVENTS: [&str; 14] = [
+pub const WEBHOOK_EVENTS: [&str; 15] = [
     "pull_request",
     "pull_request_review",
     "pull_request_review_comment",
@@ -51,6 +51,8 @@ pub const WEBHOOK_EVENTS: [&str; 14] = [
     // The checks a branch requires.
     "branch_protection_rule",
     "repository_ruleset",
+    // The repo's settings: the merge methods it allows.
+    "repository",
 ];
 
 /// The App that MergeLoop needs. GitHub only delivers webhooks to a public URL, so on
@@ -80,8 +82,9 @@ pub fn manifest(public_url: &str, owner: &str) -> Value {
             "issues": "write",
             "checks": "read",
             "statuses": "read",
-            // The logs of failed GitHub Actions jobs, for the agent that fixes them.
-            "actions": "read",
+            // The logs of failed GitHub Actions jobs, for the agent that fixes them, and running
+            // those jobs again once before a fix.
+            "actions": "write",
             "metadata": "read",
             // Who is on which team, for the reviews asked of a team.
             "members": "read",
@@ -691,7 +694,7 @@ async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest
 
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("mergepatrol/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()?)
 }

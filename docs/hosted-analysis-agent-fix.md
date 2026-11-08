@@ -17,6 +17,10 @@ Review the PR's diff on the first round. On later rounds, review the diff/new co
 reviewed head, with unresolved findings and author replies as context, instead of re-reviewing the
 whole PR. Read surrounding code and run experiments where needed to judge those changes.
 
+Deep review must demonstrate findings with independently replayed evidence, not reviewer agreement.
+Spend its additional budget on behavior, failure paths and deterministic checks. A recurring accepted
+mistake must gain a check that stays in the repository and runs in CI, applied by the user's agent.
+
 In the stricter ownership split below, hand CI edits, conflict resolution and publication to the
 user's own agent too. Show hosted analysis and author action together on the existing PR screen,
 with the next action and the head each is working on. Every hosted-originated change is a proposal
@@ -79,7 +83,7 @@ subprocess implementation; it is distinct from `agent.runs: local`.
 | Failed CI and conflicts | [queue/prep.rs](../crates/mergepatrol/src/queue/prep.rs), `hold` / `job`, starts rebase or fix work off the lane. [queue.rs](../crates/mergepatrol/src/queue.rs), `run_job`, also has rebase, fixing and rechecking phases. [core/job.rs](../crates/core/src/job.rs) owns the job state machine. CI and review share `fix_ci`'s hosted fix budget; the documented default is three. | Reserve `fix_ci` and its budget for red CI alone in `hosted`. Conflict resolution remains a separate task. In `hosted-review`, reuse `AuthorRebase` and `AuthorFix` holds: the author's agent edits, tests and pushes, without consuming hosted CI attempts. |
 | Verify-command selection | `job::checks_for` prefers configured `spec.verify`. Otherwise `checks_from_ci` reads sorted files in `.github/workflows` at the checked-out PR head. [core/ci.rs](../crates/core/src/ci.rs), `verify_from_ci`, keeps at most five distinct usable commands from workflows containing `pull_request`; it handles working directories and skips unsupported or CI-dependent commands. There is no `crates/mergepatrol/src/ci.rs` on this baseline. | Keep one hosted derivation and send its result, source and head to the author's agent. Reuse `verify_from_ci`, also already used by `review::author_brief`; do not implement another workflow parser in a client. |
 | Verify enforcement | [resolver](../crates/resolver/src/lib.rs) distinguishes `Verify::Configured`, `Ci` and `None`. `job::verify` runs only `spec.verify` after a resolution or fix. Workflow-derived commands inform the agent; they are not an additional automatic ejection gate. GitHub's required checks remain a separate gate. | Author runs the supplied commands locally. Hosted validation independently runs configured verify commands; workflow-derived suggestions retain their existing advisory role. |
-| Finding evidence | `job::check_evidence` resets to the reviewed head for each change finding, applies only its named evidence files, runs the command and records the patch/output. `failed` excludes timeouts and exit 126/127. `unsafe_file` rejects paths outside the checkout and `.github` / `.mergepatrol`. [core/review.rs](../crates/core/src/review.rs), `shows_the_change` / `ReviewSettings::route`, requires failed evidence for a non-security author change; security may be supported by code alone. Confidence, human-only kinds and `needs_human` still apply. | Remains hosted, with the same security exception and routing. A local report that a command passed or failed cannot replace it. |
+| Finding evidence | `job::check_evidence` resets to the reviewed head for each change finding, applies only its named evidence files, runs the command and records the patch/output. `failed` excludes timeouts and exit 126/127. `unsafe_file` rejects paths outside the checkout and `.github` / `.mergepatrol`. [core/review.rs](../crates/core/src/review.rs), `shows_the_change` / `ReviewSettings::route`, requires failed evidence for a non-security author change; security may be supported by code alone. Confidence, human-only kinds and `needs_human` still apply. | Remains hosted. Apply the Deep evidence contract below instead of accepting votes for an unproven non-security change. Keep security and human-decision exceptions explicit. A local report that a command passed or failed cannot replace replay. |
 | Evidence after an author change | `job::apply_evidence` installs the original failing evidence before the hosted fixer; `evidence_passes` requires its commands to pass and its patches to remain intact. `commit_fix` also runs configured verify commands. `queue::check_fix_output` checks ancestry and protected paths before publishing a hosted fix. | Preserve independent hosted evidence replay on an author's resulting head without restoring a review fixer. Extract this validation from the removed review-fix path; red-CI fixing remains separate. |
 | Gate and merge | [web/gate.rs](../crates/web/src/gate.rs), review status, required checks and thread resolution feed queue holds. `queue::run_job` rechecks the review and head before merging. [queue-flow.md](queue-flow.md) explains preparation, stacks and the single merge lane. | Remains hosted. Neither a progress report nor a local “done” grants approval, resolves a human decision or authorizes a merge. |
 
@@ -93,6 +97,52 @@ Two existing capabilities narrow the implementation considerably:
   `then`, `exit_code` and `status`. It supports `after` and up to 50 seconds of long polling, with an
   internal three-second poll. [cli](../crates/cli/src/main.rs), `land`, calls it through MCP and waits
   through `wait` responses; it starts no agent. A user agent follows the returned brief, then polls again.
+
+## Deep review: demonstrate behavior and retain prevention
+
+This extends the same hosted analysis and author handoff, so it belongs in this proposal. It is an
+independent review requirement, not conditional on the optional execution split. The newer Deep
+baseline at [`6061d17845c2e5e4a46723a98273e22ae78102eb`](https://github.com/agent-labs-dev/mergeloop/commit/6061d17845c2e5e4a46723a98273e22ae78102eb)
+allows panel votes to replace missing executable evidence for non-security changes through
+[`Depth::votes_on`](https://github.com/agent-labs-dev/mergeloop/blob/6061d17845c2e5e4a46723a98273e22ae78102eb/crates/core/src/review.rs#L138-L141),
+[`Finding::shows_the_change`](https://github.com/agent-labs-dev/mergeloop/blob/6061d17845c2e5e4a46723a98273e22ae78102eb/crates/core/src/review.rs#L402-L407)
+and the [resolver's evidence/panel instructions](https://github.com/agent-labs-dev/mergeloop/blob/6061d17845c2e5e4a46723a98273e22ae78102eb/crates/resolver/src/lib.rs#L658-L706).
+The requirements below supersede that fallback; the older implementation inventory remains historical.
+
+1. **Use Deep's extra effort to run the behavior.** Independent reviewers may discover candidate
+   findings, but votes cannot establish executable proof. Prioritize focused real user flows,
+   failure injection, property checks and deterministic static or formal checks for the changed
+   invariant. A non-security code-change finding needs a command that MergeLoop independently runs
+   on the reviewed head and sees fail for the claimed defect. A formal counterexample must be
+   reproducible; record the model, assumptions and bounds instead of claiming whole-system proof.
+2. **Attach every claim to its commit.** Each finding and evidence record names its review ID,
+   comparison base and reviewed `head_sha`, command/setup, evidence files or patch, expected
+   violation, observed exit/output and execution limits. Expose these together through the shared
+   UI/API/MCP projections. Missing evidence or a command that does not demonstrate the defect leaves
+   a candidate as a non-blocking note, never an author-change request justified by agreement.
+   Missing tools, setup failure or timeout means incomplete execution, not proof of a bug or a fix;
+   required validation stays unknown and cannot clear an existing supported finding. Preserve the
+   explicit security and human-decision routes with code-path rationale and stated uncertainty;
+   label these exceptions, never describe panel agreement as executable verification.
+3. **Verify the author's correction at the new commit.** Save the original evidence and replay it
+   independently against the author's candidate head, recording both offending and candidate SHAs.
+   A passing author report or a new vote cannot clear it. A moved head invalidates that result;
+   replay on the new head and review only new commits plus unresolved findings as specified below.
+4. **Prevent an accepted mistake from recurring.** Link a recurring finding to the earlier accepted
+   finding or owner rule. Its correction must include a retained regression check, lint/type rule,
+   property test or deterministic architecture constraint in the normal CI path. Reuse an existing
+   check when it already protects the invariant. Record the check's path, command, offending SHA
+   where it fails for that mistake and corrected SHA where it passes. Disposable diagnostic evidence
+   alone is insufficient: keep it, or prove the retained check covers the same failure. This remains
+   author action until that protection is independently verified. Present any proposed check with
+   its exact content and target head; only the user's agent applies it through the agreed owner flow.
+
+Acceptance must cover an unproven non-security finding with two-of-three or unanimous votes staying
+a note; a reproduced defect reaching its author without a hosted fix; a formal check reporting its
+bounds; stale or unavailable replay never clearing a supported finding; and a recurring correction
+remaining held until its retained CI check fails on the offending commit and passes on the new one.
+Extend existing review-routing and job scenarios at implementation time. No runtime change or new
+test is part of this design update, and red-CI-only auto-fix and owner merge controls remain intact.
 
 ## Execution contract and implementation
 
@@ -350,6 +400,7 @@ under the repository's existing API/MCP parity checks.
 | Already available | Confirmed third bullet: agent polls for work | `next_need` and `mergeloop` already implement it. Show an example using the existing skill/CLI; no daemon or new transport to land. This is the smallest ask to satisfy. |
 | First new change | Read-only PR list readiness, context and next action | Extend Queue/You rows and the existing detail with shared readiness/reasons, head freshness, description, discussion and GitHub link, plus hosted/your-agent/CI ownership, brief and copyable command. Include unqueued/draft PRs without queuing them. Render proposal targets/decisions when the split supplies them; no invented legacy proposals or agent presence. No new page, execution-policy or gate change. |
 | Independent policy change | Remove review auto-fix and make later reviews incremental | In every mode, findings reject/hold for the author immediately; only red CI can auto-fix. Review the first PR diff, then new commits plus unresolved findings. Preserve evidence, security/human gates and independent replay without a corrective publisher. This is not conditional on the optional split. |
+| Independent evidence change | Deep demonstrates findings and retains checks for recurring mistakes | Enforce the Deep evidence contract above: independent reproduction instead of non-security votes, claims and replay tied to exact commits, explicit security/human exceptions, and retained CI protection proven on offending/corrected heads. Reuse existing evidence, finding and proposal seams; only the user's agent applies changes. This does not wait for the optional split. |
 | Next control slice | Explicit owner Merge action | Keep the action in the selected PR; add server-side expected-head/stack-scope checks to the existing API/MCP queue path. Show blockers and queued/waiting/verified merged outcomes. No gate bypass, implicit draft publication or consent inferred from readiness. This does not depend on the optional execution split. |
 | Then | Opt-in `hosted-review` execution split, owner decisions and author-change validation | Route every hosted-originated repo/PR change through an owner-visible proposal and the user's agent; retain deep hosted diff review, configured checks, immutable evidence replay and head checks. Ship proposal storage/decisions, publication guards and validation together. This mode also hands CI fixes and conflicts to the author's agent; it never reinstates review auto-fix. |
 | After the split | Acknowledgement/progress and thread writes | Add fenced leases and freshness reporting for a true live agent view, then reply/resolve tools to remove the brief's dependence on `gh` thread queries. Discussion reads already ship in the first slice. This is an implementation sequence, not an invented feedback request. |

@@ -29,8 +29,11 @@ Extend the existing execution setting with an opt-in third mode, proposed as
 subject to the global removal of review auto-fix. The current `local` setting moves the review to
 the author's agent too, so switching to it does not meet the hosted-analysis request.
 
-Ship the read-only ownership and next-action view first. The polling loop already exists; the execution
-split and independent validation of an author's fix are the larger change.
+Make the existing PR list the owner's control surface: readiness kept current while the author
+works, access to the PR, description and discussion, and an explicit Merge control. Ship the
+read-only readiness, context and next-action view first, then the merge action with head fencing.
+The polling loop already exists; the execution split and independent validation of an author's
+fix are the larger change.
 
 ## Feedback and its limits
 
@@ -53,6 +56,15 @@ Jonas's decision in #mergepatrol on 2026-11-07, agreed by Furqan, supersedes the
 framing: auto-fix remains only for red CI; code-change findings reject or hold the PR for the author;
 later reviews cover the diff/new commits rather than the whole PR again. The optional ownership
 split adds owner control without preserving a hosted review fixer in another mode.
+
+Furqan's 2026-11-07 19:15 UTC message, `evt_06aef78cdfb07bac8000b40fd1bc953d`, asks for
+“readiness” kept up to date by his agent, a route from the list to the PR, its description and
+chat comments, and a merge button: the control he valued in the old flow. He also asks for a
+list without more pages and describes his agent as the interface. This belongs here because
+it makes the ownership decisions above usable while a PR is still being worked on. Extend the
+existing list/detail surface and shared API/MCP reads so his agent can present the same view
+in chat. The attachment is unreadable; no layout or behavior is inferred from it. His wider
+remarks about grouping, faster git and continuous patrols do not expand this implementation.
 
 ## Implementation baseline before the decision
 
@@ -220,14 +232,52 @@ The sandbox keeps its existing read-only fetch token, revocation and model proxy
 The author agent never receives `JobSpec`'s service access or a hosted job link. The new validation
 job may write temporary diagnostic files but must not publish any of them.
 
-## The “where my agent is” view
+## The PR list, readiness and owner controls
 
-Put one card in [QueueGate](../ui/src/Queue.tsx), already shared by Queue and You above
-[PullDetail](../ui/src/PullDetail.tsx). Keep [AgentReview](../ui/src/AgentReview.tsx)'s findings and
-the existing activity tab as the detail behind it. Illustrative content, not a production screenshot:
+Use the existing Queue and [You](../ui/src/You.tsx) lists, with one readiness summary per PR
+and the selected PR's existing [PullDetail](../ui/src/PullDetail.tsx). Include PRs still in draft
+or outside the queue; opening this view or polling it never queues, publishes or merges them.
+Keep stack/layer context inline. Do not introduce another page or require grouping to manage a PR.
+Put ownership detail in [QueueGate](../ui/src/Queue.tsx), already shared by Queue and You,
+with [AgentReview](../ui/src/AgentReview.tsx)'s findings and the activity tab behind it.
+
+Readiness answers whether this PR is ready at this commit and why. Derive it server-side from
+the existing typed review, evidence, CI, draft, required-approval, thread, conflict and stack gates;
+do not invent a score or infer approval from green CI alone. Show ready, blocked with the owner
+of the next action, checking, or unknown/stale, as applicable. Missing required review coverage,
+failed reads and incomplete required checks cannot produce ready. Show queue position separately
+from readiness; an unqueued PR without an assessment stays unknown until work is explicitly requested.
+
+Return the assessed head, comparison base, last reviewed head, source and last-updated time with
+the reasons. The user's agent refreshes the same reads through `next_need` while the author works;
+new commits trigger only incremental review plus unresolved findings. Update the list on pushes,
+check/review results and gate changes. A new head immediately invalidates the previous ready
+signal until its gates are verified; a changed base rechecks the applicable integration gates.
+An agent's summary or heartbeat may explain work but cannot attest that hosted gates passed.
+
+Selecting a row opens the description, general PR comments and review discussion in place,
+with a direct GitHub PR link. Keep existing summary/timeline views; expose full thread replies
+and pagination through the backend where summaries are insufficient. Show loading, errors and
+truncation explicitly. For every readiness, finding, proposal, agent-work and discussion item,
+show the commit it refers to alongside current head. Preserve a review comment's original commit;
+general comments/description identify the head at observation, without implying code-review coverage.
+
+Keep a visible Merge control in the selected PR, with its current gate or permission reason when
+unavailable. Clicking it explicitly authorizes the existing queue/merge path for the displayed PR,
+head and stack scope; show any affected layers before submission. It never bypasses gates or
+silently marks a draft ready. Reuse `queue_pull`, add an expected-head precondition, and recheck
+caller authorization and head server-side. A moved head rejects the stale click and refreshes the
+view; new PR content after submission invalidates that authorization before the final merge too.
+Show queued/waiting, failure or verified merged outcome instead of claiming an immediate merge.
+Readiness, polling and accepting a suggestion are never merge consent. Hosted suggestions remain
+inspectable with Accept/Reject decisions; only the user's agent applies accepted content.
+
+Illustrative content, not a production screenshot:
 
 ```text
-PR #N · head <current head> · stage Review
+List          PR #N · Blocked: author action · assessed <current head> · updated <time>
+Selected      PR #N · head <current head> · Open on GitHub
+Context       Description · Comments / review discussion · Activity
 
 MergeLoop     Hosted review finished on <reviewed head> · 2 findings need changes
 Author        PR held: fix or dispute the findings · targets <reviewed head>
@@ -236,6 +286,7 @@ Your agent    Action needed: inspect findings and evidence · connection/activit
 GitHub CI     Waiting for a new push · current checks linked below
 
 Next action   Pick up review findings   Copy agent command
+Control       Merge unavailable: review changes on <reviewed head>
 Activity      Last queue event and time
 ```
 
@@ -245,6 +296,8 @@ that a process is alive. Do not label an author hold “your agent is running”
 
 | Information the view needs | Existing source | Gap / proposed addition |
 | --- | --- | --- |
+| List readiness, including unqueued/draft PRs | `get_inbox`, `list_open_pulls`, `pull_status`, review and GitHub check reads. | One shared server projection of gate reasons, next-action owner, assessed/base/reviewed heads and freshness. An unassessed PR is unknown, not ready; no implicit queue action to obtain status. |
+| PR description, discussion and owner merge action | `get_pull` / `PullDetail` already show description, timeline comments and thread summaries; `queue_pull` requests the normal merge path. | Extend the existing detail read for full replies/pagination and commit context. Head-fence the merge request and show its scope, gates and outcome; do not add a direct-merge bypass. |
 | Queue stage, active lane step, holds and stack layer | `EntryView` in `web/api.rs`; `PullStateView` / `HoldReasonView` in [web/v1.rs](../crates/web/src/v1.rs). `list_queue`, `pull_status` and `next_need` expose these. | Project ownership from the typed policy and hold, not from parsing English event messages. A `prep_*` hold means hosted work; an `author_*` hold means work required from the user's agent. `review_changes` always returns responsibility to the author. |
 | Review head, findings, cleared/withdrawn status and last update | `ReviewRecord` in `store/review.rs`, projected as `AgentReviewView` / `ReviewBriefView` in [web/review.rs](../crates/web/src/review.rs). | Show reviewed head beside current head. Add review ID and effective execution mode to the shared response where needed. `agent_fixed` means the queue's agent fixed it; it does not identify the user's agent. |
 | Each proposed change and its owner decision | New shared proposal context on the existing review/need projections. | Show proposal ID/revision, exact diff/text, target commit, current commit, pending/accepted/rejected/stale/applied state and verified application result. Label stale proposals explicitly; never imply acceptance for a different head. |
@@ -252,9 +305,10 @@ that a process is alive. Do not label an author hold “your agent is running”
 | Last activity and coarse hosted work | Stored queue events via `list_events`; `QueueActivity` already polls every three seconds. Review `pending` / `running` is stored. | Job `JobEvent`s are accumulated in `job.rs` and recorded by `review::run_job` after executor completion; they are not a live tool stream. A running review can be waiting for a sandbox slot. Show coarse state honestly; live hosted substeps need new streaming/persistence. |
 | Actual user-agent acknowledgement, phase and freshness | Absent. `ReviewRecord.claim` and database `claimed_at` fence hosted review workers; prep claims live in memory. Database `fixing` tracks an internal hosted review fix and is not a user-agent presence field. | Later add a durable agent-work lease and heartbeat, scoped to installation/repo/PR/layer/head. Do not reuse hosted worker claims. |
 
-The first card needs no presence database and promises only ownership and the next action. A full
-live view does require the last row's new state. Reuse the same server projection for UI and MCP;
-do not create a second client-side queue state machine.
+The first slice reads readiness, PR context, ownership and the next action without a presence
+database. A full live agent view requires the last row's new state. Reuse the same server
+projection for UI and MCP, including agent-rendered chat tables; do not create a second client-side
+queue state machine. The merge write follows as a separate slice with the head check above.
 
 ## MCP contract at `https://mergeloop.ai/mcp`
 
@@ -265,12 +319,13 @@ subscription transport is needed for Furqan's polling request.
 
 | Surface | Concrete change |
 | --- | --- |
-| Existing reads: `list_queue`, `pull_status`, `get_agent_review`, `next_need`, `list_events`, `get_pull` | Add the ownership/head context through their canonical projections, keeping existing fields compatible. `get_pull` already provides current head, checks and open-thread summaries. First UI slice uses these reads only. |
+| Existing reads: `get_inbox`, `list_open_pulls`, `list_queue`, `pull_status`, `get_agent_review`, `next_need`, `list_events`, `get_pull` | Add shared readiness, ownership and head/freshness context through their canonical projections, keeping existing fields compatible. `get_pull` already provides description, timeline comments, current head, checks and open-thread summaries; add full replies/pagination and commit context for the selected PR. First UI slice uses reads only. |
+| Owner Merge control: existing `queue_pull` | Add the displayed expected head and stack scope to the request; reject stale submissions and invalidate consent on subsequent PR content changes before the final merge. Use the same API/MCP action, caller permissions and gates for a click or the user's explicitly instructed agent. Opening the view, a ready assessment or the `queue` need is not authorization to call it. |
 | Existing `next_need` loop | Continue `next_need({repo, number, after: id, wait: 50})`; `threads` returns findings/evidence and an author hold, never an auto-fix request. Optional proposals require an owner decision before application. Keep `fix_checks` specific to red CI and preserve `conflict`, then poll again. Proposal revisions and decisions update the authoritative need; rejected proposals are not repeatedly offered as new work. `NeedKind` serializes snake_case. `id` is a hash of need/hold/latest event, not a proposal ID, acceptance or proof the agent took work. Progress events must not mint endless new work from heartbeats. |
 | Proposed decision tool, with the execution split | Register `respond_to_agent_proposal` with proposal ID/revision, target head and typed `accept` / `reject`. Reuse repo authorization, persist the caller and decision idempotently, and reject stale revisions/heads. It records consent only; all repository and PR writes are applied by the user's agent. This does not wait for the later progress/lease tools. |
 | Existing `post_review` | Remains the legacy all-local review submission. New mode uses hosted findings and must never accept a local assertion through `posted_review` as hosted evidence. `ask_agent_about_review` remains the way to dispute a hosted finding; human `answer_agent_review` retains its existing role. |
 | Proposed progress tools, after the split | Register `claim_agent_work`, `report_agent_work` and `release_agent_work` under a PR's `/api/w/{id}/repos/{owner}/{name}/pulls/{number}/agent-work` routes. Claims return an opaque fenced lease; reports name its head, work generation and a typed phase (`fixing`, `verifying`, `pushing`, `blocked`). Use a client operation ID for retry idempotency, monotonic fencing and lease expiry. Resolve caller identity server-side; a display name/session label is descriptive only. |
-| Direct thread work, a follow-up | Today `need::THREADS` still tells the agent to list/reply/resolve threads with `gh` GraphQL. `get_pull`'s open-thread summaries lack thread IDs/full replies. Extend [github/detail.rs](../crates/github/src/detail.rs) and the projection, then add registered read/reply/resolve tools backed by existing GitHub adapters, scoped to the requested PR. Update the brief to use those tools. This closes the remaining PR-comment scraping gap without building another queue controller. |
+| Direct thread work | Today `need::THREADS` still tells the agent to list/reply/resolve threads with `gh` GraphQL. `get_pull`'s open-thread summaries lack thread IDs/full replies. Extend [github/detail.rs](../crates/github/src/detail.rs) and the shared read projection in the first slice so both UI and agent can inspect discussion. Registered reply/resolve tools backed by existing GitHub adapters follow later; update the brief then. All tools stay scoped to the requested PR. |
 
 For new writes, reuse [auth.rs](../crates/web/src/auth.rs)'s `Caller::repo` and
 `caller.github_token` conventions. Require repo write access to claim/report fixing work. A lease
@@ -293,14 +348,20 @@ under the repository's existing API/MCP parity checks.
 | Order | Slice | Why / completion criterion |
 | --- | --- | --- |
 | Already available | Confirmed third bullet: agent polls for work | `next_need` and `mergeloop` already implement it. Show an example using the existing skill/CLI; no daemon or new transport to land. This is the smallest ask to satisfy. |
-| First new change | Read-only ownership and next-action card | Extend the existing Queue/You PR gate with hosted/your-agent/CI rows, head freshness, the returned brief and a copyable command. Use existing read routes, plus an additive shared policy/head projection if needed. Render each proposal's target commit and decision state when proposals arrive with the split; do not invent proposals for legacy output. Show missing activity as unknown. No execution-policy or gate change. |
+| First new change | Read-only PR list readiness, context and next action | Extend Queue/You rows and the existing detail with shared readiness/reasons, head freshness, description, discussion and GitHub link, plus hosted/your-agent/CI ownership, brief and copyable command. Include unqueued/draft PRs without queuing them. Render proposal targets/decisions when the split supplies them; no invented legacy proposals or agent presence. No new page, execution-policy or gate change. |
 | Independent policy change | Remove review auto-fix and make later reviews incremental | In every mode, findings reject/hold for the author immediately; only red CI can auto-fix. Review the first PR diff, then new commits plus unresolved findings. Preserve evidence, security/human gates and independent replay without a corrective publisher. This is not conditional on the optional split. |
-| Second | Opt-in `hosted-review` execution split, owner decisions and author-change validation | Route every hosted-originated repo/PR change through an owner-visible proposal and the user's agent; retain deep hosted diff review, configured checks, immutable evidence replay and head checks. Ship proposal storage/decisions, publication guards and validation together. This mode also hands CI fixes and conflicts to the author's agent; it never reinstates review auto-fix. |
-| Third implementation slice | Acknowledgement/progress and direct thread tools | Add fenced leases and freshness reporting for a true live agent view, then remove the brief's dependence on `gh` thread queries. This is an implementation sequence, not an invented third feedback request. |
+| Next control slice | Explicit owner Merge action | Keep the action in the selected PR; add server-side expected-head/stack-scope checks to the existing API/MCP queue path. Show blockers and queued/waiting/verified merged outcomes. No gate bypass, implicit draft publication or consent inferred from readiness. This does not depend on the optional execution split. |
+| Then | Opt-in `hosted-review` execution split, owner decisions and author-change validation | Route every hosted-originated repo/PR change through an owner-visible proposal and the user's agent; retain deep hosted diff review, configured checks, immutable evidence replay and head checks. Ship proposal storage/decisions, publication guards and validation together. This mode also hands CI fixes and conflicts to the author's agent; it never reinstates review auto-fix. |
+| After the split | Acknowledgement/progress and thread writes | Add fenced leases and freshness reporting for a true live agent view, then reply/resolve tools to remove the brief's dependence on `gh` thread queries. Discussion reads already ship in the first slice. This is an implementation sequence, not an invented feedback request. |
 
-Before shipping the first slice, inspect the existing UI in both execution modes and show pending
-review, author action, human ask, new/stale head, CI wait, stack layer, disconnected/unknown and
-merged/ejected states. Do not equate a green CI badge with completed hosted review.
+Before shipping the first slice, inspect the existing list/detail UI in both execution modes and
+show unqueued/draft, pending review, author action, human ask, new/stale head, CI wait, stack layer,
+disconnected/unknown and merged/ejected states. From a row, reach the description, discussion and
+PR link without a new page. Every status/item names its commit and freshness; green CI alone is
+not ready. A new push removes the old ready signal, and UI and agent reads converge on the same
+head and reasons without queuing the PR. Before enabling Merge, prove a stale-head/scope click,
+new content after submission, missing permission or draft cannot merge without fresh authorization
+and the applicable gates. An authorized request still follows the normal queue path.
 
 For the split, extend existing queue-loop scenarios in
 [getting_ready.rs](../crates/mergepatrol/src/queue/loop_tests/getting_ready.rs), review-store cases and

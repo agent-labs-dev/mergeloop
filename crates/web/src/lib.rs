@@ -1542,6 +1542,15 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn a_post_no_route_takes_is_refused(pool: PgPool) {
+        let (router, _) = signed_in(pool).await;
+        for path in ["/webhooks", "/webhooks/", "/ada/queue"] {
+            let res = send(&router, Request::post(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn crawlers_see_the_servers_own_address(pool: PgPool) {
         let (router, _) = signed_in(pool).await;
         assert!(

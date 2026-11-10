@@ -9,14 +9,13 @@ use mergepatrol_core::{
     Step, TaskModel, WorkspaceDefaults, current_step,
 };
 use mergepatrol_github::{
-    App, AsUser, BranchFile, CheckRunState, ConfigFile, DiffOf, GitObject, InboxPull, Installation,
-    Proposal, PullDetail, PullRef, PullRequest, SYMLINK_MODE, TimelineEvent, setup,
+    App, AsUser, BranchFile, CheckRunState, ConfigFile, DiffOf, GitObject, Installation, Proposal,
+    PullDetail, PullRef, PullRequest, SYMLINK_MODE, TimelineEvent, setup,
 };
 use mergepatrol_resolver::{DeviceLogin, KeyCheck, check_api_key};
 use mergepatrol_store::{
     CHATGPT_DEVICE_LOGIN, CHATGPT_LOGIN, Change, DeveloperStats, EventRecord, ExitQuery,
-    ExitRecord, ExitStats, InboxRow, LaneKey, RepoState, ReviewRecord, Scope, Slice, Store,
-    api_key_secret,
+    ExitRecord, ExitStats, LaneKey, RepoState, ReviewRecord, Scope, Slice, Store, api_key_secret,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -259,71 +258,6 @@ pub enum EntryStateView {
     Waiting,
     Held,
     Active,
-}
-
-/// The signed-in user's PRs, and the PRs that ask for their review, across their workspaces.
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct YouView {
-    /// Theirs and open, updated last first.
-    pub authored: Vec<InboxPullView>,
-    /// Asked of them, or of a team of theirs, updated last first.
-    pub review_requested: Vec<InboxPullView>,
-    /// Theirs, merged in the last week, last first.
-    pub merged: Vec<InboxPullView>,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct InboxPullView {
-    pub repo: String,
-    pub number: u32,
-    /// The branch it merges into.
-    pub base: String,
-    pub draft: bool,
-    pub updated_at: String,
-    /// When it merged, for a merged one.
-    pub merged_at: Option<String>,
-    /// The workspace the PR is in, to act on it in.
-    pub workspace: u32,
-    /// Whether MergeLoop runs on the repo, so the PR can be queued.
-    pub queues: bool,
-    /// Where the queue has it. `None` when it is not queued.
-    pub queue: Option<QueueSpotView>,
-    /// Comments and reviews by others since the user last opened it here, or last said
-    /// something on it.
-    pub unread: u32,
-    /// Until when the user snoozed it, RFC 3339. A snooze is over once someone else says
-    /// something on the PR.
-    pub snoozed_until: Option<String>,
-    /// Its review threads no one resolved yet, of the first 100.
-    pub unresolved_threads: u32,
-    #[serde(flatten)]
-    pub pull: PullView,
-}
-
-/// A PR's place in its lane, in merge order.
-#[derive(Clone, Debug, Serialize, TS)]
-#[ts(export)]
-pub struct QueueSpotView {
-    pub state: EntryStateView,
-    /// From 1. A held PR has one too: last, after those waiting.
-    pub place: u32,
-    /// The PRs in the lane.
-    pub of: u32,
-    pub priority: bool,
-    /// Why it is held.
-    pub detail: Option<String>,
-    /// Why it is held, typed: whether it waits on its author or on others.
-    pub hold: Option<crate::v1::HoldReasonView>,
-}
-
-/// Puts a PR out of the user's inbox for a while.
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct SnoozePull {
-    /// From 1 to a year's.
-    pub minutes: u32,
 }
 
 /// Asks the reviewers who have not answered to review, in a comment that mentions them.
@@ -1930,134 +1864,6 @@ pub(crate) async fn published(
     Ok(())
 }
 
-/// How long the You tab lists a merged PR.
-const MERGED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
-
-/// The user's inbox, as webhooks keep it, with where the queue has each PR.
-pub(crate) async fn you(
-    State(app): State<AppState>,
-    caller: Caller,
-) -> Result<Json<YouView>, ApiError> {
-    let user = caller.user()?;
-    let ids = user.installations();
-    let inbox = app.store.inbox(user.login(), ids, MERGED_FOR).await?;
-    // Authored or asked to review is not enough: the user may since have lost the repo.
-    let mut readable = HashMap::new();
-    for &id in ids {
-        readable.insert(id, user.readable(&app, id).await?);
-    }
-    let on: HashSet<(u64, RepoName)> = app
-        .store
-        .repos()
-        .await?
-        .into_iter()
-        .filter(|r| ids.contains(&r.installation_id) && r.on())
-        .map(|r| (r.installation_id, r.repo))
-        .collect();
-    let mut spots = HashMap::new();
-    for &id in ids {
-        let (lanes, _) = reviewed(&app, id, app.store.lanes(id).await?).await?;
-        spots.extend(queue_spots(lanes));
-    }
-    let view = |rows: Vec<InboxRow>| -> Vec<InboxPullView> {
-        rows.into_iter()
-            .filter_map(|row| {
-                let p = InboxPull::from_node(&row.node)
-                    .inspect_err(|e| tracing::warn!(error = %format!("{e:#}"), "an inbox PR"))
-                    .ok()?;
-                if !readable.get(&row.installation_id)?.contains(&p.repo) {
-                    return None;
-                }
-                Some(InboxPullView {
-                    number: p.pr.number as u32,
-                    base: p.pr.merges_into().to_owned(),
-                    draft: p.pr.is_draft,
-                    merged_at: (p.state == "merged").then(|| p.closed_at.clone()).flatten(),
-                    workspace: row.installation_id as u32,
-                    queues: on.contains(&(row.installation_id, p.repo.clone())),
-                    queue: spots.get(&(p.repo.clone(), p.pr.number)).cloned(),
-                    unread: unread(&p.activity, user.login(), row.seen_at.as_deref()),
-                    snoozed_until: row
-                        .snoozed
-                        .filter(|(at, _)| unread(&p.activity, user.login(), Some(at)) == 0)
-                        .map(|(_, until)| until),
-                    unresolved_threads: p.pr.unresolved_threads,
-                    pull: p.pr.summary().into(),
-                    updated_at: p.updated_at,
-                    repo: p.repo.to_string(),
-                })
-            })
-            .collect()
-    };
-    Ok(Json(YouView {
-        authored: view(inbox.authored),
-        review_requested: view(inbox.requested),
-        merged: view(inbox.merged),
-    }))
-}
-
-/// What others said since `me` last opened the PR, or last said something on it: GitHub's
-/// times compare as strings.
-fn unread(activity: &[(String, String)], me: &str, seen: Option<&str>) -> u32 {
-    let mine = activity
-        .iter()
-        .filter(|(who, _)| who.eq_ignore_ascii_case(me))
-        .map(|(_, at)| at.as_str())
-        .max();
-    let since = seen.max(mine).unwrap_or("");
-    activity
-        .iter()
-        .filter(|(who, at)| !who.eq_ignore_ascii_case(me) && at.as_str() > since)
-        .count() as u32
-}
-
-/// The user opened the PR in the dashboard: what came before is read.
-pub(crate) async fn seen_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<StatusCode, ApiError> {
-    let id = caller.workspace(id)?;
-    let repo = repo_name(owner, name)?;
-    app.store
-        .inbox_seen(caller.user()?.login(), id, &repo, number)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Puts the PR out of the user's inbox for `minutes`.
-pub(crate) async fn snooze_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<SnoozePull>,
-) -> Result<StatusCode, ApiError> {
-    let id = caller.workspace(id)?;
-    let repo = repo_name(owner, name)?;
-    if !(1..=366 * 24 * 60).contains(&body.minutes) {
-        return Err(ApiError::bad_request("minutes must be from 1 to a year's"));
-    }
-    let snooze = std::time::Duration::from_secs(u64::from(body.minutes) * 60);
-    app.store
-        .inbox_snooze(caller.user()?.login(), id, &repo, number, Some(snooze))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Puts a snoozed PR back in the user's inbox.
-pub(crate) async fn unsnooze_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<StatusCode, ApiError> {
-    let id = caller.workspace(id)?;
-    let repo = repo_name(owner, name)?;
-    app.store
-        .inbox_snooze(caller.user()?.login(), id, &repo, number, None)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// Mentions the reviewers in a comment as the user, so GitHub tells them.
 pub(crate) async fn nudge_pull(
     State(app): State<AppState>,
@@ -2086,38 +1892,6 @@ pub(crate) async fn nudge_pull(
     app.store.inbox_changed(id, &repo, number).await?;
     tracing::info!(installation = id, %repo, number, "nudged from the dashboard");
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Where the queue has each PR of these lanes. A stack's layers each take the stack's spot.
-fn queue_spots(lanes: Vec<(LaneKey, Lane)>) -> HashMap<(RepoName, u64), QueueSpotView> {
-    let mut spots = HashMap::new();
-    for (key, lane) in lanes {
-        let entries = in_merge_order(lane.entries);
-        let of = entries.len() as u32;
-        for (i, e) in entries.into_iter().enumerate() {
-            let (state, detail, hold) = match e.state {
-                EntryState::Waiting => (EntryStateView::Waiting, None, None),
-                EntryState::Held(reason) => (
-                    EntryStateView::Held,
-                    Some(reason.to_string()),
-                    Some(crate::v1::HoldView::from(&reason).reason),
-                ),
-                EntryState::Active => (EntryStateView::Active, None, None),
-            };
-            let spot = QueueSpotView {
-                state,
-                place: i as u32 + 1,
-                of,
-                priority: e.priority,
-                detail,
-                hold,
-            };
-            for n in std::iter::once(e.number).chain(e.layers) {
-                spots.insert((key.repo.clone(), n), spot.clone());
-            }
-        }
-    }
-    spots
 }
 
 /// Reviews the PR as the user, then queues it if they asked. The queue reads the PR again now:
@@ -3743,56 +3517,6 @@ mod tests {
         assert_eq!(json["number"], 1);
         assert_eq!(json["title"], "");
         assert!(json.get("pull").is_none());
-    }
-
-    #[test]
-    fn unread_is_what_others_said_since_i_looked_or_last_spoke() {
-        let a = |who: &str, at: &str| (who.to_owned(), at.to_owned());
-        let activity = [a("ann", "1"), a("Me", "2"), a("bo", "3"), a("ann", "5")];
-        assert_eq!(unread(&activity, "me", None), 2);
-        assert_eq!(unread(&activity, "me", Some("4")), 1);
-        assert_eq!(unread(&activity, "me", Some("1")), 2);
-        assert_eq!(unread(&[a("ann", "1")], "me", None), 1);
-        assert_eq!(unread(&[], "me", None), 0);
-    }
-
-    #[test]
-    fn each_queued_pr_and_stack_layer_has_its_spot_in_merge_order() {
-        let repo = RepoName::parse("o/r").unwrap();
-        let mut stack = entry(9, false, EntryState::Waiting);
-        stack.layers = vec![7, 8, 9];
-        let lane = Lane {
-            entries: vec![
-                entry(
-                    1,
-                    false,
-                    EntryState::Held(mergepatrol_core::Hold::ReviewRequired),
-                ),
-                stack,
-                entry(3, true, EntryState::Waiting),
-                entry(4, false, EntryState::Active),
-            ],
-            ..Lane::default()
-        };
-        let key = LaneKey {
-            installation_id: 1,
-            repo: repo.clone(),
-            trunk: "main".into(),
-        };
-        let spots = queue_spots(vec![(key, lane)]);
-        let spot = |n| &spots[&(repo.clone(), n)];
-        let places: Vec<u32> = [4, 3, 9, 1].into_iter().map(|n| spot(n).place).collect();
-        assert_eq!(places, [1, 2, 3, 4]);
-        assert!(spot(3).priority);
-        assert_eq!(spot(7).place, 3);
-        assert_eq!(spot(8).state, EntryStateView::Waiting);
-        assert_eq!(spot(1).state, EntryStateView::Held);
-        assert_eq!(
-            spot(1).detail.as_deref(),
-            Some("waiting for a required review")
-        );
-        assert!(spots.values().all(|s| s.of == 4));
-        assert!(!spots.contains_key(&(repo, 2)));
     }
 
     #[test]

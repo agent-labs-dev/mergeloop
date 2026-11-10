@@ -366,105 +366,11 @@ mod tests {
         assert!(back.contains("another%20browser"), "{back}");
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn a_tray_sign_in_returns_to_the_app(pool: PgPool) {
-        let (router, _) = with_app(pool, Some(app(None)), Arc::default()).await;
-        let app_state = "s".repeat(24);
-        let challenge = Pkce::new().challenge;
-        let login = Request::get(format!(
-            "/auth/login?tray_port=4567&tray_state={app_state}&tray_challenge={challenge}"
-        ))
-        .body(Body::empty())
-        .unwrap();
-        let (to_github, cookies) = redirect(&send(&router, login).await);
-        let state = query_param(&to_github, "state");
-        let both = cookies.join("; ");
-        assert!(
-            both.contains(&format!("mp_tray=4567.{app_state}.{challenge}")),
-            "{both}"
-        );
-
-        // Up to GitHub's exchange of the code, which fails here: the error goes to the app.
-        let callback = Request::get(format!("/auth/callback?code=c&state={state}"))
-            .header("cookie", &both)
-            .body(Body::empty())
-            .unwrap();
-        let (back, cookies) = redirect(&send(&router, callback).await);
-        assert!(
-            back.starts_with(&format!(
-                "http://127.0.0.1:4567/callback?state={app_state}&error="
-            )),
-            "{back}"
-        );
-        assert!(cookies.contains(&"mp_tray=".to_owned()), "{cookies:?}");
-
-        // A malformed request never reaches GitHub.
-        for bad in [
-            format!("tray_port=4567&tray_state=x%26y&tray_challenge={challenge}"),
-            format!("tray_port=4567&tray_state={app_state}"),
-            format!("tray_port=4567&tray_state={app_state}&tray_challenge=short"),
-        ] {
-            let req = Request::get(format!("/auth/login?{bad}"))
-                .body(Body::empty())
-                .unwrap();
-            let (back, _) = redirect(&send(&router, req).await);
-            assert!(back.starts_with("/?error="), "{bad}: {back}");
-        }
-    }
-
     /// A store and vault on the router's database, as the router sees them.
     async fn store_and_vault(pool: PgPool) -> (Arc<dyn Store>, Vault) {
         let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
         let vault = Vault::new(store.clone(), KEY).unwrap();
         (store, vault)
-    }
-
-    fn trade(code: &str, verifier: &str) -> Request<Body> {
-        Request::post("/auth/tray/token")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({ "code": code, "verifier": verifier }).to_string(),
-            ))
-            .unwrap()
-    }
-
-    #[sqlx::test(migrations = false)]
-    async fn the_app_trades_its_code_once_with_its_verifier(pool: PgPool) {
-        let (router, _) = signed_in(pool.clone()).await;
-        let (store, vault) = store_and_vault(pool).await;
-        let pkce = Pkce::new();
-        // The callback's work: the session "tok" (from `signed_in`), sealed under a code.
-        let code = |name: &str| LoginCode {
-            token_hash: auth::hash("tok"),
-            challenge: pkce.challenge.clone(),
-            token: vault
-                .seal(&format!("login-code/{}", auth::hash(name)), "tok")
-                .unwrap(),
-            expires_at: now() + 60,
-        };
-        store
-            .create_login_code(&auth::hash("c"), &code("c"))
-            .await
-            .unwrap();
-
-        let res = send(&router, trade("c", &pkce.verifier)).await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], br#"{"token":"tok"}"#);
-        // Once only.
-        let again = send(&router, trade("c", &pkce.verifier)).await;
-        assert_eq!(again.status(), StatusCode::BAD_REQUEST);
-
-        // Without the verifier, the code fails, and the session it carried goes with it.
-        store
-            .create_login_code(&auth::hash("d"), &code("d"))
-            .await
-            .unwrap();
-        let stolen = send(&router, trade("d", &Pkce::new().verifier)).await;
-        assert_eq!(stolen.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(store.session(&auth::hash("tok")).await.unwrap(), None);
     }
 
     /// The user session "old" for installation 1, as of `checked_at`, keeping `github`.
@@ -607,7 +513,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn the_tray_reads_the_api_with_a_bearer_token(pool: PgPool) {
+    async fn a_session_reads_the_api_as_a_bearer_token(pool: PgPool) {
         let (router, _) = signed_in(pool).await;
         let req = |auth: &str| {
             Request::get("/api/w/1/lanes")
@@ -959,7 +865,6 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("mp_mcp=") && c.len() > 7)
         );
-        assert!(cookies.contains(&"mp_tray=".to_owned()), "{cookies:?}");
 
         // Up to GitHub's exchange of the code, which fails here: the error goes to the client.
         let callback = Request::get(format!("/auth/callback?code=c&state={state}"))
@@ -1057,6 +962,24 @@ mod tests {
         assert_eq!(json_of(res).await["error"], "invalid_grant");
         let res = trade("grant_type=refresh_token&refresh_token=r".into()).await;
         assert_eq!(json_of(res).await["error"], "unsupported_grant_type");
+
+        // Without the verifier, the code fails, and the session it carried goes with it.
+        let stolen = LoginCode {
+            token: vault
+                .seal(&format!("login-code/{}", auth::hash("d")), "tok")
+                .unwrap(),
+            ..code
+        };
+        store
+            .create_login_code(&auth::hash("d"), &stolen)
+            .await
+            .unwrap();
+        let form = format!(
+            "grant_type=authorization_code&code=d&code_verifier={}&client_id=x&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcallback",
+            Pkce::new().verifier
+        );
+        assert_eq!(json_of(trade(form).await).await["error"], "invalid_grant");
+        assert_eq!(store.session(&auth::hash("tok")).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = false)]
@@ -1851,18 +1774,6 @@ mod tests {
         router.clone().oneshot(req).await.unwrap().status()
     }
 
-    async fn deliver_event(router: &Router, event: &str, body: &str) -> StatusCode {
-        let req = Request::post("/webhooks/github")
-            .header("x-github-event", event)
-            .header(
-                "x-hub-signature-256",
-                webhook::sign("hush", body.as_bytes()),
-            )
-            .body(Body::from(body.to_owned()))
-            .unwrap();
-        router.clone().oneshot(req).await.unwrap().status()
-    }
-
     /// A PR as the inbox reads it, by `author`, asked of the team `core`, with a comment by
     /// `ann`.
     fn inbox_node(number: u64, author: &str) -> serde_json::Value {
@@ -1983,132 +1894,6 @@ mod tests {
         store.save_config_read(1, &repo, 0, &ship).await.unwrap();
         let listed = open(router, cookie).await;
         assert_eq!(listed, [(1, true), (2, false), (3, false), (8, false)]);
-    }
-
-    #[sqlx::test(migrations = false)]
-    async fn webhooks_keep_the_inbox_and_the_you_tab_reads_it(pool: PgPool) {
-        use mergepatrol_store::{InboxRead, InboxWrite};
-        let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool.clone()).await.unwrap());
-        let (router, cookie) = with_app(pool, Some(app(Some("hush"))), Arc::default()).await;
-        let repo = mergepatrol_core::RepoName::parse("o/r").unwrap();
-
-        // A comment on a PR marks it; one on an issue does not.
-        let on_pr = r#"{"action":"created","installation":{"id":1},"repository":{"full_name":"o/r"},"issue":{"number":5,"pull_request":{"url":"u"}}}"#;
-        let on_issue = r#"{"action":"created","installation":{"id":1},"repository":{"full_name":"o/r"},"issue":{"number":6}}"#;
-        deliver_event(&router, "issue_comment", on_pr).await;
-        deliver_event(&router, "issue_comment", on_issue).await;
-        let stale = store
-            .inbox_stale(std::time::Duration::ZERO, 10)
-            .await
-            .unwrap();
-        assert_eq!(stale.iter().map(|s| s.number).collect::<Vec<_>>(), [5]);
-        // Ada joins the team the PR asks.
-        let joined = r#"{"action":"added","installation":{"id":1},"team":{"slug":"core"},"member":{"login":"Ada"}}"#;
-        assert_eq!(
-            deliver_event(&router, "membership", joined).await,
-            StatusCode::NO_CONTENT
-        );
-        let node = inbox_node(5, "bo");
-        let read = InboxRead {
-            state: "open".into(),
-            author: Some("bo".into()),
-            requested_users: Vec::new(),
-            requested_teams: vec!["core".into()],
-            reviewers: Vec::new(),
-            closed_at: None,
-            node,
-        };
-        let write = InboxWrite {
-            number: 5,
-            changes: stale[0].changes,
-            read: Some(read),
-            settled: true,
-        };
-        store.save_inbox_reads(1, &repo, &[write]).await.unwrap();
-        // Asked of Ada's team too, in a repo she cannot read.
-        let secret = mergepatrol_core::RepoName::parse("o/secret").unwrap();
-        let on_secret = on_pr.replace("o/r", "o/secret").replace(":5,", ":9,");
-        deliver_event(&router, "issue_comment", &on_secret).await;
-        let stale = store
-            .inbox_stale(std::time::Duration::ZERO, 10)
-            .await
-            .unwrap();
-        let changes = stale.iter().find(|s| s.number == 9).unwrap().changes;
-        let mut node = inbox_node(9, "bo");
-        node["repository"]["nameWithOwner"] = "o/secret".into();
-        let read = InboxRead {
-            state: "open".into(),
-            author: Some("bo".into()),
-            requested_users: Vec::new(),
-            requested_teams: vec!["core".into()],
-            reviewers: Vec::new(),
-            closed_at: None,
-            node,
-        };
-        let write = InboxWrite {
-            number: 9,
-            changes,
-            read: Some(read),
-            settled: true,
-        };
-        store.save_inbox_reads(1, &secret, &[write]).await.unwrap();
-
-        let you = |cookie: String| {
-            let router = router.clone();
-            async move {
-                let req = Request::get("/api/you")
-                    .header("cookie", cookie)
-                    .body(Body::empty())
-                    .unwrap();
-                let res = router.oneshot(req).await.unwrap();
-                assert_eq!(res.status(), StatusCode::OK);
-                let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-                    .await
-                    .unwrap();
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-            }
-        };
-        let view = you(cookie.clone()).await;
-        assert_eq!(view["review_requested"].as_array().unwrap().len(), 1);
-        let asked = &view["review_requested"][0];
-        assert_eq!(
-            (asked["repo"].as_str(), asked["number"].as_u64()),
-            (Some("o/r"), Some(5))
-        );
-        assert_eq!(
-            (asked["workspace"].as_u64(), asked["unread"].as_u64()),
-            (Some(1), Some(1))
-        );
-        assert_eq!(asked["unresolved_threads"], 1);
-        assert_eq!(view["authored"], serde_json::json!([]));
-
-        // A thread resolved marks its PR.
-        let resolved = r#"{"action":"resolved","installation":{"id":1},"repository":{"full_name":"o/r"},"pull_request":{"number":8}}"#;
-        deliver_event(&router, "pull_request_review_thread", resolved).await;
-        let stale = store
-            .inbox_stale(std::time::Duration::ZERO, 10)
-            .await
-            .unwrap();
-        assert_eq!(stale.iter().map(|s| s.number).collect::<Vec<_>>(), [8]);
-
-        // Opened here: read.
-        let seen = Request::put("/api/w/1/repos/o/r/pulls/5/seen")
-            .header("cookie", cookie.clone())
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            router.clone().oneshot(seen).await.unwrap().status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            you(cookie.clone()).await["review_requested"][0]["unread"],
-            0
-        );
-
-        // Left the team: no longer asked.
-        let left = joined.replace("added", "removed");
-        deliver_event(&router, "membership", &left).await;
-        assert_eq!(you(cookie).await["review_requested"], serde_json::json!([]));
     }
 
     fn push(r#ref: &str, commits: &str) -> String {

@@ -35,11 +35,9 @@ import type { SetReviewSettings } from "./api/SetReviewSettings";
 import type { SetSecret } from "./api/SetSecret";
 import type { SettingsView } from "./api/SettingsView";
 import type { SkillView } from "./api/SkillView";
-import type { SnoozePull } from "./api/SnoozePull";
 import type { Unlock } from "./api/Unlock";
 import type { UpdatePullView } from "./api/UpdatePullView";
 import type { WorkspaceDefaultsView } from "./api/WorkspaceDefaultsView";
-import type { YouView } from "./api/YouView";
 
 async function request(method: string, path: string, body?: unknown): Promise<Response> {
   const res = await fetch(path, {
@@ -77,7 +75,6 @@ export const startManifest = (body: ManifestRequest) =>
 export const logout = () => call("POST", "/auth/logout");
 
 /** The user's open PRs, and those that ask for their review, across their workspaces. */
-export const fetchYou = () => get<YouView>("/api/you");
 
 /** Workspace endpoints: `id` is the installation ID. */
 const w = (id: number, path: string) => `/api/w/${id}${path}`;
@@ -235,18 +232,6 @@ export const reviewUrl = (id: number, repo: string, pr: number) =>
 /** Reviews the PR as the user, and queues it with `queue`. */
 export const reviewPull = (id: number, repo: string, pr: number, body: ReviewPull) =>
   call("POST", reviewUrl(id, repo, pr), body);
-
-/** The user opened the PR here: what came before is read. */
-export const seenPull = (id: number, repo: string, pr: number) =>
-  call("PUT", w(id, `/repos/${repo}/pulls/${pr}/seen`));
-
-/** Puts the PR out of the user's inbox for `minutes`. */
-export const snoozePull = (id: number, repo: string, pr: number, minutes: number) =>
-  call("PUT", w(id, `/repos/${repo}/pulls/${pr}/snooze`), { minutes } satisfies SnoozePull);
-
-/** Puts a snoozed PR back in the user's inbox. */
-export const unsnoozePull = (id: number, repo: string, pr: number) =>
-  call("DELETE", w(id, `/repos/${repo}/pulls/${pr}/snooze`));
 
 /** Mentions the reviewers in a comment, as the user. */
 export const nudgePull = (id: number, repo: string, pr: number, reviewers: string[]) =>

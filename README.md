@@ -122,7 +122,7 @@ A maintainer queues a PR from a fork with the label, as any other. Its author is
 
 A stack with a PR from a fork is not supported yet.
 
-The You tab reads MergeLoop's own database, never GitHub, when you open it. Webhooks tell MergeLoop which PRs changed, and it reads those again from GitHub as the App. It also reads every open PR of each repo once a day, in case a webhook got lost. Without webhooks, as on a self-hosted http URL, it reads them every 10 minutes. Team review requests need the App's `members: read` permission, which each organization's owner accepts. An App created before this permission existed must be given it on GitHub, along with the `pull_request_review_comment`, `issue_comment`, `membership` and `team` events. Until then, only review requests made to you directly show.
+The queue page's list of open PRs reads MergeLoop's own database, never GitHub, when you open it. Webhooks tell MergeLoop which PRs changed, and it reads those again from GitHub as the App. It also reads every open PR of each repo once a day, in case a webhook got lost. Without webhooks, as on a self-hosted http URL, it reads them every 10 minutes. Team review requests need the App's `members: read` permission, which each organization's owner accepts. An App created before this permission existed must be given it on GitHub, along with the `pull_request_review_comment`, `issue_comment`, `membership` and `team` events. Until then, only review requests made to you directly show.
 
 ## Pricing
 
@@ -320,7 +320,6 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | --- | --- | --- |
 | `get_changelog` | MergeLoop's newest changelog entries | |
 | `get_session` | Who a sign-in is for, and its workspaces: `signed_out` for a GitHub token | |
-| `get_inbox` | Your PRs, and the PRs that ask for your review, across workspaces | Yes |
 | `list_queue` | The queues, in the order they take PRs: a repo's, or the workspace's | Without `repo` |
 | `list_events` | A repo's queue events, newest first | |
 | `get_fix` | The diff of a commit the fix agent pushed | |
@@ -343,9 +342,6 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `answer_agent_review` | Answers what the agent's review asks, as your review on GitHub | |
 | `ask_agent_about_review` | Asks the agent about one of its findings, or replies to one it sent back | |
 | `ask_agent_review_reviewers` | Asks others to answer the agent's review | |
-| `mark_pull_seen` | Marks a PR read in your inbox | Yes |
-| `snooze_pull` | Puts a PR out of your inbox for a while | Yes |
-| `unsnooze_pull` | Puts a snoozed PR back in your inbox | Yes |
 | `nudge_reviewers` | Mentions reviewers in a comment, asking them to review | |
 | `get_repo_config` | A repo's queue settings | |
 | `propose_repo_config` | Opens a PR that changes a repo's queue settings | Yes |

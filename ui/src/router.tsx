@@ -13,7 +13,6 @@ import { Permalink } from "./Permalink";
 import { Queue } from "./Queue";
 import { Settings } from "./Settings";
 import { useWorkspace } from "./workspace";
-import { FOLDERS, type Folder, You } from "./You";
 
 /*
  * The dashboard's pages, one path each, so a reload lands where you were and PostHog sees each
@@ -35,9 +34,6 @@ const root = createRootRoute({
 // The dashboard redirects from here to the workspace it remembers.
 const home = createRoute({ getParentRoute: () => root, path: "/" });
 
-// The menu bar app's sign-in lands here. `App` shows it whatever the session is.
-const tray = createRoute({ getParentRoute: () => root, path: "tray" });
-
 /** A workspace, by its GitHub account. */
 const workspace = createRoute({ getParentRoute: () => root, path: "$account" });
 
@@ -49,26 +45,13 @@ const workspaceHome = createRoute({
   },
 });
 
-/** The You tab's folders before they were four, for the links kept from then. */
-const oldFolders: Record<string, Folder> = {
-  needs: "review",
-  turn: "opened",
-  queue: "opened",
-  others: "opened",
-  drafts: "opened",
-};
-
+/** The You tab's links, from before GitHub took its place: to the queue. */
 const you = createRoute({
   getParentRoute: () => workspace,
   path: "you",
-  /** The folder in view, Review requested by default, the PR in it as `owner/repo#n`, and
-   * whether the agent's review of the PR is being answered. */
-  validateSearch: (search): { folder?: Folder; pr?: string; answer?: boolean } => ({
-    folder: oneOf(FOLDERS, oldFolders[String(search.folder)] ?? search.folder),
-    pr: optional(search.pr, "string"),
-    answer: search.answer === true || undefined,
-  }),
-  component: You,
+  beforeLoad: ({ params }) => {
+    throw redirect({ to: "/$account/queue", params, replace: true });
+  },
 });
 
 const queue = createRoute({
@@ -148,7 +131,6 @@ const settings = createRoute({
 export const router = createRouter({
   routeTree: root.addChildren([
     home,
-    tray,
     workspace.addChildren([workspaceHome, you, queue, history, repos, settings, pull]),
   ]),
 });

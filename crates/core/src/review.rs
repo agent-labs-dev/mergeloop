@@ -110,8 +110,8 @@ pub enum Depth {
     /// One reviewer, who also says what it checked and found sound.
     #[default]
     Standard,
-    /// Several reviewers at once, each fresh, whose findings merge; a panel then votes on every
-    /// change nothing MergeLoop ran shows, of any kind.
+    /// Several reviewers at once, each fresh, whose findings merge and meet the same evidence
+    /// requirement as Standard.
     Deep,
 }
 
@@ -133,11 +133,6 @@ impl Depth {
             Depth::Quick | Depth::Standard => 1,
             Depth::Deep => 3,
         }
-    }
-
-    /// Whether a panel's votes may show a change of `kind` that no command MergeLoop ran showed.
-    pub fn votes_on(self, kind: Kind) -> bool {
-        self == Depth::Deep || kind == Kind::Security
     }
 }
 
@@ -305,8 +300,8 @@ pub struct Finding {
     /// access or credentials, or a change outside the repo.
     #[serde(default)]
     pub needs_human: bool,
-    /// What a panel of fresh agents made of it, each given only the finding and the code: for a
-    /// change that shows nothing MergeLoop ran, whether enough agree it holds.
+    /// What a panel of fresh agents made of a security change with no failing command, each
+    /// given only the finding and the code. Votes cannot show a non-security change is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<Verification>,
     /// On a `fine` finding that reports again one the last review held the PR for: how it was
@@ -400,16 +395,16 @@ impl Finding {
     }
 
     /// Whether it shows the change is needed: MergeLoop ran its evidence on the PR's head and it
-    /// failed, or enough of a panel of fresh agents agree that it holds. Only a finding that
-    /// `wants_votes` keeps a panel's votes: where they come in, the rest are dropped.
+    /// failed, or, for security only, enough of a panel of fresh agents agree that it holds.
     pub fn shows_the_change(&self) -> bool {
-        self.ran_failing() || self.verified.as_ref().is_some_and(|v| v.upheld())
+        self.ran_failing()
+            || (self.kind == Kind::Security && self.verified.as_ref().is_some_and(|v| v.upheld()))
     }
 
     /// Whether its route waits on a panel's votes: a change for the author to make, with no
-    /// evidence MergeLoop saw fail, of a kind `depth` votes on.
-    pub fn wants_votes(&self, depth: Depth) -> bool {
-        depth.votes_on(self.kind)
+    /// evidence MergeLoop saw fail, for security only at every depth.
+    pub fn wants_votes(&self) -> bool {
+        self.kind == Kind::Security
             && self.lean == Lean::Change
             && !self.needs_human
             && !self.ran_failing()
@@ -429,8 +424,8 @@ pub struct Panel {
 }
 
 impl Panel {
-    /// The panel that checks a change the code alone shows: three, two of whom must agree it
-    /// holds.
+    /// The panel that checks a security change the code alone shows: three, two of whom must
+    /// agree it holds.
     pub const FINDING: Panel = Panel {
         seats: 3,
         needed: 2,
@@ -1157,7 +1152,7 @@ mod tests {
         let mut hole = finding(Kind::Security, 100, Lean::Change);
         hole.evidence = None;
         // One agent's word is a note.
-        assert!(hole.wants_votes(Depth::Standard));
+        assert!(hole.wants_votes());
         assert_eq!(s.route(&hole), Route::Cleared);
         let panel = Panel::FINDING;
         for (cast, route) in [
@@ -1175,19 +1170,19 @@ mod tests {
         assert!(!stuffed.upheld());
         // Evidence MergeLoop saw fail shows it without a vote, as for any kind.
         let shown = finding(Kind::Security, 100, Lean::Change);
-        assert!(!shown.wants_votes(Depth::Deep));
+        assert!(!shown.wants_votes());
         assert_eq!(s.route(&shown), Route::Author);
-        // At standard depth only a security change waits on votes: another kind needs evidence.
+        // Only a security change waits on votes: another kind needs evidence.
         let mut other = finding(Kind::Other, 100, Lean::Change);
         other.evidence = None;
-        assert!(!other.wants_votes(Depth::Standard) && !other.wants_votes(Depth::Quick));
+        assert!(!other.wants_votes());
         assert_eq!(s.route(&other), Route::Cleared);
         // Nothing to vote on where the votes would not change the route.
         let mut call = hole.clone();
         call.needs_human = true;
         let mut fine = hole.clone();
         fine.lean = Lean::Fine;
-        assert!(!call.wants_votes(Depth::Deep) && !fine.wants_votes(Depth::Deep));
+        assert!(!call.wants_votes() && !fine.wants_votes());
     }
 
     #[test]
@@ -1454,24 +1449,41 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_review_has_a_panel_vote_on_any_change_nothing_it_ran_shows() {
+    fn non_security_changes_need_replayed_evidence_at_every_depth_even_with_unanimous_votes() {
         use Verdict::*;
-        let s = ReviewSettings {
-            depth: Depth::Deep,
-            ..ReviewSettings::default()
-        };
-        let mut other = finding(Kind::Other, 90, Lean::Change);
-        other.evidence = None;
-        assert!(other.wants_votes(Depth::Deep));
-        assert_eq!(s.route(&other), Route::Cleared);
-        other.verified = Some(Panel::FINDING.verdict(votes(&[Holds, Holds, DoesNotHold])));
-        assert_eq!(s.route(&other), Route::Author);
-        other.verified = Some(Panel::FINDING.verdict(votes(&[Holds, DoesNotHold, Abstained])));
-        assert_eq!(s.route(&other), Route::Cleared);
-        // Its bar still holds: upheld, but under it, is a note.
-        other.confidence = 70;
-        other.verified = Some(Panel::FINDING.verdict(votes(&[Holds, Holds, Holds])));
-        assert_eq!(s.route(&other), Route::Cleared);
+        for depth in [Depth::Deep, Depth::Standard, Depth::Quick] {
+            let mut s = ReviewSettings {
+                depth,
+                ..ReviewSettings::default()
+            };
+            // Exercise migrations when configured for author action; the default still asks a human.
+            s.bars.insert(Kind::Migrations, Bar::From(80));
+            for kind in [
+                Kind::Other,
+                Kind::Dependencies,
+                Kind::PublicApi,
+                Kind::Migrations,
+            ] {
+                let mut f = finding(kind, 100, Lean::Change);
+                f.evidence = None;
+                for cast in [[Holds, Holds, DoesNotHold], [Holds, Holds, Holds]] {
+                    // Old stored votes cannot turn an unproven finding into an author blocker.
+                    f.verified = Some(Panel::FINDING.verdict(votes(&cast)));
+                    assert_eq!(s.route(&f), Route::Cleared, "{depth:?} {kind:?} {cast:?}");
+                }
+                assert!(!f.wants_votes(), "{depth:?} {kind:?}");
+                f.evidence = Some(Evidence {
+                    command: "cargo test".into(),
+                    output: "test failed, according to the reviewer".into(),
+                    ..Evidence::default()
+                });
+                assert_eq!(s.route(&f), Route::Cleared, "{depth:?} {kind:?}");
+                f.evidence.as_mut().unwrap().failed = true;
+                assert_eq!(s.route(&f), Route::Author, "{depth:?} {kind:?}");
+                f.confidence = 0;
+                assert_eq!(s.route(&f), Route::Cleared, "{depth:?} {kind:?}");
+            }
+        }
     }
 
     #[test]

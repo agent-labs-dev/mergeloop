@@ -22,7 +22,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use mergepatrol_core::{Answer, Answered, CheckFailure, Depth, Finding, Kind, Panel, SentBack};
+use mergepatrol_core::{Answer, Answered, CheckFailure, Depth, Finding, Panel, SentBack};
 
 /// The checks a job's agent runs: the repo's verify commands, or, for a repo that sets none, the
 /// commands its own CI runs for a pull request. `None` when the repo has neither.
@@ -629,9 +629,9 @@ Reply with the JSON alone, in this shape, and nothing else:
         base = req.base,
         verify = checks_section(req.verify),
         report = report_section(req.depth),
-        evidence = evidence_section(req.depth),
-        panel = panel_section(req.depth),
-        rerun = rerun_section(req.depth),
+        evidence = evidence_section(),
+        panel = panel_section(),
+        rerun = rerun_section(),
     )
 }
 
@@ -654,56 +654,33 @@ short."
     }
 }
 
-/// What a `change` must carry: a command that fails, or, of a kind the panel votes on, nothing.
-fn evidence_section(depth: Depth) -> String {
-    let ask = "a command, run from the repo's root, that fails on this PR because of what the \
+/// What a non-security `change` must carry, at every depth.
+fn evidence_section() -> &'static str {
+    "Every finding you lean `change` on, except a `security` one, must carry `evidence`: \
+a command, run from the repo's root, that fails on this PR because of what the \
 finding says, and the files you wrote for it, most often one focused test. Write the test, run the \
-command, and see it fail for that reason before you report it.";
-    match depth.votes_on(Kind::Other) {
-        false => format!(
-            "Every finding you lean `change` on, except a `security` one, must carry `evidence`: \
-{ask}"
-        ),
-        true => format!("Give every finding you lean `change` on `evidence` if you can: {ask}"),
-    }
+command, and see it fail for that reason before you report it."
 }
 
 /// What MergeLoop does with a change's command after the review: one it does not see fail shows
-/// nothing, so the change is a note, or, of a kind the panel votes on, the panel's.
-fn rerun_section(depth: Depth) -> &'static str {
-    match depth.votes_on(Kind::Other) {
-        false => {
-            "After the review MergeLoop runs each command on the PR alone, with only the files \
+/// nothing, so a non-security change is a note.
+fn rerun_section() -> &'static str {
+    "After the review MergeLoop runs each command on the PR alone, with only the files \
 it names, and a command it does not see fail does not go back to the author: MergeLoop shows the \
 finding as a note that holds nothing. So name every file the command needs, and keep each \
 finding's files apart from the others'."
-        }
-        true => {
-            "After the review MergeLoop runs each command on the PR alone, with only the files \
-it names, and a change with a command it does not see fail goes to the panel below instead. So \
-name every file the command needs, and keep each finding's files apart from the others'."
-        }
-    }
 }
 
 /// Which changes a panel checks in place of evidence, and what it takes.
-fn panel_section(depth: Depth) -> String {
+fn panel_section() -> String {
     let Panel { seats, needed } = Panel::FINDING;
-    let checks = format!(
-        "{seats} fresh agents, given only the finding and the code, check it instead, and it goes \
-back to the author only when {needed} of them agree it holds."
-    );
-    match depth.votes_on(Kind::Other) {
-        false => format!(
-            "If you cannot make a command fail, lean `fine` and say in `unsure` what you could not \
-show. A `security` finding needs none: {checks} So say in `finding` where the hole is and how it \
+    format!(
+        "If you cannot make a command fail, lean `fine` and say in `unsure` what you could not \
+show. A `security` finding needs none: {seats} fresh agents, given only the finding and the code, \
+check it instead, and it goes back to the author only when {needed} of them agree it holds. \
+So say in `finding` where the hole is and how it \
 is reached."
-        ),
-        true => format!(
-            "If you cannot make a command fail, report it as `change` all the same, with no \
-`evidence`: {checks} So say in `finding` where the bug is and how it is reached."
-        ),
-    }
+    )
 }
 
 pub(crate) fn question_prompt(req: &QuestionRequest<'_>) -> String {
@@ -1019,25 +996,6 @@ mod prompt_tests {
         assert!(quick.contains("Report only what could be wrong"));
         // It holds a change to the same bar.
         assert!(quick.contains("must carry `evidence`"));
-    }
-
-    #[test]
-    fn a_deep_review_has_a_panel_check_any_change_it_cannot_make_fail() {
-        let standard = review_prompt(&at_depth(Depth::Standard));
-        assert!(standard.contains("If you cannot make a command fail, lean `fine`"));
-        let deep = review_prompt(&at_depth(Depth::Deep));
-        assert!(!deep.contains("lean `fine` and say in `unsure` what you could not show"));
-        assert!(deep.contains(
-            "If you cannot make a command fail, report it as `change` all the same, with no \
-`evidence`: 3 fresh agents"
-        ));
-        assert!(deep.contains("only when 2 of them agree it holds"));
-        assert!(!deep.contains("except a `security` one"));
-        // Nor does its rerun say a command it did not see fail makes the change a note.
-        let note = "a command it does not see fail does not go back to the author";
-        assert!(standard.contains(note) && review_prompt(&at_depth(Depth::Quick)).contains(note));
-        assert!(!deep.contains(note));
-        assert!(deep.contains("a command it does not see fail goes to the panel below instead"));
     }
 }
 

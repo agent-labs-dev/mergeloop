@@ -268,7 +268,7 @@ async fn in_threads(
         answers.insert(a.finding, a.answer);
         last = a.by;
     }
-    if review.asks().any(|f| !answers.contains_key(&f.finding.id)) {
+    if !every_ask_answered(review, &answers) {
         return Ok(());
     }
     settle(
@@ -277,6 +277,13 @@ async fn in_threads(
         &answered(review, answers, &last, String::new()),
     )
     .await
+}
+
+/// Whether the threads answer the review: each of its asks has an answer. A review that asks
+/// nothing in a thread, as one the agent could not make, is answered only by a review of the PR.
+fn every_ask_answered(review: &ReviewRecord, answers: &BTreeMap<String, Answer>) -> bool {
+    let mut asks = review.asks().peekable();
+    asks.peek().is_some() && asks.all(|f| answers.contains_key(&f.finding.id))
 }
 
 /// What the threads say: each ask's answer, if it has one, and the questions put to the App.
@@ -714,5 +721,26 @@ mod tests {
             ],
         );
         assert_eq!(status(&owed, &fine), ReviewStatus::Changes);
+    }
+
+    #[test]
+    fn threads_answer_only_a_review_that_asks_in_them() {
+        let fine = BTreeMap::from([("f1".to_owned(), Answer::Fine)]);
+        let one = review(ReviewStatus::Asks, vec![finding("f1", "a", true, false)]);
+        assert!(every_ask_answered(&one, &fine));
+        assert!(!every_ask_answered(&one, &BTreeMap::new()));
+        let two = review(
+            ReviewStatus::Asks,
+            vec![
+                finding("f1", "a", true, false),
+                finding("f2", "b", true, false),
+            ],
+        );
+        assert!(!every_ask_answered(&two, &fine));
+        // The agent could not review: its asks are none, and a thread answers nothing.
+        let failed = review(ReviewStatus::Asks, Vec::new());
+        assert!(!every_ask_answered(&failed, &BTreeMap::new()));
+        let notes = review(ReviewStatus::Asks, vec![finding("f1", "a", false, false)]);
+        assert!(!every_ask_answered(&notes, &fine));
     }
 }

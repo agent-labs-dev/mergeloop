@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { kindNames } from "./AgentReview";
 import { capture } from "./analytics";
 import { fetchReviewSettings, setReviewSettings } from "./api";
 import type { BandView } from "./api/BandView";
@@ -8,6 +7,7 @@ import type { BarView } from "./api/BarView";
 import type { KindView } from "./api/KindView";
 import type { RepoReviewView } from "./api/RepoReviewView";
 import type { ReviewSettingsView } from "./api/ReviewSettingsView";
+import { kindNames } from "./review";
 import { ErrorText, primary, Section, Toggle } from "./ui";
 
 /*

@@ -1,32 +1,18 @@
-import type { AgentReviewView } from "./api/AgentReviewView";
-import type { AnswerAgentReview } from "./api/AnswerAgentReview";
-import type { AskAgent } from "./api/AskAgent";
-import type { AskReviewers } from "./api/AskReviewers";
 import type { BillingView } from "./api/BillingView";
 import type { ChangelogEntryView } from "./api/ChangelogEntryView";
-import type { EventView } from "./api/EventView";
 import type { ExitsPage } from "./api/ExitsPage";
-import type { FixView } from "./api/FixView";
 import type { HistoryStatsView } from "./api/HistoryStatsView";
 import type { LaneView } from "./api/LaneView";
 import type { ManifestForm } from "./api/ManifestForm";
 import type { ManifestRequest } from "./api/ManifestRequest";
-import type { NudgePull } from "./api/NudgePull";
-import type { OpenPullView } from "./api/OpenPullView";
 import type { OutcomeView } from "./api/OutcomeView";
-import type { PullDetailView } from "./api/PullDetailView";
-import type { PullDiffView } from "./api/PullDiffView";
 import type { PullStateView } from "./api/PullStateView";
-import type { QuestionView } from "./api/QuestionView";
-import type { QueuedView } from "./api/QueuedView";
-import type { QueuePull } from "./api/QueuePull";
 import type { RedirectView } from "./api/RedirectView";
 import type { RepoConfigView } from "./api/RepoConfigView";
 import type { RepoDefaultsView } from "./api/RepoDefaultsView";
 import type { RepoSettingsView } from "./api/RepoSettingsView";
 import type { RepoUpdateView } from "./api/RepoUpdateView";
 import type { RepoView } from "./api/RepoView";
-import type { ReviewPull } from "./api/ReviewPull";
 import type { ReviewSettingsView } from "./api/ReviewSettingsView";
 import type { ReviewStatsView } from "./api/ReviewStatsView";
 import type { SessionView } from "./api/SessionView";
@@ -80,13 +66,6 @@ export const logout = () => call("POST", "/auth/logout");
 const w = (id: number, path: string) => `/api/w/${id}${path}`;
 
 export const fetchLanes = (id: number) => get<LaneView[]>(w(id, "/lanes"));
-
-export const fetchEvents = (id: number, repo: string, pr?: number) =>
-  get<EventView[]>(w(id, `/events?repo=${encodeURIComponent(repo)}${pr ? `&pr=${pr}` : ""}`));
-
-/** The changes of the fix agent's commit `sha`. */
-export const fetchFix = (id: number, repo: string, sha: string) =>
-  get<FixView>(w(id, `/fix?repo=${encodeURIComponent(repo)}&sha=${sha}`));
 
 /** The query string of the defined values. */
 const query = (params: Record<string, string | number | undefined>) =>
@@ -180,83 +159,6 @@ export const pollChatGptLogin = (id: number) =>
 /** Signs out, or cancels a sign-in. */
 export const deleteChatGptLogin = (id: number) =>
   send<SettingsView>("DELETE", w(id, "/settings/chatgpt"));
-
-/** The repo's open PRs into its default branch that are not in its queue. */
-export const fetchOpenPulls = (id: number, repo: string) =>
-  get<OpenPullView[]>(w(id, `/repos/${repo}/open`));
-
-/** An open PR's description, labels, checks and timeline. */
-export const fetchPullDetail = (id: number, repo: string, pr: number) =>
-  get<PullDetailView>(w(id, `/repos/${repo}/pulls/${pr}`));
-
-/** An open PR's diff, or one of its commits' with `commit`. */
-/** A PR's diff: one commit's, or the whole PR's. With its head and base, the server keeps it. */
-export const fetchPullDiff = (
-  id: number,
-  repo: string,
-  pr: number,
-  of?: { commit: string } | { head: string; base: string },
-) =>
-  get<PullDiffView>(
-    w(id, `/repos/${repo}/pulls/${pr}/diff${of ? `?${new URLSearchParams(of)}` : ""}`),
-  );
-
-/** Queues the PR, or changes the priority of a queued one, as the user. */
-export const queuePull = (id: number, repo: string, pr: number, priority: boolean) =>
-  send<QueuedView>("PUT", w(id, `/repos/${repo}/pulls/${pr}/queue`), {
-    priority,
-  } satisfies QueuePull);
-
-/** What a PR just queued will run into, whatever the PR: a hold, or no model key for the agent. */
-export const queuedWarning = (q: QueuedView): string | undefined =>
-  q.mergeloop.hold || q.mergeloop.missing_key ? q.message : undefined;
-
-/** Takes the PR, and its stack, out of the queue, as the user. */
-export const dequeuePull = (id: number, repo: string, pr: number) =>
-  call("DELETE", w(id, `/repos/${repo}/pulls/${pr}/queue`));
-
-export const closeUrl = (id: number, repo: string, pr: number) =>
-  w(id, `/repos/${repo}/pulls/${pr}/close`);
-
-/** Closes the PR on GitHub, as the user. */
-export const closePull = (id: number, repo: string, pr: number) =>
-  call("POST", closeUrl(id, repo, pr));
-
-/** Publishes a draft PR on GitHub, as the user: marks it ready for review. */
-export const readyPull = (id: number, repo: string, pr: number) =>
-  call("POST", w(id, `/repos/${repo}/pulls/${pr}/ready`));
-
-export const reviewUrl = (id: number, repo: string, pr: number) =>
-  w(id, `/repos/${repo}/pulls/${pr}/review`);
-
-/** Reviews the PR as the user, and queues it with `queue`. */
-export const reviewPull = (id: number, repo: string, pr: number, body: ReviewPull) =>
-  call("POST", reviewUrl(id, repo, pr), body);
-
-/** Mentions the reviewers in a comment, as the user. */
-export const nudgePull = (id: number, repo: string, pr: number, reviewers: string[]) =>
-  call("POST", w(id, `/repos/${repo}/pulls/${pr}/nudge`), { reviewers } satisfies NudgePull);
-
-const agentReview = (id: number, repo: string, pr: number, path = "") =>
-  w(id, `/repos/${repo}/pulls/${pr}/agent-review${path}`);
-
-/** The agent's newest review of the PR, or `null` before its first. */
-export const fetchAgentReview = (id: number, repo: string, pr: number) =>
-  get<AgentReviewView | null>(agentReview(id, repo, pr));
-
-/** Answers what the agent's review asks, as the user's review on GitHub. */
-export const answerAgentReview = (id: number, repo: string, pr: number, body: AnswerAgentReview) =>
-  send<AgentReviewView>("POST", agentReview(id, repo, pr, "/answers"), body);
-
-/** Asks the agent about one of its findings. Its answer comes on the review later. */
-export const askAgent = (id: number, repo: string, pr: number, body: AskAgent) =>
-  send<QuestionView>("POST", agentReview(id, repo, pr, "/questions"), body);
-
-/** Asks others to answer the review, as the user. */
-export const askReviewers = (id: number, repo: string, pr: number, reviewers: string[]) =>
-  send<AgentReviewView>("POST", agentReview(id, repo, pr, "/reviewers"), {
-    reviewers,
-  } satisfies AskReviewers);
 
 export const fetchReviewSettings = (id: number) =>
   get<ReviewSettingsView>(w(id, "/settings/review"));

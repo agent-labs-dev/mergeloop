@@ -8,7 +8,6 @@ import {
 import { App } from "./App";
 import type { OutcomeView } from "./api/OutcomeView";
 import { History, LISTS, type List, OUTCOMES, WINDOWS, type Window } from "./History";
-import { type OpenFilter, REVIEWS, STATUSES } from "./OpenFilters";
 import { Permalink } from "./Permalink";
 import { Queue } from "./Queue";
 import { Settings } from "./Settings";
@@ -57,19 +56,8 @@ const you = createRoute({
 const queue = createRoute({
   getParentRoute: () => workspace,
   path: "queue",
-  /** The lane in view, as `owner/repo:trunk`, and the PR in it, both the first by default,
-   * whether the agent's review of the PR is being answered, and the filters on its open PRs. */
-  validateSearch: (search): { lane?: string; pr?: number; answer?: boolean } & OpenFilter => ({
-    lane: optional(search.lane, "string"),
-    pr: optional(search.pr, "number"),
-    // Answering the agent's review of the PR.
-    answer: search.answer === true || undefined,
-    author: optional(search.author, "string"),
-    status: oneOf(STATUSES, search.status),
-    review: oneOf(REVIEWS, search.review),
-    drafts: search.drafts === true || undefined,
-    q: optional(search.q, "string"),
-  }),
+  /** The lane in view, as `owner/repo:trunk`: the first by default. */
+  validateSearch: (search): { lane?: string } => ({ lane: optional(search.lane, "string") }),
   component: () => <Queue workspace={useWorkspace().workspace} />,
 });
 
@@ -113,7 +101,7 @@ const repos = createRoute({
 const pull = createRoute({
   getParentRoute: () => workspace,
   path: "$repo/pull/$number",
-  component: () => <Permalink workspace={useWorkspace().workspace} />,
+  component: Permalink,
 });
 
 const settings = createRoute({

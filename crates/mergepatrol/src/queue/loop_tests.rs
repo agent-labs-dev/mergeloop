@@ -15,9 +15,9 @@ use mergepatrol_executor::proxy::Upstreams;
 use mergepatrol_github::{BranchMerge, BranchRules, Checks, HeadRepository, RepoOwner, StackRef};
 use mergepatrol_store::{
     AgentTask, BillingStore, Change, DeveloperStats, EventRecord, ExitQuery, ExitRecord, ExitStats,
-    FairUse, InboxStale, InboxStore, InboxWrite, LoginCode, PrWrite, ReadCache, RepoReads,
-    RepoState, ReviewAnswers, ReviewDone, ReviewRecord, ReviewStore, SecretRecord, Session, Slice,
-    StepStats, Subscription, Unsynced, UserInbox, ValueRead, Workspace,
+    FairUse, LoginCode, PrWrite, ReadCache, RepoReads, RepoState, ReviewAnswers, ReviewDone,
+    ReviewRecord, ReviewStore, SecretRecord, Session, Slice, StepStats, Subscription, Unsynced,
+    ValueRead, Workspace,
 };
 
 use super::*;
@@ -1287,72 +1287,6 @@ impl ReadCache for Mem {
         _: i64,
         _: &serde_json::Value,
     ) -> Result<()> {
-        unreachable!()
-    }
-}
-
-/// The queue keeps no inbox.
-#[async_trait]
-impl InboxStore for Mem {
-    async fn inbox_changed(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        Ok(())
-    }
-    async fn inbox_reviewed(&self, _: u64, _: &RepoName, _: PrNumber, _: &str) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_closed(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_ready(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_stale(&self, _: Duration, _: u32) -> Result<Vec<InboxStale>> {
-        unreachable!()
-    }
-    async fn inbox_changes(&self, _: u64, _: &RepoName) -> Result<HashMap<PrNumber, i64>> {
-        unreachable!()
-    }
-    async fn save_inbox_reads(&self, _: u64, _: &RepoName, _: &[InboxWrite]) -> Result<()> {
-        unreachable!()
-    }
-    async fn save_inbox_index(&self, _: u64, _: &RepoName, _: &[InboxWrite]) -> Result<()> {
-        unreachable!()
-    }
-    async fn set_inbox_repos(&self, _: u64, _: &[RepoName]) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_open(&self, _: u64, _: &RepoName) -> Result<Option<Vec<serde_json::Value>>> {
-        unreachable!()
-    }
-    async fn inbox_repos_due(&self, _: Duration) -> Result<Vec<(u64, RepoName)>> {
-        unreachable!()
-    }
-    async fn set_inbox_teams(&self, _: u64, _: &[(String, Vec<String>)]) -> Result<()> {
-        unreachable!()
-    }
-    async fn set_inbox_member(&self, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
-        unreachable!()
-    }
-    async fn delete_inbox_team(&self, _: u64, _: &str) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox(&self, _: &str, _: &[u64], _: Duration) -> Result<UserInbox> {
-        unreachable!()
-    }
-    async fn inbox_seen(&self, _: &str, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_snooze(
-        &self,
-        _: &str,
-        _: u64,
-        _: &RepoName,
-        _: PrNumber,
-        _: Option<Duration>,
-    ) -> Result<()> {
-        unreachable!()
-    }
-    async fn prune_inbox(&self, _: Duration) -> Result<u64> {
         unreachable!()
     }
 }

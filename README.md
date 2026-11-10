@@ -20,8 +20,7 @@ The hosted MergeLoop at https://mergeloop.ai runs the public GitHub App [Merge L
 2. Install the App on your organization or account, and choose its repos. GitHub sends you back to the dashboard.
 3. In **Settings**, pick a repo and **Set up**. MergeLoop opens a PR that adds its config file, [`.mergeloop/mergeloop.yml`](#repo-settings). Merge it, and the repo queues.
 4. In **Settings**, add an Anthropic or OpenAI API key. Create one for MergeLoop alone, with a spend limit.
-5. Add the `mergeloop` label to a PR, or queue it from the dashboard's **Queue** page, which lists the open PRs below the queue, and shows each queued PR's stage and the path it took. The dashboard puts the label on as you, so it takes triage access to the repo.
-6. In **You**, see your open PRs in every repo, by whose move it is, and the PRs that ask for your review or your team's, those the queue holds first. Approve, request changes or comment there, as you. A review waits 5 seconds before it goes to GitHub, so you can undo it.
+5. Add the `mergeloop` label to a PR on GitHub. The dashboard's **Queue** page shows each queue in the order it merges, each PR's stage, and what holds it; a PR opens on GitHub.
 
 Public repos are free. Private repos cost $15 a seat a month, after a free trial: see [Pricing](#pricing). To run your own, see [Run it](#run-it).
 
@@ -122,7 +121,7 @@ A maintainer queues a PR from a fork with the label, as any other. Its author is
 
 A stack with a PR from a fork is not supported yet.
 
-The queue page's list of open PRs reads MergeLoop's own database, never GitHub, when you open it. Webhooks tell MergeLoop which PRs changed, and it reads those again from GitHub as the App. It also reads every open PR of each repo once a day, in case a webhook got lost. Without webhooks, as on a self-hosted http URL, it reads them every 10 minutes. Team review requests need the App's `members: read` permission, which each organization's owner accepts. An App created before this permission existed must be given it on GitHub, along with the `pull_request_review_comment`, `issue_comment`, `membership` and `team` events. Until then, only review requests made to you directly show.
+The agent's review is answered in its threads on GitHub, which MergeLoop hears of from the `pull_request_review_comment`, `pull_request_review_thread` and `issue_comment` events. An App created before those events were added must subscribe to them on GitHub; until then, only an approval or a request for changes answers the review.
 
 ## Pricing
 
@@ -276,7 +275,7 @@ When the file does not parse, the queue pauses, and **Settings** shows why, unti
 
 ## From an agent, or the API
 
-MergeLoop serves an MCP server at `/mcp`, so a coding agent can do anything the dashboard does: queue a PR, take it out, read where it is, review it, read the queue's history, change a repo's settings. Every call acts as a GitHub user or bot: MergeLoop puts the labels on, comments, and reviews with their token, so GitHub checks they may.
+MergeLoop serves an MCP server at `/mcp`, so a coding agent can do anything the dashboard does: queue a PR, take it out, read where it is and what it needs next, read the agent's review and the queue's history, change a repo's settings. Reviews, approvals and comments happen on GitHub, with `gh`. Every call acts as a GitHub user or bot: MergeLoop puts the labels on, comments, and reviews with their token, so GitHub checks they may.
 
 The hosted endpoint is `https://mergeloop.ai/mcp`. It uses sessionless streamable HTTP: each POST carries one JSON-RPC message, with JSON responses to requests. GET returns `405 Method Not Allowed`. Use the endpoint directly: following a redirect from the old host can break POST requests.
 
@@ -322,27 +321,16 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `get_session` | Who a sign-in is for, and its workspaces: `signed_out` for a GitHub token | |
 | `list_queue` | The queues, in the order they take PRs: a repo's, or the workspace's | Without `repo` |
 | `list_events` | A repo's queue events, newest first | |
-| `get_fix` | The diff of a commit the fix agent pushed | |
 | `list_history` | The PRs that left the queue: merged, ejected, or removed | Yes |
 | `get_history_stats` | The queue's numbers over a window | Yes |
 | `get_review_stats` | How the agent's review did over a window: what became of each change it asked for, reviews to pass, time asked of people | Yes |
 | `list_repos` | The workspace's repos, and whether each queues | Yes |
 | `set_repo` | Turns a repo's queue on or off, or back to following its config file | Or a token with admin on the repo |
-| `list_open_pulls` | A repo's open PRs that are not queued | |
-| `get_pull` | A PR's description, labels, checks, and timeline | |
-| `get_pull_diff` | A PR's changes, or one commit's | |
 | `pull_status` | Where a PR is, as `/api/v1` below says, and its latest events | |
 | `next_need` | What a PR needs next from the agent that queued it, with what to do: waits for a newer one with `after` and `wait` | |
 | `queue_pull` | Queues a PR, or its stack. `priority` puts it at the front. Says when it goes on hold whatever the PR, or the agent has no model key | |
 | `dequeue_pull` | Takes a PR, and its stack, out of the queue | |
-| `close_pull` | Closes a PR | |
-| `ready_pull` | Publishes a draft PR: marks it ready for review | |
-| `review_pull` | Approves a PR, asks for changes, or comments, then queues it if asked | |
 | `get_agent_review` | The agent's review of a queued PR: what it found, what it sent back to the author, and what it asks a human | |
-| `answer_agent_review` | Answers what the agent's review asks, as your review on GitHub | |
-| `ask_agent_about_review` | Asks the agent about one of its findings, or replies to one it sent back | |
-| `ask_agent_review_reviewers` | Asks others to answer the agent's review | |
-| `nudge_reviewers` | Mentions reviewers in a comment, asking them to review | |
 | `get_repo_config` | A repo's queue settings | |
 | `propose_repo_config` | Opens a PR that changes a repo's queue settings | Yes |
 | `get_repo_skill` | Whether a repo has the current `mergeloop` agent skill | |
@@ -418,7 +406,7 @@ The second form reads up to 100 PRs of one repo, as `{ "pulls": [...] }` in the 
 
 | Field | Says |
 | --- | --- |
-| `url` | The PR in the dashboard. It opens the PR's lane while queued, its history once merged or ejected, the repo's settings while MergeLoop is off there, and the repo's open PRs otherwise |
+| `url` | Where to open the PR: its lane in the dashboard while queued, the repo's settings while MergeLoop is off there, and the PR on GitHub otherwise |
 | `mergeloop.state` | `on`, `off` (no App on the repo, no config file, or turned off), or `paused` (the config file does not parse: `config_error` says why) |
 | `mergeloop.override` | `on` or `off` when turned so in the dashboard, whatever the config file says. `null` follows the file |
 | `mergeloop.hold` | Why any PR queued now goes on hold, before it is queued: `{ reason, layer, message }` as in `queue.hold`, with `reason` `no_subscription` (a private repo on the hosted MergeLoop, without a subscription) or `fair_use_limit`. `null` when nothing about the repo holds it |

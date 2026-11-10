@@ -17,7 +17,7 @@ The trigger label is `label` in `.mergeloop/mergeloop.yml` on the default branch
 
 ## Over MCP
 
-When the `mergeloop` MCP server is connected (an older connection may be named `mergepatrol`), use its tools instead of the labels: `queue_pull` (with `priority` for the front of the queue), `dequeue_pull`, `pull_status` and `list_queue`. They change the same labels, as the GitHub user or bot the server was connected as, so everything below still holds. `pull_status` reads where a PR is without parsing MergeLoop's comment. The server's other tools do what the MergeLoop dashboard does, such as reviewing a PR or reading why the queue ejected one.
+When the `mergeloop` MCP server is connected (an older connection may be named `mergepatrol`), use its tools instead of the labels: `queue_pull` (with `priority` for the front of the queue), `dequeue_pull`, `pull_status` and `list_queue`. They change the same labels, as the GitHub user or bot the server was connected as, so everything below still holds. `pull_status` reads where a PR is without parsing MergeLoop's comment. The server's other tools read the queue, the agent's review and the queue's history, and change a repo's MergeLoop settings. Reviews, approvals and comments happen on GitHub, with `gh`.
 
 ## With the `mergeloop` command
 
@@ -92,7 +92,7 @@ A PR with no unresolved thread and nothing asked of a human goes on to the queue
 
 ### The MergeLoop review's findings
 
-- Never resolve a "For a human" thread, call `answer_agent_review` on a PR you built, or approve your own PR with `review_pull`. Each would answer your own review.
+- Never resolve a "For a human" thread, or approve your own PR. Each would answer your own review.
 - After three reviews in a row that send findings back, the next one asks a human about what is still left. Don't try to beat it with a fourth fix: mark those `needs-human`.
 - To have the reviewer settle a finding now rather than on the next push, reply in its thread mentioning MergeLoop's App, as the review's summary names it (`@merge-loop` on mergeloop.ai), with why it doesn't apply. The agent reads the code again and answers in the thread, ending `VERDICT: withdrawn` (the finding was wrong), `VERDICT: intended` (the code does what its author meant), or `VERDICT: stands`. Either of the first two lifts the finding and resolves its thread.
 - A finding about what wasn't checked, such as "never run on a device" or "no tests cover this", is yours to close while you can: run it, or write the test, and say what you ran in its reply. Only when you can't, such as having no device, is it `needs-human`, and it says what a human would have to run.

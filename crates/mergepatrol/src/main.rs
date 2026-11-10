@@ -2,7 +2,6 @@ mod cached;
 mod config;
 mod credentials;
 mod github;
-mod inbox;
 mod job;
 mod publish;
 mod queue;

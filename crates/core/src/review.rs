@@ -717,13 +717,37 @@ impl ReviewStatus {
     }
 }
 
-/// Where a PR's review is on the dashboard, to answer it: the PR in its lane into `trunk`.
-pub fn review_url(public_url: &str, repo: &RepoName, trunk: &str, number: PrNumber) -> String {
-    format!(
-        "{}/{}/queue?lane={repo}:{trunk}&pr={number}&answer=true",
-        public_url.trim_end_matches('/'),
-        repo.owner,
-    )
+/// Starts each of MergeLoop's threads on a PR, with its finding's title, so the next review, and
+/// a human answering in the thread, find the finding. Each mark after the first is how MergeLoop
+/// wrote it as Mergepatrol, on threads still open.
+pub const FINDING_MARKS: [&str; 2] = ["<!-- mergeloop-finding: ", "<!-- mergepatrol-finding: "];
+/// End each of MergeLoop's replies in a thread, so a reply is not taken for a human's.
+pub const REPLY_MARKS: [&str; 2] = ["<!-- mergeloop-reply -->", "<!-- mergepatrol-reply -->"];
+
+/// The most characters a comment shows of a finding's title.
+pub const TITLE_CHARS: usize = 300;
+
+/// `text`, at most `max` characters of it: one cut short ends in `…`.
+pub fn clip(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if text.chars().count() <= max {
+        return text.into();
+    }
+    let mut cut: String = text.chars().take(max - 1).collect();
+    cut.push('…');
+    cut.into()
+}
+
+/// A finding's title as threads match it: as bounded as the comment that carries it.
+pub fn thread_title(title: &str) -> String {
+    clip(&title.trim().to_lowercase().replace("--", "-"), TITLE_CHARS).into_owned()
+}
+
+/// The title of the finding a thread of MergeLoop's is about, from the comment that starts it.
+pub fn finding_title(first_comment: &str) -> Option<String> {
+    let rest = FINDING_MARKS
+        .iter()
+        .find_map(|m| Some(&first_comment[first_comment.find(m)? + m.len()..]))?;
+    Some(rest[..rest.find(" -->")?].to_owned())
 }
 
 /// A human's answer about one finding.

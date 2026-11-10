@@ -152,7 +152,7 @@ impl fmt::Display for Hold {
             Hold::PrepFixing => f.write_str("the agent is fixing its checks"),
             Hold::Reviewing => f.write_str("the agent is reviewing it"),
             Hold::ReviewAsks => {
-                f.write_str("the agent's review asks a human about what it was not sure of")
+                f.write_str("the agent's review asks a human, in its threads on GitHub, about what it was not sure of")
             }
             Hold::ReviewChanges => f.write_str(
                 "its review sent changes back to the author: it goes on once they resolve each comment, or push and it is reviewed again",

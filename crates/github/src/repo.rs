@@ -361,7 +361,7 @@ fn rejection(body: &Value) -> String {
 /// A PR's review threads, each with its first comment and its last.
 const THREADS: &str = "query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    reviewThreads(first: 100) { nodes { id isResolved
+    reviewThreads(first: 100) { nodes { id isResolved resolvedBy { login }
       first: comments(first: 1) { nodes { databaseId body author { login } } }
       last: comments(last: 1) { nodes { databaseId body author { login } } } } } } }
 }";
@@ -379,6 +379,8 @@ pub struct ReviewThread {
     /// Its GraphQL id, to resolve it by.
     pub id: String,
     pub resolved: bool,
+    /// Who resolved it, while it is resolved.
+    pub resolved_by: Option<String>,
     /// The comment that starts it, to reply to.
     pub comment_id: u64,
     pub body: String,
@@ -1560,6 +1562,7 @@ impl Installation {
         struct Thread {
             id: String,
             is_resolved: bool,
+            resolved_by: Option<Author>,
             first: Nodes<Comment>,
             last: Nodes<Comment>,
         }
@@ -1601,6 +1604,7 @@ impl Installation {
                 Some(ReviewThread {
                     id: t.id,
                     resolved: t.is_resolved,
+                    resolved_by: t.resolved_by.map(|a| a.login),
                     comment_id: first.database_id,
                     body: first.body,
                     reply,

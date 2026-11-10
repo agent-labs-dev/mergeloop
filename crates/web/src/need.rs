@@ -315,10 +315,10 @@ const THREADS: &str = "Review threads{on} hold the PR: {detail}. Work each unres
 1. List the unresolved review threads of #{pr}: `gh api graphql -f query='{ repository(owner: \"OWNER\", name: \"NAME\") { pullRequest(number: {pr}) { reviewThreads(first: 100) { nodes { id isResolved path line comments(first: 20) { nodes { author { login } body } } } } } } }'`, with `{repo}` as OWNER/NAME. MergeLoop's own findings, with their ids and evidence: `mergeloop call get_agent_review {args}`.
 2. Read each thread and the code it points at. Fix it, at every place its **Also at** names, or decide it doesn't apply, for a reason the code shows: a file and line, a test, a doc. Only a call on scope, product or design, access you lack, or a change outside the repo is for a human.
 3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch and rebase onto the remote branch, then push once.
-4. Reply in each thread you worked: the fix's short SHA and one line on what changed, or the reason it doesn't apply. Then resolve it: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"ID\"}) { thread { isResolved } } }'`. Resolve only after the push. A thread for a human: reply with the decision needed and who should make it, and leave it unresolved.
-5. To have MergeLoop's reviewer settle one of its findings now, rather than on the next push, reply to it with `mergeloop call ask_agent_about_review` and `{\"repo\", \"number\", \"head_sha\", \"finding\", \"question\"}`.
+4. Reply in each thread you worked: the fix's short SHA and one line on what changed, or the reason it doesn't apply. Then resolve it: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"ID\"}) { thread { isResolved } } }'`. Resolve only after the push. Another reviewer's thread that needs a human: reply with the decision needed and who should make it, and leave it unresolved.
+5. To have MergeLoop's reviewer settle one of its findings now, rather than on the next push, reply in its thread mentioning MergeLoop's App, as the review's summary names it, with why it doesn't apply. The agent reads the code again, answers in the thread, and withdraws the finding if your reason holds.
 
-Never answer MergeLoop's review of a PR you built with `answer_agent_review`, or approve it with `review_pull`. Then run `{then}`.";
+Leave each thread MergeLoop's review marked **For a human** to them: resolving it answers it as fine as it is. Never answer MergeLoop's review of a PR you built with `answer_agent_review`, or approve it with `review_pull`. Then run `{then}`.";
 
 #[cfg(test)]
 mod tests {

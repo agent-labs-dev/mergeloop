@@ -601,6 +601,17 @@ impl World {
         ctx.config.data_dir = tmp.path().join("data");
         ctx.executor = agent.clone();
         ctx.jobs = Semaphore::new(2);
+        // The App the review's comments mention, with no webhooks: the URL is http.
+        ctx.hosted_app = Some(AppCredentials {
+            id: 1,
+            slug: "mp".into(),
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            webhook_secret: None,
+            pem: String::new(),
+            owner: "o".into(),
+            html_url: "https://github.com/apps/mp".into(),
+        });
         // The cache's `origin` is GitHub's URL, whatever the test: it is sent here.
         let cache = cache_path(&ctx.config.data_dir, "o", "r");
         std::fs::create_dir_all(&cache).unwrap();

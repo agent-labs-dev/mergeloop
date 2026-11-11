@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use mergepatrol_analytics::Analytics;
 use mergepatrol_billing::Billing;
 use mergepatrol_core::RepoSettings;
-use mergepatrol_github::{AppCredentials, PullDiffs, SignedImages};
+use mergepatrol_github::AppCredentials;
 use mergepatrol_resolver::ChatGptAuth;
 use mergepatrol_store::{GITHUB_APP, Scope, Store, Vault};
 use secrecy::ExposeSecret;
@@ -78,10 +78,6 @@ struct AppState {
     seen: Arc<auth::Seen>,
     /// The `/api/v1` calls each caller has left.
     budgets: Arc<v1::Budgets>,
-    /// The signed URLs of private repos' images, by viewer.
-    signed_images: Arc<SignedImages>,
-    /// The PR diffs each user read lately.
-    pull_diffs: Arc<PullDiffs>,
 }
 
 impl AppState {
@@ -118,8 +114,6 @@ fn state(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> AppStat
         chatgpt: config.chatgpt,
         seen: Arc::default(),
         budgets: Arc::default(),
-        signed_images: Arc::default(),
-        pull_diffs: Arc::default(),
     }
 }
 
@@ -482,15 +476,6 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
-        // Nor can it close a PR.
-        let close = Request::post("/api/w/1/repos/acme/app/pulls/7/close")
-            .header("cookie", "mp_session=old")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            send(&router, close).await.status(),
-            StatusCode::UNAUTHORIZED
-        );
         store.delete_session(&auth::hash("old")).await.unwrap();
         old_session(&*store, &vault, now() - 60, Some(expired_token())).await;
         assert_eq!(
@@ -1181,19 +1166,14 @@ mod tests {
             assert_eq!(read(path).await.0, StatusCode::NOT_FOUND, "{path}");
             assert_eq!(read(of_a).await.0, StatusCode::OK, "{of_a}");
         }
-        let sha = "0123456789abcdef0123456789abcdef01234567";
         for path in [
-            format!("/api/w/1/fix?repo=o/secret&sha={sha}"),
-            "/api/w/1/repos/o/secret/config".into(),
-            "/api/w/1/repos/o/secret/skill".into(),
-            "/api/w/1/repos/o/secret/open".into(),
-            "/api/w/1/repos/o/secret/pulls/2".into(),
-            "/api/w/1/repos/o/secret/pulls/2/diff".into(),
-            "/api/w/1/repos/o/secret/pulls/2/status".into(),
-            "/api/w/1/repos/o/secret/pulls/2/agent-review".into(),
+            "/api/w/1/repos/o/secret/config",
+            "/api/w/1/repos/o/secret/skill",
+            "/api/w/1/repos/o/secret/pulls/2/status",
+            "/api/w/1/repos/o/secret/pulls/2/agent-review",
         ] {
             assert_eq!(
-                get(&router, &path, Some(&cookie)).await,
+                get(&router, path, Some(&cookie)).await,
                 StatusCode::NOT_FOUND,
                 "{path}"
             );
@@ -1229,21 +1209,6 @@ mod tests {
         );
         assert_eq!(
             get(&router, "/api/w/2/events?repo=o/r", Some(&cookie)).await,
-            StatusCode::NOT_FOUND
-        );
-        // Checked before GitHub sees it: it goes into the request's path.
-        assert_eq!(
-            get(&router, "/api/w/1/fix?repo=o/r&sha=../../x", Some(&cookie)).await,
-            StatusCode::BAD_REQUEST
-        );
-        let sha = "0".repeat(40);
-        assert_eq!(
-            get(
-                &router,
-                &format!("/api/w/2/fix?repo=o/r&sha={sha}"),
-                Some(&cookie)
-            )
-            .await,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
@@ -1283,7 +1248,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn the_agents_review_shows_and_takes_questions_and_its_settings_save(pool: PgPool) {
+    async fn the_agents_review_shows_and_its_settings_save(pool: PgPool) {
         use mergepatrol_core::{Bar, Finding, Judged, Kind, Lean, ReviewStatus};
         use mergepatrol_store::{ReviewDone, ReviewStore};
         let store = PgStore::migrate(pool.clone()).await.unwrap();
@@ -1355,28 +1320,6 @@ mod tests {
         // What it asks comes first.
         assert_eq!(body["findings"][0]["id"], "f2");
         assert_eq!(body["findings"][0]["bar"], 90);
-
-        let ask = |head: &str| serde_json::json!({ "head_sha": head, "finding": "f2", "question": "Why?" });
-        let questions = format!("{path}/questions");
-        let (status, _) = json(&router, "POST", &questions, &cookie, Some(ask("old"))).await;
-        assert_eq!(
-            status,
-            StatusCode::CONFLICT,
-            "a question about another head"
-        );
-        // Asking spends the workspace's model, and answering resolves the gate: GitHub must say
-        // the caller may write to the repo, which takes their GitHub token.
-        let (status, _) = json(&router, "POST", &questions, &cookie, Some(ask("head"))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let answers = serde_json::json!({
-            "head_sha": "head",
-            "answers": [{ "finding": "f2", "call": "fine" }],
-        });
-        let answer_path = format!("{path}/answers");
-        let (status, _) = json(&router, "POST", &answer_path, &cookie, Some(answers)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (_, body) = json(&router, "GET", path, &cookie, None).await;
-        assert_eq!(body["status"], "asks", "unanswered");
 
         // What repos inherit: the instance's, then the workspace's.
         let path = "/api/w/1/settings/repo-defaults";
@@ -1698,30 +1641,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_draft_published_from_the_dashboard_wakes_its_queue(pool: PgPool) {
-        let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
-        let woken = Woken::default();
-        let repo = mergepatrol_core::RepoName::parse("o/r").unwrap();
-        store.github_reads(7, &repo).await.unwrap();
-
-        assert!(
-            api::published(&*store, &woken, 7, repo.clone(), 5)
-                .await
-                .is_ok()
-        );
-        let reads = store.github_reads(7, &repo).await.unwrap();
-        assert_eq!(
-            reads
-                .prs
-                .iter()
-                .map(|p| (p.number, p.changes))
-                .collect::<Vec<_>>(),
-            [(5, 1)]
-        );
-        assert_eq!(*woken.0.lock().unwrap(), [(7, "o/r".to_string())]);
-    }
-
-    #[sqlx::test(migrations = false)]
     async fn a_webhook_marks_the_reads_it_changed(pool: PgPool) {
         let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool.clone()).await.unwrap());
         let (router, _) = with_app(pool, Some(app(Some("hush"))), Arc::default()).await;
@@ -1772,128 +1691,6 @@ mod tests {
             .body(Body::from(body.to_owned()))
             .unwrap();
         router.clone().oneshot(req).await.unwrap().status()
-    }
-
-    /// A PR as the inbox reads it, by `author`, asked of the team `core`, with a comment by
-    /// `ann`.
-    fn inbox_node(number: u64, author: &str) -> serde_json::Value {
-        serde_json::json!({
-            "number": number, "state": "OPEN", "title": "t", "body": "", "isDraft": false,
-            "isCrossRepository": false, "reviewDecision": "REVIEW_REQUIRED", "baseRefName": "main",
-            "headRefName": "b", "headRefOid": "h", "labels": { "nodes": [] }, "stack": null,
-            "url": "u", "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-02T00:00:00Z", "additions": 1, "deletions": 1,
-            "changedFiles": 1, "author": { "__typename": "User", "login": author, "avatarUrl": "a" },
-            "latestOpinionatedReviews": { "nodes": [] }, "reviewRequests": { "nodes": [] },
-            "commits": { "nodes": [] }, "repository": { "nameWithOwner": "o/r" },
-            "reviewThreads": { "nodes": [{ "isResolved": false }, { "isResolved": true }] },
-            "teamRequests": { "nodes": [{ "requestedReviewer": { "slug": "core" } }] },
-            "activity": { "nodes": [{ "createdAt": "2026-10-02T00:00:00Z", "author": { "login": "ann" } }] },
-        })
-    }
-
-    #[sqlx::test(migrations = false)]
-    async fn the_open_prs_come_from_the_inbox_without_reading_github(pool: PgPool) {
-        use mergepatrol_core::{ConfigPath, ConfigText, Entry, EntryState, Lane};
-        use mergepatrol_store::{InboxRead, InboxWrite, LaneKey};
-        // The session's GitHub token is fake: a read of GitHub would fail the request.
-        let (router, cookie) = signed_in(pool.clone()).await;
-        let (store, _) = store_and_vault(pool).await;
-        let repo = RepoName::parse("o/r").unwrap();
-        let pr = |number: u64, updated: &str, labels: &[&str]| {
-            let mut node = inbox_node(number, "bo");
-            node["updatedAt"] = updated.into();
-            node["labels"]["nodes"] = labels
-                .iter()
-                .map(|l| serde_json::json!({ "name": l }))
-                .collect();
-            node["repository"]["defaultBranchRef"] = serde_json::json!({ "name": "main" });
-            node
-        };
-        let mut draft = pr(1, "2026-10-09T00:00:00Z", &[]);
-        draft["isDraft"] = true.into();
-        let mut elsewhere = pr(6, "2026-10-08T00:00:00Z", &[]);
-        elsewhere["baseRefName"] = "release".into();
-        let nodes = [
-            draft,
-            pr(2, "2026-10-07T00:00:00Z", &[]),
-            pr(3, "2026-10-06T00:00:00Z", &["mergeloop"]),
-            // Queued, and a layer of its stack.
-            pr(4, "2026-10-05T00:00:00Z", &[]),
-            pr(5, "2026-10-04T00:00:00Z", &[]),
-            elsewhere,
-            pr(7, "2026-10-03T00:00:00Z", &["ship"]),
-            pr(8, "2026-10-02T00:00:00Z", &["mergepatrol"]),
-        ];
-        let writes: Vec<InboxWrite> = nodes
-            .into_iter()
-            .map(|node| InboxWrite {
-                number: node["number"].as_u64().unwrap(),
-                changes: 0,
-                read: Some(InboxRead {
-                    state: "open".into(),
-                    author: Some("bo".into()),
-                    requested_users: Vec::new(),
-                    requested_teams: Vec::new(),
-                    reviewers: Vec::new(),
-                    closed_at: None,
-                    node,
-                }),
-                settled: true,
-            })
-            .collect();
-        store.save_inbox_index(1, &repo, &writes).await.unwrap();
-        let key = LaneKey {
-            installation_id: 1,
-            repo: repo.clone(),
-            trunk: "main".into(),
-        };
-        let lane = Lane {
-            entries: vec![Entry {
-                number: 4,
-                priority: false,
-                state: EntryState::Waiting,
-                summary: Default::default(),
-                layers: vec![5],
-                heads: Vec::new(),
-                recheck: None,
-            }],
-            ..Lane::default()
-        };
-        store.save_lane(&key, &lane).await.unwrap();
-        let open = |router: Router, cookie: String| async move {
-            let (status, list) =
-                json(&router, "GET", "/api/w/1/repos/o/r/open", &cookie, None).await;
-            assert_eq!(status, StatusCode::OK);
-            let list = list.as_array().unwrap().iter();
-            list.map(|p| (p["number"].as_u64().unwrap(), p["draft"] == true))
-                .collect::<Vec<_>>()
-        };
-
-        // The config file not read yet: from GitHub, which this token cannot reach.
-        let (status, _) = json(&router, "GET", "/api/w/1/repos/o/r/open", &cookie, None).await;
-        assert_ne!(status, StatusCode::OK);
-        // Read, and there is none: the workspace's label.
-        store.github_reads(1, &repo).await.unwrap();
-        let none = ConfigText::none();
-        store.save_config_read(1, &repo, 0, &none).await.unwrap();
-        let listed = open(router.clone(), cookie.clone()).await;
-        assert_eq!(listed, [(1, true), (2, false), (7, false), (8, false)]);
-        // One still at the path from before the rename, which keeps the label from then.
-        let legacy = ConfigText {
-            at: ConfigPath::Legacy,
-            text: Some("version: 1\n".into()),
-        };
-        store.save_config_read(1, &repo, 0, &legacy).await.unwrap();
-        let listed = open(router.clone(), cookie.clone()).await;
-        assert_eq!(listed, [(1, true), (2, false), (3, false), (7, false)]);
-        // One that names another label.
-        let ship = ConfigText {
-            at: ConfigPath::Current,
-            text: Some("version: 1\nlabel: ship\n".into()),
-        };
-        store.save_config_read(1, &repo, 0, &ship).await.unwrap();
-        let listed = open(router, cookie).await;
-        assert_eq!(listed, [(1, true), (2, false), (3, false), (8, false)]);
     }
 
     fn push(r#ref: &str, commits: &str) -> String {

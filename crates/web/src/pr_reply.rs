@@ -396,9 +396,6 @@ async fn settle(app: &AppState, review: &ReviewRecord, answered: &ReviewAnswers)
     if app.store.answer_review(review.id, answered).await? {
         let status = answered.status.as_str();
         tracing::info!(installation, %repo, number, by = %answered.by, status, "the agent's review is answered on GitHub");
-        app.store
-            .inbox_reviewed(installation, repo, number, &answered.by)
-            .await?;
         app.wake.wake(installation, repo.clone());
     }
     Ok(())

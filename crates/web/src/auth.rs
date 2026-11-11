@@ -148,7 +148,6 @@ pub struct ManifestForm {
 
 /// A signed-in user, and the installations they could access when they signed in.
 pub(crate) struct SignedIn {
-    login: String,
     installations: Vec<u64>,
     token_hash: String,
     /// Their GitHub token, sealed. `None` for a session from before sessions kept it.
@@ -166,10 +165,6 @@ impl SignedIn {
                 "no such workspace".into(),
             ))
         }
-    }
-
-    pub(crate) fn login(&self) -> &str {
-        &self.login
     }
 
     /// The user's GitHub token, to act as them, so GitHub checks what they may do.
@@ -253,16 +248,10 @@ impl FromRequestParts<AppState> for SignedIn {
 fn signed_in(session: Session, token_hash: String) -> Option<SignedIn> {
     match session {
         Session {
-            kind:
-                SessionKind::User {
-                    login,
-                    installations,
-                    ..
-                },
+            kind: SessionKind::User { installations, .. },
             github,
             ..
         } => Some(SignedIn {
-            login,
             installations,
             token_hash,
             github,

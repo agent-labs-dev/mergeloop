@@ -351,21 +351,6 @@ impl Installation {
         Ok(res.body["full_name"].as_str().and_then(RepoName::parse))
     }
 
-    /// A GET for a body that is not JSON, in the media type `accept` names: its status and text.
-    pub(crate) async fn get_text(&self, path: &str, accept: &str) -> Result<(StatusCode, String)> {
-        let build = || async move {
-            let mut headers = api_headers();
-            headers.insert("accept", accept.parse()?);
-            Ok(self
-                .app
-                .http
-                .get(format!("{}{path}", self.app.api))
-                .bearer_auth(self.token().await?)
-                .headers(headers))
-        };
-        send(build, &format!("GET {path}")).await
-    }
-
     /// A REST call that returns the status and the body, for callers that branch on the status.
     pub(crate) async fn request(
         &self,
@@ -497,20 +482,6 @@ impl AsUser {
                 .json(&body))
         };
         graphql_data(name, None, false, send(build, "POST /graphql").await?)
-    }
-
-    /// A GET whose body is not JSON, such as a diff, by its `accept`.
-    pub(crate) async fn get_text(&self, path: &str, accept: &str) -> Result<(StatusCode, String)> {
-        let build = || async move {
-            let mut headers = api_headers();
-            headers.insert("accept", accept.parse()?);
-            Ok(self
-                .http
-                .get(format!("{}{path}", self.api))
-                .bearer_auth(&self.token)
-                .headers(headers))
-        };
-        send(build, &format!("GET {path}")).await
     }
 
     /// As [`Installation::graphql_missing_ok`].

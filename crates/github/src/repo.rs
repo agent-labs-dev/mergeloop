@@ -2147,6 +2147,22 @@ mod tests {
         assert_ne!(diff_id_of(&at_12), diff_id_of(&other), "a changed line");
         let elsewhere = compare(json!([file("b.rs", "@@ -12,2 +12,2 @@ fn f\n-old\n+new")]));
         assert_ne!(diff_id_of(&at_12), diff_id_of(&elsewhere), "another file");
+
+        // The context places the edit: the same lines put elsewhere in the file are another
+        // change, so a change in the context is reviewed again, as it may be one.
+        let here = compare(json!([file(
+            "a.rs",
+            "@@ -12,3 +12,3 @@\n read();\n-old\n+new"
+        )]));
+        let there = compare(json!([file(
+            "a.rs",
+            "@@ -40,3 +40,3 @@\n delete();\n-old\n+new"
+        )]));
+        assert_ne!(
+            diff_id_of(&here),
+            diff_id_of(&there),
+            "the same lines elsewhere"
+        );
     }
 
     #[test]

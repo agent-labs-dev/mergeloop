@@ -1058,6 +1058,9 @@ impl ReviewStore for Mem {
         {
             if r.status == ReviewStatus::Stale {
                 r.status = ReviewStatus::Pending;
+                if diff_id.is_some() {
+                    r.diff_id = diff_id.map(str::to_owned);
+                }
             }
             return Ok(r.clone());
         }

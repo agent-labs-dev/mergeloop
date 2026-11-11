@@ -422,7 +422,8 @@ impl ReviewStore for PgStore {
             "INSERT INTO agent_reviews (installation_id, repo, number, head_sha, diff_id)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (installation_id, repo, number, head_sha) DO UPDATE
-             SET status = 'pending', claimed_at = NULL, updated_at = now()
+             SET status = 'pending', claimed_at = NULL, updated_at = now(),
+                 diff_id = COALESCE(EXCLUDED.diff_id, agent_reviews.diff_id)
              WHERE agent_reviews.status = 'stale'",
         )
         .bind(installation_id as i64)
@@ -992,6 +993,20 @@ mod tests {
         );
         assert_eq!(b.diff_id.as_deref(), Some("d"));
         assert!(!carry("b", "d").await.unwrap(), "it has one");
+
+        // A queue fix's review waits, stale, for the head: starting it saves the head's id, so
+        // its approval carries too.
+        store
+            .review_queue_change(1, &repo, 7, "b", "fixed")
+            .await
+            .unwrap();
+        let fixed = store
+            .start_review(1, &repo, 7, "fixed", Some("f"))
+            .await
+            .unwrap();
+        assert_eq!(fixed.diff_id.as_deref(), Some("f"));
+        approve(fixed.id).await;
+        assert!(carry("fixed, restacked", "f").await.unwrap());
 
         // Only the newest review counts: one that holds the PR is not passed over.
         store

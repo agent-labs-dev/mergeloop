@@ -1592,7 +1592,7 @@ fn diff_id_of(compare: &Value) -> Option<String> {
             } else {
                 hash.update(line.as_bytes());
             }
-            hash.update([b'\n']);
+            hash.update(b"\n");
         }
         hash.update([0]);
     }

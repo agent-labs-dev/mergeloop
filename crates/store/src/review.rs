@@ -142,11 +142,9 @@ pub trait ReviewStore: Send + Sync {
         before: &str,
         after: &str,
     ) -> Result<()>;
-    /// Who the review asks, changed.
-    async fn set_asked(&self, id: i64, asked: &[String]) -> Result<()>;
     /// A human answered the review's asks. False if it no longer asks.
     async fn answer_review(&self, id: i64, answers: &ReviewAnswers) -> Result<bool>;
-    /// Marks the review as having told the PR, on GitHub, to answer it on the dashboard. False
+    /// Marks the review as having told the PR, on GitHub, how to answer its asks. False
     /// if it told it already, or it no longer asks.
     async fn nudge_review(&self, id: i64) -> Result<bool>;
     /// Undoes `nudge_review`, as when posting the note failed, so a later reply tries again.
@@ -564,15 +562,6 @@ impl ReviewStore for PgStore {
         .bind(after)
         .execute(&self.pool)
         .await?;
-        Ok(())
-    }
-
-    async fn set_asked(&self, id: i64, asked: &[String]) -> Result<()> {
-        sqlx::query("UPDATE agent_reviews SET asked = $2, updated_at = now() WHERE id = $1")
-            .bind(id)
-            .bind(asked)
-            .execute(&self.pool)
-            .await?;
         Ok(())
     }
 

@@ -121,6 +121,8 @@ struct State {
     forbids_force: bool,
     /// Heads that need a rebase onto the trunk. Every other head is on it.
     behind: Vec<String>,
+    /// Each head's diff id, by its base and head: a restack keeps one. Unknown heads have none.
+    diff_ids: HashMap<(String, String), String>,
     /// Heads whose workflow runs wait for a maintainer's approval.
     awaiting_approval: Vec<String>,
     /// PRs that change workflow files.
@@ -495,6 +497,11 @@ impl GitHub for Fake {
 
     async fn behind(&self, _: &RepoName, _: &str, head: &str) -> Result<bool> {
         Ok(self.state.lock().unwrap().behind.iter().any(|h| h == head))
+    }
+
+    async fn diff_id(&self, _: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.diff_ids.get(&(base.to_owned(), head.to_owned())).cloned())
     }
 
     async fn awaiting_approval(&self, _: &RepoName, sha: &str) -> Result<bool> {
@@ -1042,6 +1049,7 @@ impl ReviewStore for Mem {
         repo: &RepoName,
         pr: PrNumber,
         head: &str,
+        diff_id: Option<&str>,
     ) -> Result<ReviewRecord> {
         let mut reviews = self.reviews.lock().unwrap();
         if let Some(r) = reviews
@@ -1060,6 +1068,7 @@ impl ReviewStore for Mem {
             number: pr,
             head_sha: head.to_owned(),
             since_head: None,
+            diff_id: diff_id.map(str::to_owned),
             claim: 0,
             status: ReviewStatus::Pending,
             error: None,
@@ -1077,6 +1086,33 @@ impl ReviewStore for Mem {
         };
         reviews.push(r.clone());
         Ok(r)
+    }
+    async fn carry_unchanged(
+        &self,
+        _: u64,
+        _: &RepoName,
+        pr: PrNumber,
+        head: &str,
+        diff_id: &str,
+    ) -> Result<bool> {
+        let mut reviews = self.reviews.lock().unwrap();
+        if reviews.iter().any(|r| r.number == pr && r.head_sha == head) {
+            return Ok(false);
+        }
+        let newest = reviews.iter().rev().find(|r| r.number == pr).cloned();
+        let Some(r) = newest.filter(|r| {
+            r.status == ReviewStatus::Approved && r.diff_id.as_deref() == Some(diff_id)
+        }) else {
+            return Ok(false);
+        };
+        let id = reviews.len() as i64 + 1;
+        reviews.push(ReviewRecord {
+            id,
+            head_sha: head.to_owned(),
+            since_head: None,
+            ..r
+        });
+        Ok(true)
     }
     async fn claim_review(&self, _: Duration) -> Result<Option<ReviewRecord>> {
         unreachable!()
@@ -2417,7 +2453,7 @@ async fn a_conflict_the_agent_resolved_needs_a_review_and_a_clean_rebase_keeps_i
         let (run, key, settings) = (&run, &key, &settings);
         async move {
             let heads = [(number, head, 0)];
-            review_hold(&run.ctx, key, settings, false, &heads, &mut false)
+            review_hold(&run.ctx, &*run.gh, key, settings, false, &heads, &mut false)
                 .await
                 .unwrap()
         }
@@ -2434,6 +2470,64 @@ async fn a_conflict_the_agent_resolved_needs_a_review_and_a_clean_rebase_keeps_i
         Some(&heads[1]),
         "it reads only the resolution"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_layer_restacked_onto_a_fix_below_keeps_its_approval() {
+    let run = Run::new(Fake::new(|s| {
+        s.add_stack(10, &[1, 2], &[2]);
+        for (base, head, id) in [
+            ("main", "pr-1-v0", "one"),
+            ("pr-1-v0", "pr-2-v0", "two"),
+            ("main", "pr-1-v1", "one, fixed"),
+            ("pr-1-v1", "pr-2-v1", "two"),
+            ("pr-1-v1", "pr-2-v2", "two, changed"),
+        ] {
+            s.diff_ids.insert((base.into(), head.into()), id.into());
+        }
+    }));
+    let settings = ReviewSettings {
+        enabled: true,
+        ..ReviewSettings::default()
+    };
+    let key = LaneKey {
+        installation_id: 1,
+        repo: repo(),
+        trunk: "main".into(),
+    };
+    let hold = |one: &'static str, two: &'static str| {
+        let (run, key, settings) = (&run, &key, &settings);
+        async move {
+            let heads = [(1, one, 0), (2, two, 0)];
+            review_hold(&run.ctx, &*run.gh, key, settings, true, &heads, &mut false)
+                .await
+                .unwrap()
+        }
+    };
+    let reviewing = |number| {
+        Some(Hold::Layer {
+            number,
+            hold: Box::new(Hold::Reviewing),
+        })
+    };
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, reviewing(1));
+    run.store.finish_review(1, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, reviewing(2));
+    run.store.finish_review(2, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, None);
+
+    // A fix on the layer below, and the restack it brings: only the fix is reviewed.
+    assert_eq!(hold("pr-1-v1", "pr-2-v1").await, reviewing(1));
+    run.store.finish_review(1, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v1", "pr-2-v1").await, None);
+    assert_eq!(
+        run.store.newest_review(2).0,
+        "pr-2-v1",
+        "the approval holds for it"
+    );
+
+    // A push that changes the layer's own changes is reviewed again.
+    assert_eq!(hold("pr-1-v1", "pr-2-v2").await, reviewing(2));
 }
 
 #[tokio::test(start_paused = true)]

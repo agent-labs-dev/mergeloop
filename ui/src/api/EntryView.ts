@@ -3,6 +3,7 @@ import type { ActiveStepView } from "./ActiveStepView";
 import type { ChecksView } from "./ChecksView";
 import type { EntryStateView } from "./EntryStateView";
 import type { HoldView } from "./HoldView";
+import type { LayerView } from "./LayerView";
 import type { PersonView } from "./PersonView";
 import type { ReviewBriefView } from "./ReviewBriefView";
 import type { ReviewDecisionView } from "./ReviewDecisionView";
@@ -39,6 +40,11 @@ hold: HoldView | null,
  * A stack's PRs, bottom to top: `number` is the stack's. Empty for a PR.
  */
 layers: Array<number>, 
+/**
+ * A stack's PRs as of the last tick, bottom to top. Empty for a PR, and for a stack until
+ * the tick after it was saved without them.
+ */
+stack: Array<LayerView>, 
 /**
  * The agent's review of the PR, or of the stack's layer it is held for, else its top: the
  * newest, of whatever head.

@@ -243,6 +243,12 @@ async fn earlier(ctx: &Ctx, gh: &Installation, r: &ReviewRecord) -> Result<Earli
     })
 }
 
+/// The branch of the stack layer below the PR, which its review reads its changes from: those
+/// below are reviewed on their own. `None` for a PR, or a stack's bottom.
+fn below(pr: &PullRequest) -> Option<String> {
+    (pr.base_ref_name != pr.merges_into()).then(|| pr.base_ref_name.clone())
+}
+
 /// Runs the review in the sandbox. `Err` says why the agent could not review.
 async fn run_review(
     ctx: &Ctx,
@@ -265,7 +271,7 @@ async fn run_review(
         &r.head_sha[..8]
     );
     let ran = async {
-        let trunk = gh.branch_sha(&r.repo, pr.merges_into()).await?;
+        let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
         let task = Task::Review {
             answered,
             sent_back,
@@ -273,8 +279,9 @@ async fn run_review(
             reviewed,
             depth,
         };
-        let (spec, granted) =
+        let (mut spec, granted) =
             job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
+        spec.base_ref = below(pr);
         if granted.is_none() {
             bail!(
                 "{NO_KEY} in the workspace's settings for {}: the agent cannot review.",
@@ -960,13 +967,13 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
         let key = lane_key(&r, &pr);
         lane = Some(key.clone());
         let settings = settings(ctx, &gh, &r.repo).await?;
-        let trunk = gh.branch_sha(&r.repo, pr.merges_into()).await?;
+        let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
         let task = Task::Question {
             finding: Box::new(finding),
             question: q.question.clone(),
             sent_back,
         };
-        let (spec, granted) = job_spec(
+        let (mut spec, granted) = job_spec(
             ctx,
             &gh,
             &key,
@@ -978,6 +985,7 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
             task,
         )
         .await?;
+        spec.base_ref = below(&pr);
         if granted.is_none() {
             bail!("{NO_KEY} in the workspace's settings: the agent cannot answer.");
         }
@@ -1108,6 +1116,7 @@ mod tests {
         };
         ReviewRecord {
             since_head: None,
+            diff_id: None,
             claim: 0,
             id,
             installation_id: 1,

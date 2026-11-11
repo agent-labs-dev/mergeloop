@@ -1,12 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { fetchExits, fetchLanes } from "./api";
 import type { ActiveStepView } from "./api/ActiveStepView";
 import type { ChecksView } from "./api/ChecksView";
 import type { EntryView } from "./api/EntryView";
 import type { ExitView } from "./api/ExitView";
 import type { LaneView } from "./api/LaneView";
+import type { LayerView } from "./api/LayerView";
 import { reviewBadge, reviewLine } from "./review";
 import { Avatar, primary, timeAgo } from "./ui";
 
@@ -132,7 +133,7 @@ export function Queue({ workspace }: { workspace: number }) {
               <ol className="shadow-[inset_2px_0_0_0_var(--color-blue-400)]">
                 {batched.map((e) => (
                   <li key={e.number}>
-                    <Row repo={lane.repo} entry={e} place={place(e)} />
+                    <Row repo={lane.repo} trunk={lane.trunk} entry={e} place={place(e)} />
                   </li>
                 ))}
               </ol>
@@ -140,7 +141,7 @@ export function Queue({ workspace }: { workspace: number }) {
           )}
           {inLine.map((e) => (
             <li key={e.number}>
-              <Row repo={lane.repo} entry={e} place={place(e)} />
+              <Row repo={lane.repo} trunk={lane.trunk} entry={e} place={place(e)} />
             </li>
           ))}
         </ol>
@@ -151,10 +152,10 @@ export function Queue({ workspace }: { workspace: number }) {
           items={reviewing}
           empty="No PRs getting ready"
         >
-          {(e) => <Row repo={lane.repo} entry={e} place={null} track />}
+          {(e) => <Row repo={lane.repo} trunk={lane.trunk} entry={e} place={null} track />}
         </Rows>
         <Rows title="Held" note="until GitHub would merge it" items={held} empty="No PRs held">
-          {(e) => <Row repo={lane.repo} entry={e} place={null} />}
+          {(e) => <Row repo={lane.repo} trunk={lane.trunk} entry={e} place={null} />}
         </Rows>
         <Rows
           title="Ejected"
@@ -293,17 +294,21 @@ const rowClass = "flex gap-3 border-b border-line-soft px-4 py-3 hover:bg-page";
 
 function Row({
   repo,
+  trunk,
   entry: e,
   place,
   track,
 }: {
   repo: string;
+  trunk: string;
   entry: EntryView;
   /** `null` for a held PR: it has no place until it is released. */
   place: number | null;
   /** Shows where it is on its way to the trunk. */
   track?: boolean;
 }) {
+  if (e.stack.length > 0)
+    return <StackRow repo={repo} trunk={trunk} entry={e} place={place} track={track} />;
   const line = reviewLine(e);
   return (
     <a
@@ -350,6 +355,256 @@ function Row({
         )}
       </span>
     </a>
+  );
+}
+
+/** What a stack's PR shows of the hold: a review holds on the lowest PR it has not let on, so
+ * the PRs below it have passed it and those above wait for it. Another hold names only its PR. */
+type LayerStatus = "approved" | "holds" | "waits" | null;
+
+function layerStatuses(e: EntryView): LayerStatus[] {
+  const at = e.state === "held" ? e.stack.findIndex((l) => l.number === e.hold?.layer) : -1;
+  const byReview = reviewBadge(e) !== null && !e.hold?.reason.startsWith("prep_");
+  return e.stack.map((_, i) => {
+    if (i === at) return "holds";
+    if (at < 0 || !byReview) return null;
+    return i < at ? "approved" : "waits";
+  });
+}
+
+const approvedBadge =
+  "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/30";
+
+const statusDot: Record<NonNullable<LayerStatus>, string> = {
+  approved: "bg-ok",
+  holds: "bg-amber-500",
+  waits: "bg-line-strong",
+};
+
+/** A stack shows more than this many PRs by folding runs of alike PRs. */
+const STACK_UNFOLDED = 8;
+/** The shortest run of alike PRs a long stack folds. */
+const FOLD_RUN = 4;
+
+/** A stack: its row, and each of its PRs under it, top first, on a rail down to the trunk. The
+ * PR that holds it shows what holds it; a long stack folds runs of alike PRs. */
+function StackRow({
+  repo,
+  trunk,
+  entry: e,
+  place,
+  track,
+}: {
+  repo: string;
+  trunk: string;
+  entry: EntryView;
+  place: number | null;
+  track?: boolean;
+}) {
+  const [unfolded, setUnfolded] = useState<Set<number>>(new Set());
+  const statuses = layerStatuses(e);
+  const top = e.stack[e.stack.length - 1];
+  const holder = e.stack[statuses.indexOf("holds")];
+  const approved = statuses.filter((s) => s === "approved").length;
+  const waiting = statuses.filter((s) => s === "waits").length;
+  const additions = e.stack.reduce((sum, l) => sum + l.additions, 0);
+  const deletions = e.stack.reduce((sum, l) => sum + l.deletions, 0);
+  const line = reviewLine(e);
+
+  // Top first, in runs of PRs alike: the holder alone, as it says what holds the stack.
+  const runs: { from: number; to: number }[] = [];
+  for (let i = e.stack.length - 1; i >= 0; i--) {
+    const run = runs[runs.length - 1];
+    if (run && statuses[i] !== "holds" && statuses[run.to] === statuses[i]) run.to = i;
+    else runs.push({ from: i, to: i });
+  }
+  const fold = e.stack.length > STACK_UNFOLDED;
+  return (
+    <div className="border-b border-line-soft">
+      <a
+        href={top.url || pullUrl(repo, top.number)}
+        target="_blank"
+        rel="noreferrer"
+        className="flex gap-3 px-4 pt-3 pb-2 hover:bg-page"
+      >
+        <span className="w-4 pt-px text-right text-xs text-faint tabular-nums">{place}</span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-start justify-between gap-3">
+            <span className="flex min-w-0 items-center gap-2">
+              <StackIcon />
+              <span className="shrink-0 font-medium">Stack of {e.stack.length} PRs</span>
+              <span className="truncate text-muted">· {top.head_ref}</span>
+            </span>
+            <State entry={e} />
+          </span>
+          <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
+            {holder ? (
+              <span>
+                {approved > 0 && `${approved} of ${e.stack.length} approved · `}
+                {waiting > 0
+                  ? `${waiting} wait for #${holder.number}`
+                  : `held on #${holder.number}`}
+              </span>
+            ) : (
+              <span className="tabular-nums">{refsOf(e)}</span>
+            )}
+            {top.author && (
+              <span className="flex items-center gap-1">
+                <Avatar src={top.author.avatar_url} alt={top.author.login} size="size-4" />
+                {top.author.login}
+              </span>
+            )}
+            {e.priority && <span className="font-medium text-hot">↑ Priority</span>}
+            {e.fix_budget > 0 && e.fixes > 0 && (
+              <span>
+                {e.fixes} of {e.fix_budget} fixes used
+              </span>
+            )}
+            <span className="ml-auto font-mono tabular-nums">
+              <span className="text-ok">+{additions}</span>{" "}
+              <span className="text-bad">−{deletions}</span>
+            </span>
+          </span>
+          {track && (
+            <span className="mt-2 block">
+              <Track entry={e} />
+            </span>
+          )}
+          {!holder &&
+            (line ? (
+              <span className="mt-1 block text-xs">{line}</span>
+            ) : (
+              e.detail && <span className="mt-1 block text-warn">{e.detail}</span>
+            ))}
+        </span>
+      </a>
+      <ol className="mr-4 mb-3 ml-11 border-l border-line-strong">
+        {runs.map(({ from, to }) => {
+          const status = statuses[from];
+          if (!fold || from - to + 1 < FOLD_RUN || unfolded.has(from))
+            return Array.from({ length: from - to + 1 }, (_, k) => from - k).map((i) => (
+              <LayerRow
+                key={e.stack[i].number}
+                repo={repo}
+                layer={e.stack[i]}
+                status={statuses[i]}
+                entry={e}
+                line={
+                  statuses[i] !== "holds"
+                    ? null
+                    : line || (e.detail && <span className="text-warn">{e.detail}</span>)
+                }
+              />
+            ));
+          const what =
+            status === "approved"
+              ? "approved"
+              : status === "waits" && holder
+                ? `waiting for #${holder.number}`
+                : "";
+          return (
+            <li key={from}>
+              <button
+                type="button"
+                onClick={() => setUnfolded(new Set([...unfolded, from]))}
+                className="relative flex w-full items-center gap-2 py-1.5 pl-4 text-left text-xs text-muted hover:text-fg"
+              >
+                <Dot status={status} />
+                <span className="tabular-nums">
+                  Layers {to + 1}–{from + 1}
+                </span>
+                <span>
+                  · {from - to + 1} PRs {what}
+                </span>
+                <span className="text-faint underline underline-offset-2">Show titles</span>
+              </button>
+            </li>
+          );
+        })}
+        <li className="relative pt-1 pl-4 text-xs text-faint">
+          <span className="absolute top-2 -left-[4.5px] size-2 rounded-full border border-line-strong bg-surface" />
+          {trunk}
+        </li>
+      </ol>
+    </div>
+  );
+}
+
+function Dot({ status, sentBack }: { status: LayerStatus; sentBack?: boolean }) {
+  const fill = sentBack
+    ? "bg-bad"
+    : status
+      ? statusDot[status]
+      : "border border-line-strong bg-surface";
+  return <span className={`absolute top-3 -left-[4.5px] size-2 rounded-full ${fill}`} />;
+}
+
+/** Held for the author: the review sent findings back, or threads are open. */
+const heldForAuthor = (e: EntryView) =>
+  e.hold?.reason === "review_changes" || e.hold?.reason === "unresolved_threads";
+
+function LayerRow({
+  repo,
+  layer: l,
+  status,
+  entry: e,
+  line,
+}: {
+  repo: string;
+  layer: LayerView;
+  status: LayerStatus;
+  entry: EntryView;
+  line: ReactNode;
+}) {
+  const holds = status === "holds";
+  const sentBack = holds && heldForAuthor(e);
+  return (
+    <li
+      className={holds ? `my-1 rounded-r-md ${sentBack ? "bg-red-500/5" : "bg-amber-500/5"}` : ""}
+    >
+      <a
+        href={l.url || pullUrl(repo, l.number)}
+        target="_blank"
+        rel="noreferrer"
+        className="relative block py-1.5 pr-1 pl-4 hover:bg-page"
+      >
+        <Dot status={status} sentBack={sentBack} />
+        <span className="flex items-center gap-2">
+          <span className="w-8 shrink-0 text-xs text-faint tabular-nums">#{l.number}</span>
+          <span className={`min-w-0 flex-1 truncate ${holds ? "font-medium" : "text-fg-2"}`}>
+            {l.title || `Pull request #${l.number}`}
+          </span>
+          {holds && <State entry={e} />}
+          {status === "approved" && <Badge style={approvedBadge}>Approved</Badge>}
+          {status === "waits" && <Badge style={stateBadge.waiting[1]}>Waiting</Badge>}
+          <span className="flex shrink-0 items-center justify-end gap-2 text-xs max-sm:hidden">
+            <Checks checks={l.checks} />
+            <span className="font-mono tabular-nums">
+              <span className="text-ok">+{l.additions}</span>{" "}
+              <span className="text-bad">−{l.deletions}</span>
+            </span>
+          </span>
+        </span>
+        {line && <span className="mt-0.5 block pl-10 text-xs">{line}</span>}
+      </a>
+    </li>
+  );
+}
+
+function StackIcon() {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className="size-4 shrink-0 text-muted"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.3"
+      aria-hidden
+    >
+      <rect x="3" y="2" width="10" height="3" rx="1" />
+      <rect x="3" y="6.5" width="10" height="3" rx="1" />
+      <rect x="3" y="11" width="10" height="3" rx="1" />
+    </svg>
   );
 }
 

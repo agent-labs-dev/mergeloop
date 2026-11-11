@@ -470,6 +470,7 @@ mod tests {
             number: 5,
             head_sha: "h1".into(),
             since_head: None,
+            diff_id: None,
             status,
             claim: 0,
             error: None,

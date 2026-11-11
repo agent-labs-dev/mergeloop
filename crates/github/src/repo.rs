@@ -271,6 +271,7 @@ impl PullRequest {
             checks: d.commits["nodes"][0]["commit"]["statusCheckRollup"]["state"]
                 .as_str()
                 .map(str::to_owned),
+            stack: Vec::new(),
         }
     }
 }
@@ -717,6 +718,20 @@ impl Installation {
             )
             .await?;
         Ok(r["behind_by"].as_u64().context("behind_by")? > 0)
+    }
+
+    /// What `head` changes since it left `base`, as an id that a restack keeps: two heads
+    /// with the same id change the same lines the same way. `None` when GitHub does not show
+    /// the whole diff.
+    pub async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        let r: Value = self
+            .rest(
+                Method::GET,
+                &format!("/repos/{repo}/compare/{base}...{head}"),
+                None,
+            )
+            .await?;
+        Ok(diff_id_of(&r))
     }
 
     /// Whether workflow runs on `sha` wait for a maintainer to approve them, as GitHub has a
@@ -1544,6 +1559,46 @@ impl Installation {
     }
 }
 
+/// The most files GitHub's compare lists: a diff with this many may have more.
+const COMPARE_FILES: usize = 300;
+
+/// The id of a compare's diff, from each file's name and patch. A hunk's line numbers are left
+/// out, as the layers below a stack layer move its lines without changing them. `None` when a
+/// file is too large for a patch, or the compare may list only some files.
+fn diff_id_of(compare: &Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let files = compare["files"].as_array()?;
+    if files.len() >= COMPARE_FILES {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    for f in files {
+        let patch = f["patch"].as_str();
+        // A text file too large to show has lines changed and no patch. A binary file, or a
+        // rename alone, has none: its content at the head stands for it.
+        if patch.is_none() && f["changes"].as_u64() != Some(0) {
+            return None;
+        }
+        let blob = if patch.is_none() { "sha" } else { "" };
+        for field in ["filename", "previous_filename", "status", blob] {
+            hash.update(f[field].as_str().unwrap_or("").as_bytes());
+            hash.update([0]);
+        }
+        for line in patch.unwrap_or("").lines() {
+            // `@@ -12,7 +12,9 @@ fn name` hashes as `@@ fn name`.
+            if let Some((_, after)) = line.strip_prefix("@@ ").and_then(|l| l.split_once(" @@")) {
+                hash.update(b"@@");
+                hash.update(after.as_bytes());
+            } else {
+                hash.update(line.as_bytes());
+            }
+            hash.update([b'\n']);
+        }
+        hash.update([0]);
+    }
+    Some(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// The most characters GitHub takes in a comment or a review's body.
 const COMMENT_CHARS: usize = 65_536;
 
@@ -2068,5 +2123,51 @@ mod tests {
         );
         assert_eq!(s.checks.as_deref(), Some("PENDING"));
         assert_eq!(s.fixes, 1);
+    }
+
+    fn compare(files: Value) -> Value {
+        json!({ "behind_by": 0, "files": files })
+    }
+
+    fn file(name: &str, patch: &str) -> Value {
+        json!({ "filename": name, "status": "modified", "changes": 2, "patch": patch })
+    }
+
+    #[test]
+    fn a_restack_that_moves_a_layers_lines_keeps_its_diff_id() {
+        let at_12 = compare(json!([file("a.rs", "@@ -12,2 +12,2 @@ fn f\n-old\n+new")]));
+        let at_40 = compare(json!([file("a.rs", "@@ -40,2 +40,2 @@ fn f\n-old\n+new")]));
+        assert!(diff_id_of(&at_12).is_some());
+        assert_eq!(diff_id_of(&at_12), diff_id_of(&at_40));
+
+        let other = compare(json!([file(
+            "a.rs",
+            "@@ -12,2 +12,2 @@ fn f\n-old\n+newer"
+        )]));
+        assert_ne!(diff_id_of(&at_12), diff_id_of(&other), "a changed line");
+        let elsewhere = compare(json!([file("b.rs", "@@ -12,2 +12,2 @@ fn f\n-old\n+new")]));
+        assert_ne!(diff_id_of(&at_12), diff_id_of(&elsewhere), "another file");
+    }
+
+    #[test]
+    fn a_diff_github_does_not_show_whole_has_no_id() {
+        let binary =
+            |sha| json!({ "filename": "a.png", "status": "modified", "changes": 0, "sha": sha });
+        let renamed = &json!({ "filename": "b.rs", "previous_filename": "a.rs",
+            "status": "renamed", "changes": 0, "sha": "s" });
+        let id = diff_id_of(&compare(json!([binary("1"), renamed])));
+        assert!(id.is_some());
+        assert_ne!(
+            id,
+            diff_id_of(&compare(json!([binary("2"), renamed]))),
+            "another image"
+        );
+
+        let large = json!({ "filename": "big.rs", "status": "modified", "changes": 9000 });
+        assert_eq!(diff_id_of(&compare(json!([large]))), None);
+        let many: Vec<Value> = (0..COMPARE_FILES)
+            .map(|i| file(&format!("{i}.rs"), "+x"))
+            .collect();
+        assert_eq!(diff_id_of(&compare(Value::Array(many))), None);
     }
 }

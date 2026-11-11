@@ -786,9 +786,11 @@ impl Caches {
 
 /// Why a unit waits for the agent's review, the queue's first gate: each PR's review of its
 /// head, which a tick starts, then its review threads. `heads` are each layer's, bottom to top,
-/// as (PR, head, unresolved review threads).
+/// as (PR, head, unresolved review threads). A head that changes what an approved one did, as a
+/// layer that a restack moved onto new layers below, keeps that approval.
 async fn review_hold(
     ctx: &Ctx,
+    gh: &dyn GitHub,
     key: &LaneKey,
     review: &ReviewSettings,
     stacked: bool,
@@ -798,7 +800,7 @@ async fn review_hold(
     if !review.enabled {
         return Ok(None);
     }
-    for &(number, head, unresolved) in heads {
+    for (i, &(number, head, unresolved)) in heads.iter().enumerate() {
         let latest = ctx
             .store
             .latest_review(key.installation_id, &key.repo, number)
@@ -823,13 +825,45 @@ async fn review_hold(
                 }
             }
             _ => {
-                let r = ctx
-                    .store
-                    .start_review(key.installation_id, &key.repo, number, head)
-                    .await?;
-                // Woken by the caller once the lane is saved: a PR just queued is in it then.
-                *started = true;
-                r.status
+                // A layer's own changes start at the layer below.
+                let base = match i {
+                    0 => key.trunk.as_str(),
+                    _ => heads[i - 1].1,
+                };
+                let diff_id = match gh.diff_id(&key.repo, base, head).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(repo = %key.repo, pr = number, error = %format!("{e:#}"), "could not read the PR's diff");
+                        None
+                    }
+                };
+                let carried = match &diff_id {
+                    Some(id) => {
+                        ctx.store
+                            .carry_unchanged(key.installation_id, &key.repo, number, head, id)
+                            .await?
+                    }
+                    None => false,
+                };
+                if carried {
+                    let why = "its changes are those of the head it approved";
+                    record(ctx, key, number, "review-carried", why).await?;
+                    ReviewStatus::Approved
+                } else {
+                    let r = ctx
+                        .store
+                        .start_review(
+                            key.installation_id,
+                            &key.repo,
+                            number,
+                            head,
+                            diff_id.as_deref(),
+                        )
+                        .await?;
+                    // Woken by the caller once the lane is saved: a PR just queued is in it then.
+                    *started = true;
+                    r.status
+                }
             }
         };
         if let Some(hold) = Hold::of_reviews(stacked, [(number, status)]) {
@@ -1149,8 +1183,16 @@ async fn sync_lane(
                     false => (pr.number, pr.head_ref_oid.as_str(), pr.unresolved_threads),
                 })
                 .collect();
-            let hold =
-                review_hold(ctx, key, &read.review, unit.stacked, &heads, &mut started).await?;
+            let hold = review_hold(
+                ctx,
+                gh,
+                key,
+                &read.review,
+                unit.stacked,
+                &heads,
+                &mut started,
+            )
+            .await?;
             if hold.is_none() {
                 withdraw_change_requests(gh, repo, &unit.layers).await;
             }
@@ -1182,6 +1224,14 @@ async fn sync_lane(
                 fix_budget: match unit.fork() {
                     true => 0,
                     false => settings.fix_ci.allowed(),
+                },
+                stack: match unit.stacked {
+                    true => unit
+                        .layers
+                        .iter()
+                        .map(|pr| (pr.number, pr.summary()).into())
+                        .collect(),
+                    false => Vec::new(),
                 },
                 ..unit.layers[0].summary()
             },
@@ -2961,7 +3011,8 @@ async fn run_job(
                 } else if let Some(reason) = {
                     let mut started = false;
                     let hold =
-                        review_hold(ctx, key, review, now.stacked, &reviewed, &mut started).await?;
+                        review_hold(ctx, gh, key, review, now.stacked, &reviewed, &mut started)
+                            .await?;
                     if started {
                         ctx.reviews.notify_one();
                     }

@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- PROTOTYPE, throw away: stack variants for the queue. `pnpm prototype:stack`. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stack prototype</title>
+    <script>
+      const dark = new URLSearchParams(location.search).get("theme") === "dark";
+      document.documentElement.classList.toggle("dark", dark);
+    </script>
+  </head>
+  <body class="bg-page text-sm text-fg antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/prototype/StackQueue.prototype.tsx"></script>
+  </body>
+</html>

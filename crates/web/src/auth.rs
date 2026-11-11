@@ -57,7 +57,7 @@ const RECHECK: i64 = 3600;
 const MAX_STALE: i64 = 8 * 3600;
 /// How long one request holds a session it checks. A check that dies lets go after it.
 const CHECK_HOLD: i64 = 60;
-/// How long the menu bar app has to trade its one-time code.
+/// How long an MCP client has to trade its one-time code.
 const LOGIN_CODE: i64 = 120;
 const SETUP_SESSION: Duration = Duration::from_secs(3600);
 /// GitHub gives the manifest flow one hour.
@@ -1167,7 +1167,7 @@ fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// The browser's cookie, or the menu bar app's `Authorization: Bearer` header.
+/// The browser's cookie, or an MCP client's `Authorization: Bearer` header.
 pub(crate) fn session_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)

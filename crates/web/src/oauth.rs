@@ -1,6 +1,6 @@
 //! OAuth for MCP clients, as the MCP spec's authorization asks: MergeLoop is the authorization
 //! server, and signs the user in with GitHub. The access token is a MergeLoop session, as the
-//! menu bar app's is, so the user's GitHub token stays on the server.
+//! dashboard's is, so the user's GitHub token stays on the server.
 //!
 //! Clients register themselves (RFC 7591), and must redirect to a loopback address (RFC 8252):
 //! the code never leaves the user's machine, so no consent screen has to guard it.

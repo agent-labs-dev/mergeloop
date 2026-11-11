@@ -438,7 +438,7 @@ pub struct Session {
     pub github: Option<Sealed>,
 }
 
-/// A one-time code that hands a session to the menu bar app.
+/// A one-time code that hands a session to an MCP client, in OAuth's code flow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoginCode {
     pub token_hash: String,

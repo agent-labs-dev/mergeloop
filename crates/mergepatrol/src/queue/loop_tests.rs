@@ -1151,9 +1151,6 @@ impl ReviewStore for Mem {
         }
         Ok(())
     }
-    async fn set_asked(&self, _: i64, _: &[String]) -> Result<()> {
-        unreachable!()
-    }
     async fn answer_review(&self, _: i64, _: &ReviewAnswers) -> Result<bool> {
         unreachable!()
     }

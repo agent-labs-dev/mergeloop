@@ -60,8 +60,6 @@ export const startManifest = (body: ManifestRequest) =>
 
 export const logout = () => call("POST", "/auth/logout");
 
-/** The user's open PRs, and those that ask for their review, across their workspaces. */
-
 /** Workspace endpoints: `id` is the installation ID. */
 const w = (id: number, path: string) => `/api/w/${id}${path}`;
 

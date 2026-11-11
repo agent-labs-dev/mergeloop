@@ -26,8 +26,8 @@ Anthropic's models, Codex for OpenAI's, on the workspace's own key):
 3. **Your `verify` commands run** before anything is pushed.
 4. **The checks run again.** The PR keeps its place at the head of the queue meanwhile.
 
-The fix is a normal commit on the PR, so the author and reviewers see exactly what changed, and
-the dashboard shows the diff of every commit the fix agent pushed.
+The fix is a normal commit on the PR, so the author and reviewers see exactly what changed on
+GitHub.
 
 ## When it gives up
 

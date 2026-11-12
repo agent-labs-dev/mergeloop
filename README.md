@@ -354,6 +354,9 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `claim_build` | Claims one task for you to build, in a repo you may push to | Yes |
 | `heartbeat_build` | Says you still work on a build you claimed | Yes |
 | `release_build` | Gives a build back, or marks it stuck with a reason | Yes |
+| `mint_push_token` | A token that pushes to the repo of a build you hold, and nothing else | Yes |
+| `open_build_pr` | Has the App open the PR of a build you hold, once its branch is pushed | Yes |
+| `report_build` | Says whether the PR of a build you hold is landing, waiting on a human, or merged | Yes |
 | `get_billing` | The workspace's plan and seats | Yes |
 | `start_checkout` | A Stripe page to subscribe | Yes |
 | `open_billing_portal` | A Stripe page to manage the subscription | Yes |

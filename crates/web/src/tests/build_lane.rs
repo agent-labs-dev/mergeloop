@@ -17,6 +17,14 @@ struct Hub {
     config: Option<String>,
     /// The writes: method, path, body.
     writes: Vec<(String, String, String)>,
+    /// GitHub tokens that lost push access to `o/r`.
+    revoked: Vec<String>,
+    /// The bodies of scoped token mints.
+    mints: Vec<Value>,
+    /// `o/r`'s open PRs: number, head branch.
+    prs: Vec<(u64, String)>,
+    /// What opened each PR: the token, and the body sent.
+    opened: Vec<(String, Value)>,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -35,7 +43,35 @@ async fn github(hub: Shared) -> GitHub {
         let push = |yes: bool| (200, json!({ "permissions": { "push": yes } }).to_string());
         match (call.method, call.path) {
             ("GET", "/rate_limit") => (200, "{}".into()),
-            ("GET", "/repos/o/r") => push(matches!(call.token, "ghu_ana" | "ghu_ben")),
+            ("GET", "/repos/o/r") => push(
+                matches!(call.token, "ghu_ana" | "ghu_ben")
+                    && !hub.revoked.iter().any(|t| t == call.token),
+            ),
+            ("POST", "/app/installations/1/access_tokens") => {
+                hub.mints.push(serde_json::from_str(call.body).unwrap());
+                (201, json!({ "token": "ghs_push", "expires_at": "2026-11-12T13:00:00Z" }).to_string())
+            }
+            ("GET", path) if path.starts_with("/repos/o/r/pulls?state=open&head=o:") => {
+                let branch = &path["/repos/o/r/pulls?state=open&head=o:".len()..];
+                let open: Vec<Value> = hub
+                    .prs
+                    .iter()
+                    .filter(|(_, head)| head == branch)
+                    .map(|(n, _)| json!({ "number": n, "html_url": format!("https://github.com/o/r/pull/{n}") }))
+                    .collect();
+                (200, Value::from(open).to_string())
+            }
+            ("POST", "/repos/o/r/pulls") => {
+                let body: Value = serde_json::from_str(call.body).unwrap();
+                let head = body["head"].as_str().unwrap().to_owned();
+                if hub.prs.iter().any(|(_, h)| *h == head) {
+                    return (422, r#"{"message":"A pull request already exists"}"#.into());
+                }
+                let number = 40 + hub.prs.len() as u64;
+                hub.prs.push((number, head));
+                hub.opened.push((call.token.into(), body));
+                (201, json!({ "number": number }).to_string())
+            }
             ("GET", "/repos/o/y") => push(true),
             ("POST", "/graphql") => {
                 let file = hub.config.as_ref().map(|text| json!({ "object": { "text": text } }));
@@ -149,6 +185,52 @@ fn shared(labeled: Vec<Value>) -> Shared {
     }))
 }
 
+/// `who` calls `/builds/{build}/{what}` with the build's claim and `body`'s fields.
+async fn on_build(
+    router: &Router,
+    who: &str,
+    claimed: &Value,
+    what: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let path = format!("/builds/{}/{what}", claimed["build"]);
+    let mut body = body;
+    body["claim"] = claimed["claim"].clone();
+    call(router, who, "POST", &path, body).await
+}
+
+async fn mint(router: &Router, who: &str, claimed: &Value) -> (StatusCode, Value) {
+    on_build(router, who, claimed, "token", json!({})).await
+}
+
+async fn open_pr(router: &Router, who: &str, claimed: &Value) -> (StatusCode, Value) {
+    let body = json!({ "title": "Add the thing", "body": "It adds the thing.\n" });
+    on_build(router, who, claimed, "pr", body).await
+}
+
+async fn report(
+    router: &Router,
+    who: &str,
+    claimed: &Value,
+    standing: &str,
+) -> (StatusCode, Value) {
+    on_build(
+        router,
+        who,
+        claimed,
+        "report",
+        json!({ "standing": standing }),
+    )
+    .await
+}
+
+async fn age_claims(pool: &PgPool) {
+    sqlx::query("UPDATE builds SET heartbeat_at = now() - interval '31 minutes'")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 #[sqlx::test(migrations = false)]
 async fn with_the_lane_off_every_lane_route_refuses(pool: PgPool) {
     let hub = shared(vec![issue(1, &[])]);
@@ -172,6 +254,9 @@ async fn with_the_lane_off_every_lane_route_refuses(pool: PgPool) {
         )
         .await,
         release(&router, "ana", &fake, None).await,
+        mint(&router, "ana", &fake).await,
+        open_pr(&router, "ana", &fake).await,
+        report(&router, "ana", &fake, "merged").await,
     ] {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
@@ -486,4 +571,303 @@ async fn only_a_signed_in_member_of_the_workspace_may_claim(pool: PgPool) {
     let res = send(&router, token).await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     assert!(hub.lock().unwrap().writes.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_holder_gets_a_token_for_its_one_repo_that_pushes_and_opens_prs(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+
+    let (status, token) = mint(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::OK, "{token}");
+    assert_eq!(
+        token,
+        json!({ "token": "ghs_push", "expires_at": "2026-11-12T13:00:00Z" })
+    );
+    assert_eq!(
+        hub.lock().unwrap().mints,
+        [json!({
+            "repositories": ["r"],
+            "permissions": { "contents": "write", "pull_requests": "write" },
+        })]
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn no_token_without_a_live_claim_held_by_the_caller_who_may_push(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    let refused = |(status, body): (StatusCode, Value), want: StatusCode, says: &str| {
+        assert_eq!(status, want, "{body}");
+        assert!(body.as_str().unwrap().contains(says), "{body}");
+    };
+
+    refused(
+        mint(&router, "ben", &ana).await,
+        StatusCode::CONFLICT,
+        "no longer hold",
+    );
+    let older = json!({ "build": ana["build"], "claim": 0 });
+    refused(
+        mint(&router, "ana", &older).await,
+        StatusCode::CONFLICT,
+        "no longer hold",
+    );
+
+    let token = Request::post(format!("/api/w/1/builds/{}/token", ana["build"]))
+        .header("authorization", "Bearer ghu_ana")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "claim": ana["claim"] }).to_string()))
+        .unwrap();
+    assert_eq!(
+        send(&router, token).await.status(),
+        StatusCode::FORBIDDEN,
+        "a sign-in only"
+    );
+
+    hub.lock().unwrap().revoked.push("ghu_ana".into());
+    refused(
+        mint(&router, "ana", &ana).await,
+        StatusCode::FORBIDDEN,
+        "may not push",
+    );
+    hub.lock().unwrap().revoked.clear();
+
+    age_claims(&pool).await;
+    refused(
+        mint(&router, "ana", &ana).await,
+        StatusCode::CONFLICT,
+        "heartbeat",
+    );
+    assert_eq!(heartbeat(&router, "ana", &ana).await, StatusCode::OK);
+
+    let (status, _) = release(&router, "ana", &ana, None).await;
+    assert_eq!(status, StatusCode::OK);
+    refused(
+        mint(&router, "ana", &ana).await,
+        StatusCode::CONFLICT,
+        "no longer hold",
+    );
+
+    let ana = claim(&router, "ana").await;
+    call(
+        &router,
+        "ana",
+        "PUT",
+        "/settings/builds",
+        json!({ "enabled": false }),
+    )
+    .await;
+    refused(
+        mint(&router, "ana", &ana).await,
+        StatusCode::CONFLICT,
+        "build lane is off",
+    );
+    assert!(hub.lock().unwrap().mints.is_empty(), "no token was minted");
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_app_opens_the_pr_ready_labeled_assigned_and_closing_the_issue(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+
+    let (status, build) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::OK, "{build}");
+    assert_eq!(
+        (build["status"].as_str(), build["pr"].as_u64()),
+        (Some("landing"), Some(40))
+    );
+
+    let hub = hub.lock().unwrap();
+    assert_eq!(
+        hub.opened,
+        [(
+            fake::INSTALLATION_TOKEN.to_owned(),
+            json!({
+                "head": "mergeloop/build-7", "base": "trunk", "title": "Add the thing",
+                "body": "It adds the thing.\n\nCloses #7", "draft": false,
+            })
+        )]
+    );
+    let pr_writes: Vec<(&str, &str)> = hub
+        .writes
+        .iter()
+        .filter(|(_, path, _)| path.starts_with("/repos/o/r/issues/40/"))
+        .map(|(_, path, body)| (path.as_str(), body.as_str()))
+        .collect();
+    assert_eq!(
+        pr_writes,
+        [
+            ("/repos/o/r/issues/40/labels", r#"{"labels":["mergeloop"]}"#),
+            ("/repos/o/r/issues/40/assignees", r#"{"assignees":["ana"]}"#),
+        ]
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn opening_twice_or_after_a_lost_answer_opens_one_pr(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    // The PR was opened, but its answer never came back.
+    hub.lock()
+        .unwrap()
+        .prs
+        .push((40, "mergeloop/build-7".into()));
+
+    let (_, first) = open_pr(&router, "ana", &ana).await;
+    let (status, second) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        (first["pr"].as_u64(), second["pr"].as_u64()),
+        (Some(40), Some(40))
+    );
+    let hub = hub.lock().unwrap();
+    assert!(hub.opened.is_empty(), "{:?}", hub.opened);
+    assert_eq!(hub.prs.len(), 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_the_holder_opens_the_pr_with_a_title(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+
+    assert_eq!(open_pr(&router, "ben", &ana).await.0, StatusCode::CONFLICT);
+    let blank = on_build(
+        &router,
+        "ana",
+        &ana,
+        "pr",
+        json!({ "title": " ", "body": "" }),
+    )
+    .await;
+    assert_eq!(blank.0, StatusCode::BAD_REQUEST);
+    assert!(hub.lock().unwrap().opened.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_holder_reports_waiting_then_merged_which_ends_the_build(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+
+    let (status, body) = report(&router, "ana", &ana, "merged").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.as_str().unwrap().contains("no PR"), "{body}");
+
+    open_pr(&router, "ana", &ana).await;
+    let (status, waiting) = report(&router, "ana", &ana, "waiting").await;
+    assert_eq!(
+        (status, waiting["status"].as_str()),
+        (StatusCode::OK, Some("waiting"))
+    );
+    let (_, mine) = call(&router, "ana", "GET", "/builds?mine=true", Value::Null).await;
+    assert_eq!(
+        mine.as_array().unwrap().len(),
+        1,
+        "a waiting build is still Ana's"
+    );
+    let (_, landing) = report(&router, "ana", &ana, "landing").await;
+    assert_eq!(landing["status"], "landing");
+    let (_, merged) = report(&router, "ana", &ana, "merged").await;
+    assert_eq!(
+        (merged["status"].as_str(), merged["pr"].as_u64()),
+        (Some("merged"), Some(40))
+    );
+
+    assert_eq!(
+        heartbeat(&router, "ana", &ana).await,
+        StatusCode::CONFLICT,
+        "it is over"
+    );
+    assert_eq!(mint(&router, "ana", &ana).await.0, StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_build_with_a_pr_survives_its_issue_closing_and_the_lane_off_and_on(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    open_pr(&router, "ana", &ana).await;
+
+    let mut closed = issue(7, &[]);
+    closed["state"] = "closed".into();
+    deliver(&router, "closed", closed).await;
+    let mut unlabeled = issue(7, &[]);
+    unlabeled["labels"] = json!([]);
+    deliver(&router, "unlabeled", unlabeled).await;
+    call(
+        &router,
+        "ana",
+        "PUT",
+        "/settings/builds",
+        json!({ "enabled": false }),
+    )
+    .await;
+    turn_on(&router).await;
+    hub.lock().unwrap().labeled.clear();
+    assert_eq!(
+        claim(&router, "ben").await,
+        Value::Null,
+        "a sync keeps it too"
+    );
+
+    assert_eq!(heartbeat(&router, "ana", &ana).await, StatusCode::OK);
+    let (_, builds) = call(&router, "ana", "GET", "/builds", Value::Null).await;
+    assert_eq!(builds[0]["status"], "landing");
+    assert_eq!(builds[0]["pr"], 40);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stale_build_with_a_pr_is_claimed_with_its_pr_and_fences_out_the_old_holder(
+    pool: PgPool,
+) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    open_pr(&router, "ana", &ana).await;
+    age_claims(&pool).await;
+
+    let ben = claim(&router, "ben").await;
+    assert_eq!(
+        (ben["build"].clone(), ben["pr"].as_u64()),
+        (ana["build"].clone(), Some(40))
+    );
+    assert_eq!(mint(&router, "ana", &ana).await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        report(&router, "ana", &ana, "merged").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(mint(&router, "ben", &ben).await.0, StatusCode::OK);
+    let (_, again) = open_pr(&router, "ben", &ben).await;
+    assert_eq!(again["pr"], 40, "Ben's call finds Ana's PR");
+    assert_eq!(hub.lock().unwrap().opened.len(), 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_issue_closed_while_its_build_is_claimed_cancels_the_build(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    let mut closed = issue(7, &[]);
+    closed["state"] = "closed".into();
+    deliver(&router, "closed", closed).await;
+
+    let (status, body) = on_build(&router, "ana", &ana, "heartbeat", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.as_str().unwrap().contains("closed"), "{body}");
+    assert_eq!(mint(&router, "ana", &ana).await.0, StatusCode::CONFLICT);
 }

@@ -12,7 +12,7 @@ pub mod setup;
 pub use app::fake;
 pub use app::{
     App, AsUser, GitHub, HookDelivery, Installation, InstallationInfo, RateLimited, RepoInfo,
-    revoke_token,
+    ScopedToken, revoke_token,
 };
 pub use checks::{BranchRules, CheckState, Checks};
 pub use codeowners::CodeOwners;

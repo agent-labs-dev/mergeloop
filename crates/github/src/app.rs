@@ -249,6 +249,14 @@ pub struct Installation {
     token: Arc<Mutex<Option<(String, SystemTime)>>>,
 }
 
+/// An installation token for one repo, with chosen permissions.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ScopedToken {
+    pub token: String,
+    /// When GitHub stops taking it, as RFC 3339.
+    pub expires_at: String,
+}
+
 pub(crate) struct Response {
     pub status: StatusCode,
     pub body: Value,
@@ -292,8 +300,29 @@ impl Installation {
         struct Tok {
             token: String,
         }
-        let permissions =
-            json!({ "repositories": [repo.name], "permissions": { "contents": "read" } });
+        let permissions = json!({ "contents": "read" });
+        let tok: Tok = self
+            .scoped_token(repo, permissions, "create a read-only token")
+            .await?;
+        Ok(tok.token)
+    }
+
+    /// A token that can push to `repo` and open PRs in it, and nothing else: the build lane
+    /// gives it to the daemon that holds a build there.
+    pub async fn push_token(&self, repo: &RepoName) -> Result<ScopedToken> {
+        let permissions = json!({ "contents": "write", "pull_requests": "write" });
+        self.scoped_token(repo, permissions, "create a push token")
+            .await
+    }
+
+    /// A token for `repo` alone, with `permissions` alone. GitHub ends its life after an hour.
+    async fn scoped_token<T: DeserializeOwned>(
+        &self,
+        repo: &RepoName,
+        permissions: Value,
+        what: &str,
+    ) -> Result<T> {
+        let body = json!({ "repositories": [repo.name], "permissions": permissions });
         let mint = || async {
             Ok(self
                 .app
@@ -304,10 +333,9 @@ impl Installation {
                 ))
                 .bearer_auth(self.app.jwt()?)
                 .headers(api_headers())
-                .json(&permissions))
+                .json(&body))
         };
-        let tok: Tok = json_ok(send(mint, "create a read-only token").await?)?;
-        Ok(tok.token)
+        json_ok(send(mint, what).await?)
     }
 
     /// The repos this installation can access.

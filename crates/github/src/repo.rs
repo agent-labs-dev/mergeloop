@@ -987,11 +987,35 @@ impl Installation {
         title: &str,
         body: &str,
     ) -> Result<PrNumber> {
+        self.create_pr(repo, head, base, title, body, true).await
+    }
+
+    /// Opens a PR, ready for review, from `head` in the same repo.
+    pub async fn open_pr(
+        &self,
+        repo: &RepoName,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PrNumber> {
+        self.create_pr(repo, head, base, title, body, false).await
+    }
+
+    async fn create_pr(
+        &self,
+        repo: &RepoName,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<PrNumber> {
         let r: Value = self
             .rest(
                 Method::POST,
                 &format!("/repos/{repo}/pulls"),
-                Some(json!({ "head": head, "base": base, "title": title, "body": body, "draft": true })),
+                Some(json!({ "head": head, "base": base, "title": title, "body": body, "draft": draft })),
             )
             .await?;
         r["number"].as_u64().context("PR number")

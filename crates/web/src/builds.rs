@@ -1,13 +1,16 @@
 //! The build lane: a workspace's labeled issues are tasks, which a signed-in developer's daemon
-//! claims one at a time, in repos GitHub says they may push to, builds, and gives back or marks
-//! stuck. The lane is off until a workspace turns it on.
+//! claims one at a time, in repos GitHub says they may push to, builds, pushes with a token
+//! minted for its claim, has the App open a PR for, and lands, or gives back or marks stuck.
+//! The lane is off until a workspace turns it on.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use mergepatrol_core::{RepoName, RepoSettings};
-use mergepatrol_github::{ConfigFile, Installation, Issue};
-use mergepatrol_store::{Build, BuildSettings, BuildStatus, Claimed, Holder, IssueTask, Stage};
+use mergepatrol_github::{ConfigFile, Installation, Issue, ScopedToken};
+use mergepatrol_store::{
+    Build, BuildSettings, BuildStatus, Claimed, Holder, IssueTask, Stage, Standing,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
@@ -199,9 +202,7 @@ pub(crate) async fn list_builds(
         builds
             .into_iter()
             .filter(|b| readable.contains(&b.repo))
-            .filter(|b| {
-                !mine || (b.status.held() && b.holder.as_deref() == Some(login))
-            })
+            .filter(|b| !mine || (b.status.held() && b.holder.as_deref() == Some(login)))
             .map(BuildView::from)
             .collect(),
     ))
@@ -405,12 +406,17 @@ async fn claimed_view(
         title: build.title.clone(),
         body: build.body.clone(),
         default_branch,
-        branch: format!("mergeloop/build-{}", build.issue),
+        branch: branch(build.issue),
         verify: settings.verify,
         author,
         co_author,
         pr: build.pr,
     })
+}
+
+/// The branch a build is pushed to, and its PR opened from.
+fn branch(issue: u64) -> String {
+    format!("mergeloop/build-{issue}")
 }
 
 /// The issue's assignees only mirror the claims, so a failure to change them fails nothing.
@@ -520,9 +526,243 @@ fn lost(build: u64) -> ApiError {
     ApiError::Status(
         StatusCode::CONFLICT,
         format!(
-            "You no longer hold build {build}: it was given back, or its claim went stale and someone else took it. Stop working on it."
+            "You no longer hold build {build}: it was given back or is over, its issue was closed or lost its label before it had a PR, or its claim went stale and someone else took it. Stop working on it."
         ),
     )
+}
+
+/// The build `user` holds with `claim`, in a workspace whose lane is on.
+async fn held(
+    app: &AppState,
+    caller: &Caller,
+    id: u64,
+    build: u64,
+    claim: u64,
+) -> Result<(u64, Build), ApiError> {
+    let user = caller.user()?;
+    let id = user.workspace(id)?;
+    require_lane(app, id).await?;
+    let held = holder(id, build, user.login(), claim);
+    let build = app
+        .builds
+        .held_build(held)
+        .await?
+        .ok_or_else(|| lost(build))?;
+    Ok((id, build))
+}
+
+fn may_not_push(repo: &RepoName) -> ApiError {
+    ApiError::Status(
+        StatusCode::FORBIDDEN,
+        format!("GitHub says you may not push to {repo}. Give the build back."),
+    )
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct MintPushToken {
+    pub claim: u64,
+}
+
+/// A token for the build's repo alone, that pushes and opens PRs.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct PushTokenView {
+    pub token: String,
+    /// When GitHub stops taking it, an hour after it was made, as RFC 3339.
+    pub expires_at: String,
+}
+
+/// Gives the holder of a live claim a token for its build's repo, while GitHub says they may
+/// push there. Asks GitHub afresh: the token outlives any cached answer.
+pub(crate) async fn mint_push_token(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path((id, build)): Path<(u64, u64)>,
+    Json(body): Json<MintPushToken>,
+) -> Result<Json<PushTokenView>, ApiError> {
+    let (id, build) = held(&app, &caller, id, build, body.claim).await?;
+    require_heard(&build)?;
+    let user = caller.user()?;
+    require_push_now(&app, user, &build.repo).await?;
+    let ScopedToken { token, expires_at } = installation(&app, id)
+        .await?
+        .push_token(&build.repo)
+        .await?;
+    tracing::info!(installation = id, repo = %build.repo, issue = build.issue, login = user.login(), "minted a push token");
+    Ok(Json(PushTokenView { token, expires_at }))
+}
+
+/// A claim unheard for `STALE_SECS` is anyone's to take: it is no live claim.
+fn require_heard(build: &Build) -> Result<(), ApiError> {
+    if build.heard_secs.is_some_and(|s| s < STALE_SECS) {
+        return Ok(());
+    }
+    Err(ApiError::Status(
+        StatusCode::CONFLICT,
+        format!(
+            "Build {} was not heard from for 30 minutes, so anyone may claim it. Heartbeat it with `heartbeat_build`, then ask again.",
+            build.id
+        ),
+    ))
+}
+
+/// GitHub says `user` may push to `repo`, asked now and not from a cache.
+async fn require_push_now(
+    app: &AppState,
+    user: &SignedIn,
+    repo: &RepoName,
+) -> Result<(), ApiError> {
+    let token = user.github_token(app)?;
+    match app
+        .github
+        .as_user(&token)?
+        .can_write(&repo.to_string())
+        .await?
+    {
+        true => Ok(()),
+        false => Err(may_not_push(repo)),
+    }
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct OpenBuildPr {
+    pub claim: u64,
+    pub title: String,
+    /// What the PR does. `Closes #<issue>` is added to it.
+    pub body: String,
+}
+
+/// The App opens the build's PR from its pushed branch into the default branch, ready for
+/// review, labels it so it queues, and assigns the developer. Every step is safe to repeat: a
+/// build has one PR, found again by its number or by its branch.
+pub(crate) async fn open_build_pr(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path((id, build)): Path<(u64, u64)>,
+    Json(body): Json<OpenBuildPr>,
+) -> Result<Json<BuildView>, ApiError> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("Give the PR a title."));
+    }
+    let (id, build) = held(&app, &caller, id, build, body.claim).await?;
+    let user = caller.user()?;
+    if !user.may_push(&app, &build.repo).await? {
+        return Err(may_not_push(&build.repo));
+    }
+    let pr = queued_pr(&app, id, &build, user.login(), title, &body.body).await?;
+    let held = holder(id, build.id, user.login(), body.claim);
+    let landing = app
+        .builds
+        .opened_pr(held, pr)
+        .await?
+        .ok_or_else(|| lost(build.id))?;
+    tracing::info!(installation = id, repo = %build.repo, issue = build.issue, pr, login = user.login(), "opened a build's PR");
+    Ok(Json(landing.into()))
+}
+
+/// The build's PR, opened unless it has one, labeled so it queues, and assigned to `login`.
+async fn queued_pr(
+    app: &AppState,
+    id: u64,
+    build: &Build,
+    login: &str,
+    title: &str,
+    body: &str,
+) -> Result<u64, ApiError> {
+    let gh = installation(app, id).await?;
+    let (settings, base) = settings(app, &gh, id, &build.repo).await?;
+    let body = format!("{}\n\nCloses #{}", body.trim_end(), build.issue);
+    let pr = match build.pr {
+        Some(pr) => pr,
+        None => opened(&gh, build, &base, title, body.trim_start()).await?,
+    };
+    gh.add_label(&build.repo, pr, &settings.label).await?;
+    mirror(gh.assign(&build.repo, pr, login).await, build, "assign");
+    Ok(pr)
+}
+
+/// A new PR from the build's branch, or the one open from it already: GitHub refuses a second,
+/// and one opened by a call whose answer was lost, or by a racing call, is found by its branch.
+async fn opened(
+    gh: &Installation,
+    build: &Build,
+    base: &str,
+    title: &str,
+    body: &str,
+) -> Result<u64, ApiError> {
+    let (repo, head) = (&build.repo, branch(build.issue));
+    match gh.open_pr(repo, &head, base, title, body).await {
+        Ok(pr) => Ok(pr),
+        Err(e) => match gh.open_pr_from(repo, &head).await? {
+            Some(open) => Ok(open.number),
+            None => Err(ApiError::Status(
+                StatusCode::CONFLICT,
+                format!(
+                    "GitHub would not open a PR from {head} into {base}. Is the branch pushed? {e:#}"
+                ),
+            )),
+        },
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum StandingView {
+    /// You act on what the queue needs of the PR's author.
+    Landing,
+    /// The PR waits on a human.
+    Waiting,
+    /// The PR merged: the build is over.
+    Merged,
+}
+
+impl From<StandingView> for Standing {
+    fn from(s: StandingView) -> Self {
+        match s {
+            StandingView::Landing => Self::Landing,
+            StandingView::Waiting => Self::Waiting,
+            StandingView::Merged => Self::Merged,
+        }
+    }
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct ReportBuild {
+    pub claim: u64,
+    pub standing: StandingView,
+}
+
+/// The holder says how the build's PR stands.
+pub(crate) async fn report_build(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path((id, build)): Path<(u64, u64)>,
+    Json(body): Json<ReportBuild>,
+) -> Result<Json<BuildView>, ApiError> {
+    let (id, build) = held(&app, &caller, id, build, body.claim).await?;
+    if build.pr.is_none() {
+        return Err(ApiError::Status(
+            StatusCode::CONFLICT,
+            format!(
+                "Build {} has no PR yet: open it with `open_build_pr` first.",
+                build.id
+            ),
+        ));
+    }
+    let login = caller.user()?.login();
+    let held = holder(id, build.id, login, body.claim);
+    let reported = app
+        .builds
+        .report_build(held, body.standing.into())
+        .await?
+        .ok_or_else(|| lost(build.id))?;
+    tracing::info!(installation = id, repo = %reported.repo, issue = reported.issue, login, status = reported.status.as_str(), "reported a build");
+    Ok(Json(reported.into()))
 }
 
 /// An `issues` delivery: keeps the issue's build in step with it, while the lane is on and the

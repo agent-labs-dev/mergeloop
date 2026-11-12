@@ -2035,7 +2035,9 @@ impl RepoUpdateView {
 /// An error, for a user reading an outcome rather than a failed request.
 fn reason(e: ApiError, fallback: &str) -> String {
     match e {
-        ApiError::Status(_, why) | ApiError::GitHubLimited(_, why) => why,
+        ApiError::Status(_, why) | ApiError::Refused(_, why) | ApiError::GitHubLimited(_, why) => {
+            why
+        }
         ApiError::Internal(e) => {
             tracing::error!(error = %format!("{e:#}"), "{fallback}");
             fallback.to_owned()

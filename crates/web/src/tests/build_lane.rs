@@ -1421,3 +1421,76 @@ async fn merged_is_taken_only_when_github_says_the_pr_merged(pool: PgPool) {
         (StatusCode::OK, Some("merged"))
     );
 }
+
+/// `who` calls `tool` through `/mcp`, signed in: the tool's result.
+async fn mcp_tool(router: &Router, who: &str, tool: &str, args: Value) -> Value {
+    let message = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": tool, "arguments": args },
+    });
+    let req = Request::post("/mcp")
+        .header("authorization", format!("Bearer {who}"))
+        .header("content-type", "application/json")
+        .body(Body::from(message.to_string()))
+        .unwrap();
+    let res = send(router, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone()
+}
+
+/// What kind of refusal a tool's result says it is: its route's status, and the refusal's name
+/// when the route named one.
+fn refusal(result: &Value) -> (Value, Value) {
+    assert_eq!(result["isError"], true, "{result}");
+    (
+        result["_meta"]["status"].clone(),
+        result["_meta"]["refusal"].clone(),
+    )
+}
+
+#[sqlx::test(migrations = false)]
+async fn mcp_says_which_refusal_a_daemon_must_act_on(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[]), issue(8, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    let on = |claimed: &Value| json!({ "workspace": 1, "build": claimed["build"], "claim": claimed["claim"] });
+
+    let off = mcp_tool(&router, "ana", "claim_build", json!({ "workspace": 1 })).await;
+    assert_eq!(refusal(&off), (json!(409), json!("lane_off")));
+
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    let ok = mcp_tool(&router, "ana", "heartbeat_build", on(&ana)).await;
+    assert_eq!(ok["isError"], false, "{ok}");
+    assert!(ok.get("_meta").is_none(), "{ok}");
+
+    hub.lock().unwrap().revoked.push("ghu_ana".into());
+    let barred = mcp_tool(&router, "ana", "mint_push_token", on(&ana)).await;
+    assert_eq!(refusal(&barred), (json!(403), json!("may_not_push")));
+    hub.lock().unwrap().revoked.clear();
+
+    age_claims(&pool).await;
+    let unheard = mcp_tool(&router, "ana", "mint_push_token", on(&ana)).await;
+    assert_eq!(refusal(&unheard), (json!(409), json!("unheard")));
+
+    let lost = mcp_tool(&router, "ben", "heartbeat_build", on(&ana)).await;
+    assert_eq!(refusal(&lost), (json!(409), json!("lost")));
+
+    let ana = claim(&router, "ana").await;
+    let mut closed = issue(ana["issue"].as_u64().unwrap(), &[]);
+    closed["state"] = "closed".into();
+    deliver(&router, "closed", closed).await;
+    let cancelled = mcp_tool(&router, "ana", "heartbeat_build", on(&ana)).await;
+    assert_eq!(refusal(&cancelled), (json!(409), json!("cancelled")));
+
+    let blank = mcp_tool(
+        &router,
+        "ana",
+        "release_build",
+        json!({ "workspace": 1, "build": ana["build"], "claim": ana["claim"], "stuck": " " }),
+    )
+    .await;
+    assert_eq!(refusal(&blank), (json!(400), Value::Null));
+}

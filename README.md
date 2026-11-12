@@ -279,6 +279,8 @@ When the file does not parse, the queue pauses, and **Settings** shows why, unti
 
 MergeLoop serves an MCP server at `/mcp`, so a coding agent can do anything the dashboard does: queue a PR, take it out, read where it is and what it needs next, read the agent's review and the queue's history, change a repo's settings. Reviews, approvals and comments happen on GitHub, with `gh`. Every call acts as a GitHub user or bot: MergeLoop puts the labels on, comments, and reviews with their token, so GitHub checks they may.
 
+A tool that refuses answers `isError: true` with the reason as text, and `_meta.status`, the HTTP status its route answered. A refusal a client must act on also names its kind in `_meta.refusal`: `lane_off` (the build lane is off), `lost` (you no longer hold the build), `cancelled` (its issue stopped being a task: give it back), `unheard` (heartbeat it, then ask again), `may_not_push` (give it back).
+
 The hosted endpoint is `https://mergeloop.ai/mcp`. It uses sessionless streamable HTTP: each POST carries one JSON-RPC message, with JSON responses to requests. GET returns `405 Method Not Allowed`. Use the endpoint directly: following a redirect from the old host can break POST requests.
 
 An MCP client that supports OAuth signs in with GitHub in the browser, as the dashboard does:

@@ -17,7 +17,7 @@ use ts_rs::TS;
 
 use crate::api::installation;
 use crate::auth::{Caller, Readable, SignedIn};
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, Refusal};
 
 /// A claim not heard from for this long may be claimed again, by anyone.
 const STALE_SECS: u64 = 30 * 60;
@@ -79,8 +79,8 @@ async fn require_lane(app: &AppState, id: u64) -> Result<(), ApiError> {
     if lane_on(app, id).await? {
         return Ok(());
     }
-    Err(ApiError::Status(
-        StatusCode::CONFLICT,
+    Err(ApiError::Refused(
+        Refusal::LaneOff,
         "The build lane is off for this workspace. Turn it on in its settings, or with `set_build_settings`.".into(),
     ))
 }
@@ -563,8 +563,8 @@ async fn released_on_github(gh: &Installation, released: &Build, login: &str, st
 }
 
 fn lost(build: u64) -> ApiError {
-    ApiError::Status(
-        StatusCode::CONFLICT,
+    ApiError::Refused(
+        Refusal::Lost,
         format!(
             "You no longer hold build {build}: it was given back or is over, or its claim went stale and someone else took it. Stop working on it."
         ),
@@ -573,8 +573,8 @@ fn lost(build: u64) -> ApiError {
 
 /// The holder of a build without a PR whose issue stopped being a task may only give it back.
 fn cancelled(build: u64) -> ApiError {
-    ApiError::Status(
-        StatusCode::CONFLICT,
+    ApiError::Refused(
+        Refusal::Cancelled,
         format!(
             "Build {build}'s issue was closed or lost its label before the build had a PR. Give it back with `release_build`, and stop working on it."
         ),
@@ -605,8 +605,8 @@ async fn held(
 }
 
 fn may_not_push(repo: &RepoName) -> ApiError {
-    ApiError::Status(
-        StatusCode::FORBIDDEN,
+    ApiError::Refused(
+        Refusal::MayNotPush,
         format!("GitHub says you may not push to {repo}. Give the build back."),
     )
 }
@@ -672,8 +672,8 @@ fn require_heard(build: &Build) -> Result<(), ApiError> {
     if build.heard_secs.is_some_and(|s| s < STALE_SECS) {
         return Ok(());
     }
-    Err(ApiError::Status(
-        StatusCode::CONFLICT,
+    Err(ApiError::Refused(
+        Refusal::Unheard,
         format!(
             "Build {} was not heard from for 30 minutes, so anyone may claim it. Heartbeat it with `heartbeat_build`, then ask again.",
             build.id

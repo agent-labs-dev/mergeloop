@@ -141,9 +141,46 @@ fn serve(state: AppState) -> Router {
 enum ApiError {
     /// A message for the user.
     Status(StatusCode, String),
+    /// A message for the user, of a kind a client acts on: MCP names it beside the text.
+    Refused(Refusal, String),
     /// GitHub's rate limit is used up, until this much later.
     GitHubLimited(std::time::Duration, String),
     Internal(anyhow::Error),
+}
+
+/// The refusals a daemon must tell apart, because each asks something different of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The workspace's build lane is off: wait, and ask again later.
+    LaneOff,
+    /// The caller no longer holds the build: stop working on it.
+    Lost,
+    /// The build's issue stopped being a task before it had a PR: give it back.
+    Cancelled,
+    /// The build went unheard too long: heartbeat it, then ask again.
+    Unheard,
+    /// GitHub says the caller may not push to the repo: give the build back.
+    MayNotPush,
+}
+
+impl Refusal {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::MayNotPush => StatusCode::FORBIDDEN,
+            Self::LaneOff | Self::Lost | Self::Cancelled | Self::Unheard => StatusCode::CONFLICT,
+        }
+    }
+
+    /// Its name in MCP's answer.
+    fn name(self) -> &'static str {
+        match self {
+            Self::LaneOff => "lane_off",
+            Self::Lost => "lost",
+            Self::Cancelled => "cancelled",
+            Self::Unheard => "unheard",
+            Self::MayNotPush => "may_not_push",
+        }
+    }
 }
 
 impl ApiError {
@@ -155,6 +192,7 @@ impl ApiError {
     fn message(&self) -> String {
         match self {
             Self::Status(code, m) => format!("{code}: {m}"),
+            Self::Refused(r, m) => format!("{}: {m}", r.status()),
             Self::GitHubLimited(_, m) => m.clone(),
             Self::Internal(e) => format!("{e:#}"),
         }
@@ -174,6 +212,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             Self::Status(code, m) => (code, m).into_response(),
+            // MCP reads the refusal back from the response's extensions.
+            Self::Refused(r, m) => (r.status(), axum::Extension(r), m).into_response(),
             Self::GitHubLimited(wait, m) => {
                 let secs = wait.as_secs().max(1).to_string();
                 let retry = [(axum::http::header::RETRY_AFTER, secs)];

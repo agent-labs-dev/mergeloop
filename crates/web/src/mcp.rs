@@ -16,7 +16,7 @@ use tower::ServiceExt;
 
 use crate::auth::{Caller, bearer_caller, percent_encode};
 use crate::routes::{self, Route, Tool, Ty};
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, Refusal};
 
 /// The newest first: the protocol versions this server speaks.
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -113,15 +113,31 @@ async fn call(app: &AppState, caller: &Caller, bearer: &str, params: &Value) -> 
         },
         None => Err(ApiError::bad_request(&format!("No tool {name}."))),
     };
-    let (text, is_error) = match result {
-        Ok(text) => (text, false),
-        Err(ApiError::Status(_, m) | ApiError::GitHubLimited(_, m)) => (m, true),
-        Err(ApiError::Internal(e)) => {
+    let e = match result {
+        Ok(text) => {
+            return json!({ "content": [{ "type": "text", "text": text }], "isError": false });
+        }
+        Err(e) => e,
+    };
+    // What a client acts on rides in `_meta`: the route's status, and the refusal's kind.
+    let (status, refusal, text) = match e {
+        ApiError::Status(status, m) => (status, None, m),
+        ApiError::Refused(r, m) => (r.status(), Some(r.name()), m),
+        ApiError::GitHubLimited(_, m) => (StatusCode::SERVICE_UNAVAILABLE, None, m),
+        ApiError::Internal(e) => {
             tracing::error!(error = %format!("{e:#}"), tool = name, "MCP error");
-            ("Internal error.".into(), true)
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                "Internal error.".into(),
+            )
         }
     };
-    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+    let mut meta = json!({ "status": status.as_u16() });
+    if let Some(refusal) = refusal {
+        meta["refusal"] = refusal.into();
+    }
+    json!({ "content": [{ "type": "text", "text": text }], "isError": true, "_meta": meta })
 }
 
 /// The tool's call to its route: the path parameters from their arguments, and the others as
@@ -225,13 +241,15 @@ async fn answer(app: &AppState, req: Request<Body>) -> Result<String, ApiError> 
         .await
         .unwrap_or_else(|e| match e {});
     let status = res.status();
+    let refusal = res.extensions().get::<Refusal>().copied();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    match (status.is_success(), text.is_empty()) {
-        (true, true) => Ok("Done.".into()),
-        (true, false) => Ok(text),
-        (false, _) => Err(ApiError::Status(status, text)),
+    match (status.is_success(), text.is_empty(), refusal) {
+        (true, true, _) => Ok("Done.".into()),
+        (true, false, _) => Ok(text),
+        (false, _, Some(r)) => Err(ApiError::Refused(r, text)),
+        (false, _, None) => Err(ApiError::Status(status, text)),
     }
 }

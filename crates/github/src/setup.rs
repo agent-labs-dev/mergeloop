@@ -34,8 +34,9 @@ impl AppCredentials {
 }
 
 /// The webhook events that wake a repo's queue: its PRs, reviews, checks, and trunk moves. And
-/// what people say on a PR, where the agent's review is answered.
-pub const WEBHOOK_EVENTS: [&str; 13] = [
+/// what people say on a PR, where the agent's review is answered, and the issues labeled for the
+/// build lane.
+pub const WEBHOOK_EVENTS: [&str; 14] = [
     "pull_request",
     "pull_request_review",
     "pull_request_review_comment",
@@ -53,6 +54,8 @@ pub const WEBHOOK_EVENTS: [&str; 13] = [
     "repository_ruleset",
     // The repo's settings: the merge methods it allows.
     "repository",
+    // Issues labeled for the build lane: its tasks.
+    "issues",
 ];
 
 /// The App that MergeLoop needs. GitHub only delivers webhooks to a public URL, so on

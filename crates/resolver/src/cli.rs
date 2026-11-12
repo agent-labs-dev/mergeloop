@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdout, Command};
 
 /// Sends `cmd`'s calls to `url` around the job's egress proxy. Claude Code sends plain HTTP
 /// through `HTTPS_PROXY` too, and the proxy only lets out the hosts on its allowlist.
@@ -60,7 +60,7 @@ pub(crate) async fn stream(
     let stdout = child.stdout.take().context("stdout")?;
     // Drain stderr as it comes, so a full pipe never blocks the CLI.
     let mut stderr = child.stderr.take().context("stderr")?;
-    let mut stderr = tokio::spawn(async move {
+    let stderr = tokio::spawn(async move {
         let mut err = String::new();
         let _ = stderr.read_to_string(&mut err).await;
         err
@@ -69,39 +69,14 @@ pub(crate) async fn stream(
         tokio::fs::create_dir_all(dir).await?;
     }
     let mut transcript = tokio::fs::File::create(transcript_path).await?;
-
-    // The outer error is reading the CLI, the inner one `on_event` stopping it. Reading ends at
-    // the end of the output, or `DRAIN` after the CLI exited.
     let mut exited = None;
-    let read = async {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut drain = None;
-        loop {
-            let line = match drain {
-                None => tokio::select! {
-                    line = lines.next_line() => line?,
-                    status = child.wait() => {
-                        exited = Some(status?);
-                        drain = Some(tokio::time::Instant::now() + DRAIN);
-                        continue;
-                    }
-                },
-                Some(until) => tokio::time::timeout_at(until, lines.next_line())
-                    .await
-                    .unwrap_or(Ok(None))?,
-            };
-            let Some(line) = line else {
-                return anyhow::Ok(Ok(()));
-            };
-            transcript.write_all(line.as_bytes()).await?;
-            transcript.write_all(b"\n").await?;
-            if let Ok(event) = serde_json::from_str::<Value>(&line)
-                && let Err(e) = on_event(&event)
-            {
-                return Ok(Err(e));
-            }
-        }
-    };
+    let read = read(
+        stdout,
+        &mut child,
+        &mut exited,
+        &mut transcript,
+        &mut on_event,
+    );
     match tokio::time::timeout(timeout, read).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => return Ok(Ended::Stopped(format!("{e:#}"))),
@@ -116,12 +91,55 @@ pub(crate) async fn stream(
         Some(status) => status,
         None => child.wait().await?,
     };
-    let err = match tokio::time::timeout(DRAIN, &mut stderr).await {
-        Ok(err) => err?,
+    Ok(Ended::Exited(status, drained(stderr).await?))
+}
+
+/// Reads the CLI's events into `transcript` and `on_event`, until its output ends, or `DRAIN`
+/// after it exited (noted in `exited`). The outer error is reading the CLI, the inner one
+/// `on_event` stopping it.
+async fn read(
+    stdout: ChildStdout,
+    child: &mut Child,
+    exited: &mut Option<ExitStatus>,
+    transcript: &mut tokio::fs::File,
+    on_event: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<Result<()>> {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut drain = None;
+    loop {
+        let line = match drain {
+            None => tokio::select! {
+                line = lines.next_line() => line?,
+                status = child.wait() => {
+                    *exited = Some(status?);
+                    drain = Some(tokio::time::Instant::now() + DRAIN);
+                    continue;
+                }
+            },
+            Some(until) => tokio::time::timeout_at(until, lines.next_line())
+                .await
+                .unwrap_or(Ok(None))?,
+        };
+        let Some(line) = line else {
+            return Ok(Ok(()));
+        };
+        transcript.write_all(line.as_bytes()).await?;
+        transcript.write_all(b"\n").await?;
+        if let Ok(event) = serde_json::from_str::<Value>(&line)
+            && let Err(e) = on_event(&event)
+        {
+            return Ok(Err(e));
+        }
+    }
+}
+
+/// What the CLI wrote to stderr, or nothing when what it left running holds it open.
+async fn drained(mut stderr: tokio::task::JoinHandle<String>) -> Result<String> {
+    match tokio::time::timeout(DRAIN, &mut stderr).await {
+        Ok(err) => Ok(err?),
         Err(_) => {
             stderr.abort();
-            String::new()
+            Ok(String::new())
         }
-    };
-    Ok(Ended::Exited(status, err))
+    }
 }

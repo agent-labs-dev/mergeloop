@@ -25,9 +25,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use mergepatrol_analytics::WorkspaceInfo;
 use mergepatrol_core::RepoName;
+use mergepatrol_github::AppCredentials;
 use mergepatrol_github::setup::{self, Pkce, random_token};
 use mergepatrol_github::setup::{Revoked, UserInstallation, UserToken};
-use mergepatrol_github::{App, AppCredentials};
 use mergepatrol_store::{GITHUB_APP, LoginCode, Scope, Sealed, Session, SessionKind, Workspace};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -329,7 +329,12 @@ impl Caller {
         // Only a yes is kept: one just made admin need not wait.
         let admin = match state.seen.admins.get(&key) {
             Some(admin) => admin,
-            None => match setup::can_admin(token, &repo.to_string()).await {
+            None => match state
+                .github
+                .as_user(token)?
+                .can_admin(&repo.to_string())
+                .await
+            {
                 Ok(admin) => admin,
                 Err(e) if e.is::<Revoked>() => return Err(token_refused()),
                 Err(e) => return Err(e.into()),
@@ -374,7 +379,12 @@ impl Caller {
         let token = self.github_token(state)?;
         let key = (hash(&token), repo.clone());
         if state.seen.reads.get(&key).is_none() {
-            match setup::can_read(&token, &repo.to_string()).await {
+            match state
+                .github
+                .as_user(&token)?
+                .can_read(&repo.to_string())
+                .await
+            {
                 Ok(true) => state.seen.reads.put(key, ()),
                 Ok(false) => return Err(no_repo(repo)),
                 Err(e) if e.is::<Revoked>() => return Err(token_refused()),
@@ -448,7 +458,7 @@ async fn token_works(state: &AppState, token: &str) -> Result<bool, ApiError> {
     if state.seen.tokens.get(&key).is_some() {
         return Ok(true);
     }
-    if !setup::token_works(token).await? {
+    if !state.github.as_user(token)?.token_works().await? {
         return Ok(false);
     }
     state.seen.tokens.put(key, ());
@@ -475,7 +485,7 @@ async fn installation_of(
     if let Some(id) = state.seen.installations.get(repo) {
         return Ok(id);
     }
-    let app = App::from_credentials(creds)?;
+    let app = state.github.app(creds)?;
     let id = app.installation_for(repo).await?.map(|gh| gh.id);
     state.seen.installations.put(repo.clone(), id);
     Ok(id)
@@ -860,7 +870,11 @@ pub(crate) async fn login_callback(
             .ok_or_else(|| anyhow::anyhow!("no GitHub App yet"))?;
         let user_token =
             setup::exchange_code(&creds, &code, &callback_url(&state), verifier).await?;
-        let user = setup::user(&user_token.access_token).await?;
+        let user = state
+            .github
+            .as_user(&user_token.access_token)?
+            .user()
+            .await?;
         let installations = setup::user_installations(&user_token.access_token).await?;
         save_workspaces(&state, &installations).await?;
         destination = install_destination(&headers, &installations);

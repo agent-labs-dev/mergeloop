@@ -1225,7 +1225,7 @@ pub(crate) async fn github_app(app: &AppState) -> Result<App, ApiError> {
         .app_credentials()
         .await?
         .ok_or_else(|| ApiError::Status(StatusCode::CONFLICT, "No GitHub App yet.".into()))?;
-    Ok(App::from_credentials(&creds)?)
+    Ok(app.github.app(&creds)?)
 }
 
 pub(crate) async fn set_repo(

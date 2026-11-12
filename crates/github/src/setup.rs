@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::AsUser;
+
 const API: &str = "https://api.github.com";
 
 /// What GitHub returns when it creates the App. Stored encrypted.
@@ -309,14 +311,6 @@ pub struct GithubUser {
     pub avatar_url: String,
 }
 
-pub async fn user(token: &str) -> Result<GithubUser> {
-    Ok(user_get(token, "/user")
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
 /// An installation of the App that a signed-in user can access.
 #[derive(Clone, Debug)]
 pub struct UserInstallation {
@@ -385,8 +379,13 @@ pub async fn user_installation_repos(token: &str, id: u64) -> Result<Vec<String>
 
 /// A 401 is `Revoked`: GitHub no longer takes the token.
 async fn user_get(token: &str, path: &str) -> Result<reqwest::Response> {
-    let res = client()?
-        .get(format!("{API}{path}"))
+    get_as(&client()?, format!("{API}{path}"), token).await
+}
+
+/// As [`user_get`], with any client at any URL.
+async fn get_as(http: &reqwest::Client, url: String, token: &str) -> Result<reqwest::Response> {
+    let res = http
+        .get(url)
         .bearer_auth(token)
         .header("accept", "application/vnd.github+json")
         .send()
@@ -458,49 +457,63 @@ pub struct LineComment<'a> {
     pub body: String,
 }
 
-/// Whether GitHub takes the token, of any kind: `/rate_limit` answers every token, and costs
-/// none of its rate limit.
-pub async fn token_works(token: &str) -> Result<bool> {
-    match user_get(token, "/rate_limit").await {
-        Ok(res) => {
-            res.error_for_status()?;
-            Ok(true)
+/// What GitHub says of a user's token.
+impl AsUser {
+    /// A 401 is `Revoked`: GitHub no longer takes the token.
+    async fn get(&self, path: &str) -> Result<reqwest::Response> {
+        get_as(&self.http, format!("{}{path}", self.api), &self.token).await
+    }
+
+    /// The token's user.
+    pub async fn user(&self) -> Result<GithubUser> {
+        Ok(self.get("/user").await?.error_for_status()?.json().await?)
+    }
+
+    /// Whether GitHub takes the token, of any kind: `/rate_limit` answers every token, and
+    /// costs none of its rate limit.
+    pub async fn token_works(&self) -> Result<bool> {
+        match self.get("/rate_limit").await {
+            Ok(res) => {
+                res.error_for_status()?;
+                Ok(true)
+            }
+            Err(e) if e.is::<Revoked>() => Ok(false),
+            Err(e) => Err(e),
         }
-        Err(e) if e.is::<Revoked>() => Ok(false),
-        Err(e) => Err(e),
     }
-}
 
-/// Whether the token can read `repo`. GitHub answers 404 for a private repo it cannot.
-/// `Revoked` when GitHub does not take the token.
-pub async fn can_read(token: &str, repo: &str) -> Result<bool> {
-    let res = user_get(token, &format!("/repos/{repo}")).await?;
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
+    /// Whether the token can read `repo`. GitHub answers 404 for a private repo it cannot.
+    /// `Revoked` when GitHub does not take the token.
+    pub async fn can_read(&self, repo: &str) -> Result<bool> {
+        let res = self.get(&format!("/repos/{repo}")).await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        res.error_for_status()?;
+        Ok(true)
     }
-    res.error_for_status()?;
-    Ok(true)
-}
 
-/// Whether the token's user may push to the repo. An App's installation token, as a workflow's
-/// `GITHUB_TOKEN` is, names no user: no.
-pub async fn can_write(token: &str, repo: &str) -> Result<bool> {
-    has_permission(token, repo, "push").await
-}
-
-/// Whether the token's user administers the repo. An App's installation token names no user: no.
-pub async fn can_admin(token: &str, repo: &str) -> Result<bool> {
-    has_permission(token, repo, "admin").await
-}
-
-/// Whether GitHub gives the token's user `permission` on the repo, as `/repos/{repo}` says.
-async fn has_permission(token: &str, repo: &str, permission: &str) -> Result<bool> {
-    let res = user_get(token, &format!("/repos/{repo}")).await?;
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
+    /// Whether the token's user may push to the repo. An App's installation token, as a
+    /// workflow's `GITHUB_TOKEN` is, names no user: no.
+    pub async fn can_write(&self, repo: &str) -> Result<bool> {
+        self.has_permission(repo, "push").await
     }
-    let repo: Value = res.error_for_status()?.json().await?;
-    Ok(repo["permissions"][permission] == true)
+
+    /// Whether the token's user administers the repo. An App's installation token names no
+    /// user: no.
+    pub async fn can_admin(&self, repo: &str) -> Result<bool> {
+        self.has_permission(repo, "admin").await
+    }
+
+    /// Whether GitHub gives the token's user `permission` on the repo, as `/repos/{repo}` says.
+    async fn has_permission(&self, repo: &str, permission: &str) -> Result<bool> {
+        let res = self.get(&format!("/repos/{repo}")).await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let repo: Value = res.error_for_status()?.json().await?;
+        Ok(repo["permissions"][permission] == true)
+    }
 }
 
 /// A 401 is `Revoked`, a 403 `Refused`.
@@ -591,5 +604,26 @@ mod tests {
     #[test]
     fn pkce_challenge_is_43_chars() {
         assert_eq!(Pkce::new().challenge.len(), 43);
+    }
+
+    #[tokio::test]
+    async fn a_token_may_push_where_github_says_its_user_may() {
+        let github = crate::fake::github(|call| match (call.token, call.path) {
+            ("ghp_dev", "/repos/o/r") => (200, r#"{"permissions":{"push":true}}"#.into()),
+            ("ghp_guest", "/repos/o/r") => (200, r#"{"permissions":{"push":false}}"#.into()),
+            ("ghp_dev", "/user") => (200, r#"{"login":"ana","avatar_url":""}"#.into()),
+            _ => (404, "{}".into()),
+        })
+        .await;
+        let may = |token: &str, repo: &str| {
+            let user = github.as_user(token).unwrap();
+            let repo = repo.to_owned();
+            async move { user.can_write(&repo).await.unwrap() }
+        };
+        assert!(may("ghp_dev", "o/r").await);
+        assert!(!may("ghp_guest", "o/r").await);
+        assert!(!may("ghp_dev", "o/private").await);
+        let user = github.as_user("ghp_dev").unwrap().user().await.unwrap();
+        assert_eq!(user.login, "ana");
     }
 }

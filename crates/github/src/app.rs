@@ -448,8 +448,8 @@ impl Installation {
 /// A client that acts as a signed-in user, on the user's own rate limit, not the installation's:
 /// for what the dashboard reads on the user's behalf.
 pub struct AsUser {
-    http: reqwest::Client,
-    api: String,
+    pub(crate) http: reqwest::Client,
+    pub(crate) api: String,
     pub(crate) token: String,
 }
 
@@ -501,6 +501,39 @@ impl AsUser {
                 .json(&body))
         };
         graphql_data(name, None, true, send(build, "POST /graphql").await?)
+    }
+}
+
+/// Where the server reaches GitHub: GitHub itself. Only a test's fake ([`fake::github`]) answers
+/// in its place, so nothing else can point the server at another API.
+#[derive(Clone, Default)]
+pub struct GitHub {
+    /// The fake's address.
+    #[cfg(any(test, feature = "testing"))]
+    fake: Option<String>,
+}
+
+impl GitHub {
+    /// The App its credentials name.
+    pub fn app(&self, credentials: &crate::AppCredentials) -> Result<App> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(api) = &self.fake {
+            return Ok(fake::app(api.clone()));
+        }
+        App::from_credentials(credentials)
+    }
+
+    /// The user whose token this is.
+    pub fn as_user(&self, token: &str) -> Result<AsUser> {
+        let user = AsUser::new(token.to_owned())?;
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(api) = &self.fake {
+            return Ok(AsUser {
+                api: api.clone(),
+                ..user
+            });
+        }
+        Ok(user)
     }
 }
 
@@ -752,7 +785,7 @@ pub mod fake {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{App, AsUser, Installation};
+    use super::{App, AsUser, GitHub, Installation};
 
     /// A response: status, extra header lines, body.
     pub type Scripted = (u16, &'static str, &'static str);
@@ -809,6 +842,41 @@ pub mod fake {
     pub async fn answered_by(
         answer: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> Installation {
+        installation(listen(move |call| answer(call.method, call.path, call.body)).await)
+    }
+
+    /// The token of every installation of the App that [`github`] fakes.
+    pub const INSTALLATION_TOKEN: &str = "t";
+
+    /// A request to the fake.
+    pub struct Call<'a> {
+        /// The bearer token it came with: a user's, [`INSTALLATION_TOKEN`], or the App's JWT.
+        pub token: &'a str,
+        pub method: &'a str,
+        pub path: &'a str,
+        pub body: &'a str,
+    }
+
+    /// A GitHub whose App and users talk to `answer`, for a test of the server. It mints each
+    /// installation's own token itself, as [`INSTALLATION_TOKEN`]; a token scoped by a body is
+    /// `answer`'s.
+    pub async fn github(answer: impl Fn(&Call) -> (u16, String) + Send + Sync + 'static) -> GitHub {
+        let api = listen(move |call| {
+            let mints = call.method == "POST"
+                && call.path.starts_with("/app/installations/")
+                && call.path.ends_with("/access_tokens")
+                && call.body.is_empty();
+            if mints {
+                return (201, format!(r#"{{"token":"{INSTALLATION_TOKEN}"}}"#));
+            }
+            answer(&call)
+        })
+        .await;
+        GitHub { fake: Some(api) }
+    }
+
+    /// Answers each request to its address, which it returns, as `answer` says.
+    async fn listen(answer: impl Fn(Call) -> (u16, String) + Send + Sync + 'static) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         let answer = Arc::new(answer);
@@ -821,7 +889,20 @@ pub mod fake {
                     let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
                     let mut line = head.lines().next().unwrap_or_default().split(' ');
                     let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
-                    let (status, body) = answer(method, path, body);
+                    let token = head
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().strip_prefix("Bearer "))?
+                        })
+                        .unwrap_or("");
+                    let (status, body) = answer(Call {
+                        token,
+                        method,
+                        path,
+                        body,
+                    });
                     let response = format!(
                         "HTTP/1.1 {status} Answered\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
@@ -830,21 +911,28 @@ pub mod fake {
                 });
             }
         });
-        installation(api)
+        api
     }
 
-    fn installation(api: String) -> Installation {
-        let app = App {
+    /// The App, at the fake: its JWT is signed with a key the fake does not check.
+    pub(super) fn app(api: String) -> App {
+        App {
             app_id: 1,
             key: Arc::new(jsonwebtoken::EncodingKey::from_secret(b"unused")),
             http: reqwest::Client::new(),
             api,
             alg: jsonwebtoken::Algorithm::HS256,
-        };
-        let token = Some(("t".into(), SystemTime::now() + Duration::from_secs(3600)));
+        }
+    }
+
+    fn installation(api: String) -> Installation {
+        let token = Some((
+            INSTALLATION_TOKEN.into(),
+            SystemTime::now() + Duration::from_secs(3600),
+        ));
         Installation {
             id: 1,
-            app,
+            app: app(api),
             token: Arc::new(tokio::sync::Mutex::new(token)),
         }
     }

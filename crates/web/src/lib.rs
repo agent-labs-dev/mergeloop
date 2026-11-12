@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use mergepatrol_analytics::Analytics;
 use mergepatrol_billing::Billing;
 use mergepatrol_core::RepoSettings;
-use mergepatrol_github::AppCredentials;
+use mergepatrol_github::{AppCredentials, GitHub};
 use mergepatrol_resolver::ChatGptAuth;
 use mergepatrol_store::{GITHUB_APP, Scope, Store, Vault};
 use secrecy::ExposeSecret;
@@ -78,6 +78,8 @@ struct AppState {
     seen: Arc<auth::Seen>,
     /// The `/api/v1` calls each caller has left.
     budgets: Arc<v1::Budgets>,
+    /// Where GitHub is: a fake in tests.
+    github: GitHub,
 }
 
 impl AppState {
@@ -114,6 +116,7 @@ fn state(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> AppStat
         chatgpt: config.chatgpt,
         seen: Arc::default(),
         budgets: Arc::default(),
+        github: GitHub::default(),
     }
 }
 
@@ -167,6 +170,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use mergepatrol_core::RepoName;
+    use mergepatrol_github::fake;
     use mergepatrol_github::setup::{Pkce, UserToken};
     use mergepatrol_store::{LoginCode, PgStore, Session, SessionKind};
     use sqlx::PgPool;
@@ -211,6 +215,21 @@ mod tests {
     }
 
     async fn with_config(pool: PgPool, config: WebConfig) -> (Router, String) {
+        (
+            serve(signed_in_state(pool, config).await),
+            "mp_session=tok".into(),
+        )
+    }
+
+    /// As `signed_in`, with the GitHub App set up, and GitHub answered by `github`.
+    async fn with_github(pool: PgPool, github: GitHub) -> (Router, String) {
+        let config = web_config(Some(app(None)), Arc::default());
+        let mut state = signed_in_state(pool, config).await;
+        state.github = github;
+        (serve(state), "mp_session=tok".into())
+    }
+
+    async fn signed_in_state(pool: PgPool, config: WebConfig) -> AppState {
         let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
         let vault = Arc::new(Vault::new(store.clone(), KEY).unwrap());
         let expires_at = (std::time::SystemTime::now()
@@ -248,7 +267,7 @@ mod tests {
         for token in ["ghu_tok", "ghu_x"] {
             state.seen.assume_repos(token, 1, &READABLE);
         }
-        (serve(state), "mp_session=tok".into())
+        state
     }
 
     fn web_config(hosted_app: Option<AppCredentials>, wake: Arc<Woken>) -> WebConfig {
@@ -2328,5 +2347,74 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
         let error = text_of(res).await;
         assert!(error.contains("spans a workspace"), "{error}");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_repos_listed_are_those_a_faked_github_gives_the_installation(pool: PgPool) {
+        let github = fake::github(|call| match (call.token, call.path) {
+            (fake::INSTALLATION_TOKEN, "/installation/repositories?per_page=100&page=1") => (
+                200,
+                r#"{"repositories":[{"full_name":"o/r","private":false},{"full_name":"o/unread","private":true}]}"#.into(),
+            ),
+            _ => (404, "{}".into()),
+        })
+        .await;
+        let (router, cookie) = with_github(pool, github).await;
+        let req = Request::get("/api/w/1/repos").header("cookie", cookie);
+        let res = send(&router, req.body(Body::empty()).unwrap()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let repos = json_of(res).await;
+        let names: Vec<&str> = repos
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["repo"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["o/r"]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_token_is_checked_against_a_faked_github(pool: PgPool) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let heard = calls.clone();
+        let github = fake::github(move |call| {
+            heard
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", call.token, call.path));
+            let permissions = |admin: bool| {
+                (
+                    200,
+                    format!(r#"{{"permissions":{{"push":true,"admin":{admin}}}}}"#),
+                )
+            };
+            match (call.token, call.path) {
+                (_, "/rate_limit") => (200, "{}".into()),
+                ("ghp_admin", "/repos/o/r") => permissions(true),
+                ("ghp_dev", "/repos/o/r") => permissions(false),
+                (_, "/repos/o/r/installation") => (200, r#"{"id":1}"#.into()),
+                _ => (404, "{}".into()),
+            }
+        })
+        .await;
+        let (router, _) = with_github(pool, github).await;
+        let set = |token: &str| {
+            let req = Request::put("/api/w/1/repos/o/r")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":true}"#))
+                .unwrap();
+            send(&router, req)
+        };
+
+        let res = set("ghp_dev").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(text_of(res).await, "You need admin access to o/r for this.");
+        assert_eq!(set("ghp_admin").await.status(), StatusCode::NO_CONTENT);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.contains(&"ghp_admin /repos/o/r".to_owned()),
+            "{calls:?}"
+        );
     }
 }

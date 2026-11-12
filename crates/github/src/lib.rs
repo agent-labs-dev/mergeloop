@@ -10,7 +10,8 @@ pub mod setup;
 #[cfg(any(test, feature = "testing"))]
 pub use app::fake;
 pub use app::{
-    App, AsUser, HookDelivery, Installation, InstallationInfo, RateLimited, RepoInfo, revoke_token,
+    App, AsUser, GitHub, HookDelivery, Installation, InstallationInfo, RateLimited, RepoInfo,
+    revoke_token,
 };
 pub use checks::{BranchRules, CheckState, Checks};
 pub use codeowners::CodeOwners;

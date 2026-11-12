@@ -259,7 +259,14 @@ mod tests {
         std::fs::write(decoy.join("secret"), "DECOY").unwrap();
         std::os::unix::fs::symlink(decoy.join("secret"), room.tree.join("link")).unwrap();
         let access = Access::workspace(std::slice::from_ref(&decoy));
-        check(&access).await.unwrap();
+        if let Err(e) = check(&access).await {
+            // A Linux runner may have no working bubblewrap; macOS always has sandbox-exec.
+            if !cfg!(target_os = "linux") {
+                panic!("{e:#}");
+            }
+            eprintln!("skipped: {e:#}");
+            return;
+        }
         let (_g, groups) = groups();
         let confined = |commands: &[String]| {
             let commands = commands.to_vec();

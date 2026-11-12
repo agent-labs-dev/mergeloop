@@ -392,6 +392,15 @@ fn hostile(ws: &Path, fired: &Path, session: &Path) -> String {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hostile_verify_command_writes_only_its_own_tree_and_reads_no_session() {
+    let probe = mergepatrol_resolver::Access::workspace(&[]);
+    if let Err(e) = mergeloop_cli::daemon::verify::check(&probe).await {
+        // A Linux runner may have no working bubblewrap; macOS always has sandbox-exec.
+        if !cfg!(target_os = "linux") {
+            panic!("{e:#}");
+        }
+        eprintln!("skipped: {e:#}");
+        return;
+    }
     let w = World::new().await;
     let fired = w.root().join("fired");
     std::fs::create_dir_all(&fired).unwrap();

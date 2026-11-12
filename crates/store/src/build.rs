@@ -1,5 +1,9 @@
 //! The build lane's tasks: one per labeled open issue of a workspace with the lane on, which a
 //! developer's daemon claims, builds, opens a PR for and lands, or gives back or marks stuck.
+//!
+//! A build records whether its issue is a task, and webhooks and syncs change that record: they
+//! never delete a build, so a held one keeps its holder and its PR, and a sync that began before
+//! a webhook's write leaves that row be.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -26,10 +30,10 @@ pub enum BuildStatus {
     Landing,
     /// A daemon holds it, and its PR waits on a human.
     Waiting,
-    /// Its holder gave up, and said why. A human takes the label off and on to make it a task
-    /// again.
+    /// Its holder gave up, and said why. A human puts the label on again to make it a task
+    /// again, with its PR if it has one.
     Stuck,
-    /// Its PR merged. Gone once its issue is no task, which the merge closes.
+    /// Its PR merged.
     Merged,
 }
 
@@ -127,6 +131,8 @@ pub struct Build {
     pub title: String,
     pub body: String,
     pub assignees: Vec<String>,
+    /// Its issue is a task: open, with the repo's label.
+    pub task: bool,
     pub status: BuildStatus,
     /// Who holds the claim, or held it last.
     pub holder: Option<String>,
@@ -141,6 +147,18 @@ pub struct Build {
     /// Why it is stuck.
     pub reason: Option<String>,
 }
+
+impl Build {
+    /// Its holder may go on with it: its issue is still a task, or it has a PR, which lands
+    /// whatever its issue does.
+    pub fn live(&self) -> bool {
+        self.task || self.pr.is_some()
+    }
+}
+
+/// When a sync of a repo began: it writes only to builds that no webhook or sync wrote since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncStart(String);
 
 /// A build just claimed, and who held it before, when a stale claim was taken over.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,41 +188,56 @@ pub trait BuildStore: Send + Sync {
         installation_id: u64,
         settings: &BuildSettings,
     ) -> Result<()>;
-    /// The issue is a task: adds it, or updates its title, body and assignees. A claimed or
-    /// stuck build stays so.
+    /// The issue is a task: adds it, or updates its title, body and assignees. A held or stuck
+    /// build stays so.
     async fn upsert_task(
         &self,
         installation_id: u64,
         repo: &RepoName,
         issue: &IssueTask,
     ) -> Result<()>;
-    /// The issue is no task now: drops its build unless it has a PR that is still landing. A
-    /// claimed build is dropped too: the issue's own event cancels it, and its holder learns so
-    /// at its next call.
+    /// The issue's label was put on again: a stuck build of it is a task again, with its PR if
+    /// it has one, for whoever claims it next.
+    async fn relabeled(&self, installation_id: u64, repo: &RepoName, issue: u64) -> Result<()>;
+    /// The issue is no task now. Its build stays, with its holder and PR: it is claimed no more,
+    /// and its holder may go on only if it has a PR.
     async fn drop_task(&self, installation_id: u64, repo: &RepoName, issue: u64) -> Result<()>;
-    /// `issues` are all the repo's tasks: upserts each, and drops the others that no daemon
-    /// holds. A list read a moment ago may race a claim, so it never cancels one.
+    /// `issues` are the repo's tasks as GitHub listed them after `since`: upserts each, and,
+    /// when the list is `complete`, makes every other build no task. Leaves be every build a
+    /// webhook or sync wrote after `since`, so an older list never undoes a newer write.
     async fn sync_tasks(
         &self,
         installation_id: u64,
         repo: &RepoName,
+        since: &SyncStart,
         issues: &[IssueTask],
+        complete: bool,
     ) -> Result<()>;
     /// Whether to read the repo's labeled issues now: they were last read over `every_secs`
-    /// ago, or never. A yes marks them read, so one caller of many reads them.
+    /// ago, or never. A yes marks them read, so one caller of many reads them, and says when.
     async fn take_sync(
         &self,
         installation_id: u64,
         repo: &RepoName,
         every_secs: u64,
+    ) -> Result<Option<SyncStart>>;
+    /// The stuck build `build`, stuck with `claim`, is a task again if its issue is one and
+    /// one of `labeled_at` (RFC 3339) is after it got stuck. Whether it is.
+    async fn relabeled_since_stuck(
+        &self,
+        installation_id: u64,
+        build: u64,
+        claim: u64,
+        labeled_at: &[String],
     ) -> Result<bool>;
     /// The repos with a build that some caller could claim: ready, or held and stale.
     async fn claimable_repos(&self, installation_id: u64, stale_secs: u64)
     -> Result<Vec<RepoName>>;
-    /// Gives `login` one build in `repos`, atomically: a ready one assigned to them, else a
-    /// ready one assigned to no one, else a held one whose holder was last heard from over
-    /// `stale_secs` ago or gave it back, which keeps its status and PR. Never a ready one
-    /// assigned to someone else.
+    /// Gives `login` one build in `repos` whose issue is a task, atomically: a ready one
+    /// assigned to them, else a ready one assigned to no one, else a held one whose holder was
+    /// last heard from over `stale_secs` ago or gave it back, which keeps its status and PR.
+    /// Never a ready one assigned to someone else. Taking back one's own keeps what its claim
+    /// assigned.
     async fn claim_build(
         &self,
         installation_id: u64,
@@ -218,14 +251,16 @@ pub trait BuildStore: Send + Sync {
         holder: Holder<'_>,
         stage: Option<Stage>,
     ) -> Result<Option<Build>>;
-    /// The holder gives the build back, or marks it stuck with a reason. `None` when it holds
-    /// the claim no more. Giving back a build without a PR makes it ready, and takes away the
-    /// assignee the claim added; giving back one with a PR leaves it as it is, for anyone to
-    /// take at once.
+    /// The holder gives the build back, or marks it stuck with a reason, and holds it no more.
+    /// `None` when it held the claim no more. Giving back a build without a PR makes it ready,
+    /// and takes away the assignee the claim added; giving back one with a PR leaves it as it
+    /// is, for anyone to take at once.
     async fn release_build(&self, holder: Holder<'_>, stuck: Option<&str>)
     -> Result<Option<Build>>;
     /// The build, while `holder` holds it.
     async fn held_build(&self, holder: Holder<'_>) -> Result<Option<Build>>;
+    /// Whether `holder` holds a live build, in a workspace whose lane is on, all read at once.
+    async fn holds(&self, holder: Holder<'_>) -> Result<bool>;
     /// The holder opened PR `pr` for the build: it is landing. `None` when it holds the claim
     /// no more, or the build has another PR.
     async fn opened_pr(&self, holder: Holder<'_>, pr: u64) -> Result<Option<Build>>;
@@ -239,7 +274,7 @@ pub trait BuildStore: Send + Sync {
 /// What every read of a build selects.
 macro_rules! columns {
     () => {
-        "id, installation_id, repo, issue, title, body, assignees, status, holder, mirrored, claim,
+        "id, installation_id, repo, issue, title, body, assignees, task, status, holder, mirrored, claim,
          stage, pr, reason, EXTRACT(EPOCH FROM now() - heartbeat_at)::BIGINT AS heard_secs"
     };
 }
@@ -282,6 +317,7 @@ fn build(r: &sqlx::postgres::PgRow) -> Result<Build> {
         title: r.get("title"),
         body: r.get("body"),
         assignees: r.get("assignees"),
+        task: r.get("task"),
         status: BuildStatus::parse(r.get("status"))?,
         holder: r.get("holder"),
         mirrored: r.get("mirrored"),
@@ -295,18 +331,36 @@ fn build(r: &sqlx::postgres::PgRow) -> Result<Build> {
     })
 }
 
-const UPSERT_TASK: &str =
-    "INSERT INTO builds (installation_id, repo, issue, title, body, assignees)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (installation_id, repo, issue) DO UPDATE SET title = excluded.title,
-        body = excluded.body, assignees = excluded.assignees, updated_at = now()";
+/// Adds or updates a task; `$7`, a sync's start, guards a sync's write.
+macro_rules! upsert_task {
+    ($guard:literal) => {
+        concat!(
+            "INSERT INTO builds (installation_id, repo, issue, title, body, assignees)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (installation_id, repo, issue) DO UPDATE SET title = excluded.title,
+               body = excluded.body, assignees = excluded.assignees, task = true,
+               task_at = now(), updated_at = now()",
+            $guard
+        )
+    };
+}
+
+/// A stuck build made a task again: ready, or, with a PR, landing and free to take.
+macro_rules! unstuck {
+    () => {
+        "UPDATE builds SET status = CASE WHEN pr IS NULL THEN 'ready' ELSE 'landing' END,
+           reason = NULL, stuck_at = NULL, stage = NULL, heartbeat_at = NULL, updated_at = now()
+         WHERE status = 'stuck' AND task AND installation_id = $1"
+    };
+}
 
 fn upsert<'q>(
+    sql: &'static str,
     installation_id: u64,
     repo: &'q str,
     issue: &'q IssueTask,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    sqlx::query(UPSERT_TASK)
+    sqlx::query(sql)
         .bind(installation_id as i64)
         .bind(repo)
         .bind(issue.number as i64)
@@ -359,16 +413,29 @@ impl BuildStore for PgStore {
         repo: &RepoName,
         issue: &IssueTask,
     ) -> Result<()> {
-        upsert(installation_id, &repo.to_string(), issue)
+        upsert(upsert_task!(""), installation_id, &repo.to_string(), issue)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn relabeled(&self, installation_id: u64, repo: &RepoName, issue: u64) -> Result<()> {
+        sqlx::query(concat!(unstuck!(), " AND repo = $2 AND issue = $3"))
+            .bind(installation_id as i64)
+            .bind(repo.to_string())
+            .bind(issue as i64)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
     async fn drop_task(&self, installation_id: u64, repo: &RepoName, issue: u64) -> Result<()> {
+        // A build that was never a task still records that it is none: a sync that began
+        // earlier must not make it one.
         sqlx::query(
-            "DELETE FROM builds WHERE installation_id = $1 AND repo = $2 AND issue = $3
-               AND status NOT IN ('landing', 'waiting')",
+            "INSERT INTO builds (installation_id, repo, issue, task) VALUES ($1, $2, $3, false)
+             ON CONFLICT (installation_id, repo, issue) DO UPDATE SET task = false,
+               task_at = now(), updated_at = now()",
         )
         .bind(installation_id as i64)
         .bind(repo.to_string())
@@ -382,25 +449,45 @@ impl BuildStore for PgStore {
         &self,
         installation_id: u64,
         repo: &RepoName,
+        since: &SyncStart,
         issues: &[IssueTask],
+        complete: bool,
     ) -> Result<()> {
         let repo = repo.to_string();
         let mut tx = self.pool.begin().await?;
         for issue in issues {
-            upsert(installation_id, &repo, issue)
-                .execute(&mut *tx)
-                .await?;
+            upsert(
+                upsert_task!(" WHERE builds.task_at < $7::TIMESTAMPTZ"),
+                installation_id,
+                &repo,
+                issue,
+            )
+            .bind(&since.0)
+            .execute(&mut *tx)
+            .await?;
         }
-        let numbers: Vec<i64> = issues.iter().map(|i| i.number as i64).collect();
-        sqlx::query(concat!(
-            "DELETE FROM builds WHERE installation_id = $1 AND repo = $2
-               AND status NOT IN ",
-            held!(),
-            " AND NOT issue = ANY($3)"
-        ))
+        if complete {
+            let numbers: Vec<i64> = issues.iter().map(|i| i.number as i64).collect();
+            sqlx::query(
+                "UPDATE builds SET task = false, task_at = now(), updated_at = now()
+                 WHERE installation_id = $1 AND repo = $2 AND task
+                   AND task_at < $3::TIMESTAMPTZ AND NOT issue = ANY($4)",
+            )
+            .bind(installation_id as i64)
+            .bind(&repo)
+            .bind(&since.0)
+            .bind(&numbers)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // A day on, no sync that began before a build stopped being a task is still running:
+        // its record is no longer needed.
+        sqlx::query(
+            "DELETE FROM builds WHERE installation_id = $1 AND repo = $2 AND NOT task
+               AND status IN ('ready', 'merged') AND task_at < now() - interval '1 day'",
+        )
         .bind(installation_id as i64)
         .bind(&repo)
-        .bind(&numbers)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -412,18 +499,40 @@ impl BuildStore for PgStore {
         installation_id: u64,
         repo: &RepoName,
         every_secs: u64,
-    ) -> Result<bool> {
-        let taken = sqlx::query(
+    ) -> Result<Option<SyncStart>> {
+        let taken = sqlx::query_scalar(
             "INSERT INTO build_syncs (installation_id, repo) VALUES ($1, $2)
              ON CONFLICT (installation_id, repo) DO UPDATE SET synced_at = now()
-             WHERE build_syncs.synced_at < now() - make_interval(secs => $3)",
+             WHERE build_syncs.synced_at < now() - make_interval(secs => $3)
+             RETURNING synced_at::TEXT",
         )
         .bind(installation_id as i64)
         .bind(repo.to_string())
         .bind(every_secs as f64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(taken.map(SyncStart))
+    }
+
+    async fn relabeled_since_stuck(
+        &self,
+        installation_id: u64,
+        build: u64,
+        claim: u64,
+        labeled_at: &[String],
+    ) -> Result<bool> {
+        let done = sqlx::query(concat!(
+            unstuck!(),
+            " AND id = $2 AND claim = $3
+              AND EXISTS (SELECT 1 FROM unnest($4::TEXT[]) AS at WHERE at::TIMESTAMPTZ > stuck_at)"
+        ))
+        .bind(installation_id as i64)
+        .bind(build as i64)
+        .bind(claim as i64)
+        .bind(labeled_at)
         .execute(&self.pool)
         .await?;
-        Ok(taken.rows_affected() == 1)
+        Ok(done.rows_affected() == 1)
     }
 
     async fn claimable_repos(
@@ -432,7 +541,7 @@ impl BuildStore for PgStore {
         stale_secs: u64,
     ) -> Result<Vec<RepoName>> {
         let rows = sqlx::query(concat!(
-            "SELECT DISTINCT repo FROM builds WHERE installation_id = $1 AND (status = 'ready'
+            "SELECT DISTINCT repo FROM builds WHERE installation_id = $1 AND task AND (status = 'ready'
                OR (status IN ",
             held!(),
             " AND (heartbeat_at IS NULL
@@ -463,7 +572,7 @@ impl BuildStore for PgStore {
             "WITH pick AS (
                SELECT id AS pick_id, status AS old_status, holder AS old_holder, mirrored AS old_mirrored
                FROM builds
-               WHERE installation_id = $1 AND repo = ANY($3) AND (
+               WHERE installation_id = $1 AND repo = ANY($3) AND task AND (
                  (status = 'ready' AND (assignees = '{}' OR $2 = ANY(assignees)))
                  OR (status IN ", held!(), " AND (heartbeat_at IS NULL
                    OR heartbeat_at < now() - make_interval(secs => $4))))
@@ -472,7 +581,9 @@ impl BuildStore for PgStore {
              )
              UPDATE builds b SET
                status = CASE WHEN b.status = 'ready' THEN 'claimed' ELSE b.status END, holder = $2, claim = b.claim + 1,
-               mirrored = NOT ($2 = ANY(b.assignees)), stage = NULL, heartbeat_at = now(),
+               mirrored = CASE WHEN b.status IN ", held!(), " AND b.holder = $2 THEN b.mirrored
+                 ELSE NOT ($2 = ANY(b.assignees)) END,
+               stage = NULL, heartbeat_at = now(),
                updated_at = now()
              FROM pick WHERE b.id = pick.pick_id
              RETURNING ", columns!(), ", pick.old_status, pick.old_holder, pick.old_mirrored"
@@ -530,7 +641,8 @@ impl BuildStore for PgStore {
                 "UPDATE builds SET
                    status = CASE WHEN $5::TEXT IS NOT NULL THEN 'stuck'
                      WHEN pr IS NULL THEN 'ready' ELSE status END,
-                   reason = $5,
+                   reason = $5, stuck_at = CASE WHEN $5::TEXT IS NOT NULL THEN now() END,
+                   claim = claim + 1,
                    assignees = CASE WHEN $5::TEXT IS NULL AND pr IS NULL AND mirrored
                      THEN array_remove(assignees, holder) ELSE assignees END,
                    stage = NULL, heartbeat_at = NULL, updated_at = now()
@@ -555,6 +667,22 @@ impl BuildStore for PgStore {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(build).transpose()
+    }
+
+    async fn holds(&self, holder: Holder<'_>) -> Result<bool> {
+        let held: bool = sqlx::query_scalar(concat!(
+            "SELECT EXISTS (SELECT 1 FROM builds WHERE",
+            fence!(),
+            " AND (task OR pr IS NOT NULL) AND EXISTS (SELECT 1 FROM build_settings s
+                WHERE s.installation_id = $1 AND (s.settings->>'enabled')::BOOLEAN))"
+        ))
+        .bind(holder.installation_id as i64)
+        .bind(holder.build as i64)
+        .bind(holder.login)
+        .bind(holder.claim as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(held)
     }
 
     async fn opened_pr(&self, holder: Holder<'_>, pr: u64) -> Result<Option<Build>> {
@@ -650,6 +778,12 @@ mod tests {
             login,
             claim: b.claim,
         }
+    }
+
+    /// A complete sync of `r` that lists `issues`.
+    async fn sync(store: &PgStore, r: &RepoName, issues: &[IssueTask]) {
+        let since = store.take_sync(1, r, 0).await.unwrap().unwrap();
+        store.sync_tasks(1, r, &since, issues, true).await.unwrap();
     }
 
     /// As if the holder were last heard from `secs` ago.
@@ -852,7 +986,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_stuck_build_is_no_task_until_its_label_goes_off_and_on(pool: PgPool) {
+    async fn a_stuck_build_is_no_task_until_its_label_is_put_on_again(pool: PgPool) {
         let store = store(pool).await;
         let r = repo("o/r");
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
@@ -865,18 +999,19 @@ mod tests {
         assert_eq!(stuck.status, BuildStatus::Stuck);
         assert_eq!(stuck.reason.as_deref(), Some("tests never pass"));
         assert_eq!(claim(&store, "ben").await, None);
-        // An edit, or a sync that finds it still labeled, leaves it stuck.
+        // An edit, a sync that finds it still labeled, or the label going off, leave it stuck.
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
-        store.sync_tasks(1, &r, &[issue(1, &[])]).await.unwrap();
-        assert_eq!(claim(&store, "ben").await, None);
-
+        sync(&store, &r, &[issue(1, &[])]).await;
         store.drop_task(1, &r, 1).await.unwrap();
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        assert_eq!(claim(&store, "ben").await, None);
+
+        store.relabeled(1, &r, 1).await.unwrap();
         assert_eq!(claim(&store, "ben").await.map(|b| b.issue), Some(1));
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_sync_keeps_the_listed_tasks_and_claims_and_drops_the_rest(pool: PgPool) {
+    async fn a_sync_makes_the_unlisted_no_task_and_keeps_their_holders(pool: PgPool) {
         let store = store(pool).await;
         let r = repo("o/r");
         for n in 1..=3 {
@@ -885,21 +1020,23 @@ mod tests {
         let held = claim(&store, "ana").await.unwrap();
         assert_eq!(held.issue, 1);
 
-        store
-            .sync_tasks(1, &r, &[issue(3, &["ben"]), issue(4, &[])])
-            .await
-            .unwrap();
-        let left: Vec<(u64, Vec<String>)> = store
+        sync(&store, &r, &[issue(3, &["ben"]), issue(4, &[])]).await;
+        let left: Vec<(u64, bool, Vec<String>)> = store
             .builds(1)
             .await
             .unwrap()
             .into_iter()
-            .map(|b| (b.issue, b.assignees))
+            .map(|b| (b.issue, b.task, b.assignees))
             .collect();
         assert_eq!(
             left,
-            [(1, vec![]), (3, vec!["ben".into()]), (4, vec![])],
-            "#1 is claimed, #2 left the label"
+            [
+                (1, false, vec![]),
+                (2, false, vec![]),
+                (3, true, vec!["ben".into()]),
+                (4, true, vec![])
+            ],
+            "#1 and #2 left the label, and #1 is still Ana's"
         );
     }
 
@@ -920,7 +1057,7 @@ mod tests {
             .upsert_task(1, &new, &issue(2, &["ben"]))
             .await
             .unwrap();
-        assert!(store.take_sync(1, &old, 300).await.unwrap());
+        assert!(store.take_sync(1, &old, 300).await.unwrap().is_some());
 
         store.rename_repo(1, &old, &new).await.unwrap();
 
@@ -941,7 +1078,7 @@ mod tests {
             .await
             .unwrap();
         assert!(beat.is_some(), "Ana still holds #1");
-        assert!(store.take_sync(1, &new, 300).await.unwrap());
+        assert!(store.take_sync(1, &new, 300).await.unwrap().is_some());
     }
 
     /// Ana claims #1 and opens PR 40 for it.
@@ -1087,12 +1224,14 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_build_with_a_pr_survives_its_issue_going_and_the_lane_off_and_on(pool: PgPool) {
+    async fn a_build_with_a_pr_lives_on_through_its_issue_going_and_the_lane_off_and_on(
+        pool: PgPool,
+    ) {
         let store = store(pool).await;
         let r = repo("o/r");
         let pr = landing(&store).await;
         store.drop_task(1, &r, 1).await.unwrap();
-        store.sync_tasks(1, &r, &[]).await.unwrap();
+        sync(&store, &r, &[]).await;
         store
             .set_build_settings(1, &BuildSettings::default())
             .await
@@ -1107,37 +1246,156 @@ mod tests {
             Some((BuildStatus::Landing, Some(40)))
         );
 
-        // Merged, its issue closes: the build is done with.
-        store
-            .report_build(held(&pr, "ana"), Standing::Merged)
-            .await
-            .unwrap();
-        store.drop_task(1, &r, 1).await.unwrap();
-        assert!(store.builds(1).await.unwrap().is_empty());
+        assert!(store.holds(held(&pr, "ana")).await.unwrap(), "it has a PR");
     }
 
     #[sqlx::test(migrations = false)]
-    async fn an_issue_that_stops_being_a_task_takes_its_claim_away(pool: PgPool) {
+    async fn an_issue_that_stops_being_a_task_leaves_its_holder_only_giving_back(pool: PgPool) {
         let store = store(pool).await;
         let r = repo("o/r");
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
         let ana = claim(&store, "ana").await.unwrap();
-        store.sync_tasks(1, &r, &[]).await.unwrap();
-        let beat = store
-            .heartbeat_build(held(&ana, "ana"), None)
-            .await
-            .unwrap();
-        assert!(
-            beat.is_some(),
-            "a sync may race a claim: it leaves claims be"
-        );
-
         store.drop_task(1, &r, 1).await.unwrap();
-        let beat = store
-            .heartbeat_build(held(&ana, "ana"), None)
+        let held_on = store.held_build(held(&ana, "ana")).await.unwrap().unwrap();
+        assert!(
+            !held_on.live(),
+            "Ana still holds it, and may only give it back"
+        );
+        assert!(!store.holds(held(&ana, "ana")).await.unwrap());
+
+        let back = store.release_build(held(&ana, "ana"), None).await.unwrap();
+        assert_eq!(back.map(|b| b.status), Some(BuildStatus::Ready));
+        assert_eq!(
+            claim(&store, "ben").await,
+            None,
+            "no task, so not in the pool"
+        );
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        assert_eq!(claim(&store, "ben").await.map(|b| b.issue), Some(1));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_stale_claim_on_an_issue_that_is_no_task_is_not_taken_over(pool: PgPool) {
+        let store = store(pool.clone()).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let ana = claim(&store, "ana").await.unwrap();
+        sync(&store, &r, &[]).await;
+        heard_ago(&pool, ana.id, STALE as i64 + 1).await;
+        assert_eq!(claim(&store, "ben").await, None);
+        assert!(store.claimable_repos(1, STALE).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_sync_leaves_be_what_a_webhook_wrote_after_it_began(pool: PgPool) {
+        let store = store(pool).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let since = store.take_sync(1, &r, 0).await.unwrap().unwrap();
+        // After the list was read: #1 closes, #2 gets the label, #3 never had it.
+        store.drop_task(1, &r, 1).await.unwrap();
+        store.upsert_task(1, &r, &issue(2, &[])).await.unwrap();
+        store.drop_task(1, &r, 3).await.unwrap();
+        store
+            .sync_tasks(1, &r, &since, &[issue(1, &[]), issue(3, &[])], true)
             .await
             .unwrap();
-        assert_eq!(beat, None, "the issue's own event cancels the build");
+        let tasks: Vec<(u64, bool)> = store
+            .builds(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.issue, b.task))
+            .collect();
+        assert_eq!(tasks, [(1, false), (2, true), (3, false)]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_partial_list_makes_nothing_it_left_out_no_task(pool: PgPool) {
+        let store = store(pool).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let since = store.take_sync(1, &r, 0).await.unwrap().unwrap();
+        store.sync_tasks(1, &r, &since, &[], false).await.unwrap();
+        assert_eq!(claim(&store, "ana").await.map(|b| b.issue), Some(1));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn taking_back_ones_own_stale_claim_keeps_what_it_assigned(pool: PgPool) {
+        let store = store(pool.clone()).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let first = claim(&store, "ana").await.unwrap();
+        assert!(first.mirrored);
+        store.upsert_task(1, &r, &issue(1, &["ana"])).await.unwrap();
+        for status in ["claimed", "landing", "waiting"] {
+            sqlx::query("UPDATE builds SET status = $1")
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+            heard_ago(&pool, first.id, STALE as i64 + 1).await;
+            let again = claim(&store, "ana").await.unwrap();
+            assert!(again.mirrored, "{status}");
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_stuck_build_is_a_task_again_only_if_labeled_after_it_got_stuck(pool: PgPool) {
+        let store = store(pool).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let ana = claim(&store, "ana").await.unwrap();
+        let stuck = store
+            .release_build(held(&ana, "ana"), Some("no"))
+            .await
+            .unwrap()
+            .unwrap();
+        let again = |at: &'static str| {
+            let at = [at.to_owned()];
+            let store = &store;
+            async move {
+                store
+                    .relabeled_since_stuck(1, stuck.id, stuck.claim, &at)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!again("2020-01-01T00:00:00Z").await);
+        assert!(again("2999-01-01T00:00:00Z").await);
+        assert_eq!(claim(&store, "ben").await.map(|b| b.issue), Some(1));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn holding_is_read_with_the_lane_and_ends_with_giving_back(pool: PgPool) {
+        let store = store(pool).await;
+        let on = BuildSettings { enabled: true };
+        store.set_build_settings(1, &on).await.unwrap();
+        let pr = landing(&store).await;
+        assert!(store.holds(held(&pr, "ana")).await.unwrap());
+        let ben = Holder {
+            login: "ben",
+            ..held(&pr, "ana")
+        };
+        assert!(!store.holds(ben).await.unwrap());
+
+        let back = store
+            .release_build(held(&pr, "ana"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.claim, pr.claim + 1, "the old claim is over");
+        assert!(!store.holds(held(&pr, "ana")).await.unwrap());
+        let late = store.heartbeat_build(held(&pr, "ana"), None).await.unwrap();
+        assert_eq!(late, None);
+
+        let again = claim(&store, "ana").await.unwrap();
+        assert!(store.holds(held(&again, "ana")).await.unwrap());
+        store
+            .set_build_settings(1, &BuildSettings::default())
+            .await
+            .unwrap();
+        assert!(!store.holds(held(&again, "ana")).await.unwrap(), "lane off");
     }
 
     #[sqlx::test(migrations = false)]
@@ -1177,8 +1435,11 @@ mod tests {
     async fn one_caller_of_many_syncs_a_repo(pool: PgPool) {
         let store = store(pool).await;
         let r = repo("o/r");
-        assert!(store.take_sync(1, &r, 300).await.unwrap());
-        assert!(!store.take_sync(1, &r, 300).await.unwrap());
-        assert!(store.take_sync(1, &r, 0).await.unwrap(), "once it is due");
+        assert!(store.take_sync(1, &r, 300).await.unwrap().is_some());
+        assert!(store.take_sync(1, &r, 300).await.unwrap().is_none());
+        assert!(
+            store.take_sync(1, &r, 0).await.unwrap().is_some(),
+            "once it is due"
+        );
     }
 }

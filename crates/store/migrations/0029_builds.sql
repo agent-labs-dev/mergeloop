@@ -6,7 +6,9 @@ CREATE TABLE build_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- One per labeled open issue of a workspace with the lane on: a task, until it is claimed.
+-- One per issue of a workspace with the lane on that was ever a task (open, with the repo's
+-- label): a build outlives its issue's leaving the label, so that a holder keeps its claim and
+-- an older read of the issues cannot bring back what a newer one ended.
 CREATE TABLE builds (
     id BIGSERIAL PRIMARY KEY,
     installation_id BIGINT NOT NULL,
@@ -16,6 +18,11 @@ CREATE TABLE builds (
     body TEXT NOT NULL DEFAULT '',
     -- The issue's assignees on GitHub, by login: its pre-assignment.
     assignees TEXT[] NOT NULL DEFAULT '{}',
+    -- Whether the issue is a task now: open, with the repo's label. Only a task is claimed.
+    task BOOLEAN NOT NULL DEFAULT true,
+    -- When a webhook or a sync last wrote what the row knows of its issue: a sync that began
+    -- before then leaves the row be.
+    task_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- `ready`; held by a daemon: `claimed`, `landing` or `waiting`; `stuck` or `merged`.
     status TEXT NOT NULL DEFAULT 'ready',
     -- The login that holds the claim, or held it last.
@@ -28,8 +35,9 @@ CREATE TABLE builds (
     stage TEXT,
     heartbeat_at TIMESTAMPTZ,
     pr BIGINT,
-    -- Why a stuck build is stuck.
+    -- Why a stuck build is stuck, and since when.
     reason TEXT,
+    stuck_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (installation_id, repo, issue)

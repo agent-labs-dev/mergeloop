@@ -2,6 +2,6 @@
 
 export type OpenBuildPr = { claim: bigint, title: string, 
 /**
- * What the PR does. `Closes #<issue>` is added to it.
+ * What the PR does. `Closes #<issue>` goes before it.
  */
 body: string, };

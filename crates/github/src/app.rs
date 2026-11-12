@@ -315,6 +315,11 @@ impl Installation {
             .await
     }
 
+    /// Revokes a token this installation minted.
+    pub async fn revoke(&self, token: &str) -> Result<()> {
+        revoke_token_at(&self.app.api, token).await
+    }
+
     /// A token for `repo` alone, with `permissions` alone. GitHub ends its life after an hour.
     async fn scoped_token<T: DeserializeOwned>(
         &self,
@@ -789,9 +794,9 @@ async fn revoke_token_at(api: &str, token: &str) -> Result<()> {
             .bearer_auth(token)
             .headers(api_headers()))
     };
-    let (status, body) = send(build, "revoke the read-only token").await?;
+    let (status, body) = send(build, "revoke a token").await?;
     if !status.is_success() {
-        bail!("revoke the read-only token: {status} {body}");
+        bail!("revoke a token: {status} {body}");
     }
     Ok(())
 }

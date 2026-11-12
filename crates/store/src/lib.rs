@@ -9,6 +9,7 @@ mod vault;
 pub use billing::{BillingStore, FairUse, Subscription, Unsynced};
 pub use build::{
     Build, BuildSettings, BuildStatus, BuildStore, Claimed, Holder, IssueTask, Stage, Standing,
+    SyncStart,
 };
 pub use github::{BRANCH_RULES, Change, PrRead, PrWrite, Read, ReadCache, RepoReads, ValueRead};
 pub use review::{ReviewAnswers, ReviewDone, ReviewRecord, ReviewStore};

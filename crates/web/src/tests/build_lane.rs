@@ -11,7 +11,8 @@ const SECRET: &str = "whs";
 /// What the fake GitHub has, and what it was asked to change.
 #[derive(Default)]
 struct Hub {
-    /// `o/r`'s open issues with the `mergeloop` label, as the issues API lists them.
+    /// `o/r`'s open issues with the `mergeloop` label, as the issues API lists them. A list
+    /// over 100 is answered a page at a time.
     labeled: Vec<Value>,
     /// `o/r`'s config file.
     config: Option<String>,
@@ -21,10 +22,61 @@ struct Hub {
     revoked: Vec<String>,
     /// The bodies of scoped token mints.
     mints: Vec<Value>,
-    /// `o/r`'s open PRs: number, head branch.
-    prs: Vec<(u64, String)>,
+    /// `o/r`'s PRs.
+    prs: Vec<Pr>,
     /// What opened each PR: the token, and the body sent.
     opened: Vec<(String, Value)>,
+    /// Paths whose writes GitHub refuses.
+    failing: Vec<String>,
+    /// Each issue's events, as the issue events API lists them.
+    events: Vec<(u64, Value)>,
+    /// Installation tokens revoked.
+    revoked_tokens: Vec<String>,
+    /// Paths that were read.
+    reads: Vec<String>,
+    /// Acts before the answer to the first request whose path starts with its prefix: another
+    /// call, put in the middle of the one that asked.
+    hooks: Vec<(String, Hook)>,
+}
+
+type Hook = Box<dyn FnOnce() + Send>;
+
+/// A PR in `o/r`.
+#[derive(Clone)]
+struct Pr {
+    number: u64,
+    head: String,
+    head_repo: String,
+    base: String,
+    open: bool,
+    merged: bool,
+    author: String,
+}
+
+impl Pr {
+    /// One the App opened from `head` into the default branch.
+    fn bots(number: u64, head: &str) -> Self {
+        Self {
+            number,
+            head: head.into(),
+            head_repo: "o/r".into(),
+            base: "trunk".into(),
+            open: true,
+            merged: false,
+            author: "mp[bot]".into(),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "number": self.number, "html_url": format!("https://github.com/o/r/pull/{}", self.number),
+            "state": if self.open { "open" } else { "closed" },
+            "merged_at": if self.merged { json!("2026-11-12T12:00:00Z") } else { Value::Null },
+            "user": { "login": self.author },
+            "head": { "ref": self.head, "repo": { "full_name": self.head_repo } },
+            "base": { "ref": self.base },
+        })
+    }
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -37,10 +89,27 @@ fn issue(number: u64, assignees: &[&str]) -> Value {
     })
 }
 
+/// The `page`th page of 100 of `all`, for a list API.
+fn page(all: &[Value], path: &str) -> (u16, String) {
+    let n: usize = path.rsplit("page=").next().unwrap().parse().unwrap();
+    let page: Vec<Value> = all.iter().skip((n - 1) * 100).take(100).cloned().collect();
+    (200, Value::from(page).to_string())
+}
+
 async fn github(hub: Shared) -> GitHub {
     fake::github(move |call| {
         let mut hub = hub.lock().unwrap();
+        if let Some(i) = hub.hooks.iter().position(|(p, _)| call.path.starts_with(p.as_str())) {
+            (hub.hooks.remove(i).1)();
+        }
+        if call.method == "GET" {
+            hub.reads.push(call.path.into());
+        }
         let push = |yes: bool| (200, json!({ "permissions": { "push": yes } }).to_string());
+        if call.method != "GET" && hub.failing.iter().any(|p| p == call.path) {
+            return (422, r#"{"message":"Validation Failed"}"#.into());
+        }
+        let issues = "/repos/o/r/issues?labels=mergeloop&state=open&per_page=100&page=";
         match (call.method, call.path) {
             ("GET", "/rate_limit") => (200, "{}".into()),
             ("GET", "/repos/o/r") => push(
@@ -51,24 +120,36 @@ async fn github(hub: Shared) -> GitHub {
                 hub.mints.push(serde_json::from_str(call.body).unwrap());
                 (201, json!({ "token": "ghs_push", "expires_at": "2026-11-12T13:00:00Z" }).to_string())
             }
-            ("GET", path) if path.starts_with("/repos/o/r/pulls?state=open&head=o:") => {
-                let branch = &path["/repos/o/r/pulls?state=open&head=o:".len()..];
-                let open: Vec<Value> = hub
+            ("DELETE", "/installation/token") => {
+                hub.revoked_tokens.push(call.token.into());
+                (204, String::new())
+            }
+            ("GET", path) if path.starts_with("/repos/o/r/pulls?") => {
+                let (query, branch) = path.split_once("&head=o:").unwrap();
+                let open_only = query.contains("state=open");
+                let found: Vec<Value> = hub
                     .prs
                     .iter()
-                    .filter(|(_, head)| head == branch)
-                    .map(|(n, _)| json!({ "number": n, "html_url": format!("https://github.com/o/r/pull/{n}") }))
+                    .filter(|pr| pr.head == branch && (pr.open || !open_only))
+                    .map(Pr::json)
                     .collect();
-                (200, Value::from(open).to_string())
+                (200, Value::from(found).to_string())
+            }
+            ("GET", path) if path.starts_with("/repos/o/r/pulls/") => {
+                let number: u64 = path["/repos/o/r/pulls/".len()..].parse().unwrap();
+                match hub.prs.iter().find(|pr| pr.number == number) {
+                    Some(pr) => (200, pr.json().to_string()),
+                    None => (404, "{}".into()),
+                }
             }
             ("POST", "/repos/o/r/pulls") => {
                 let body: Value = serde_json::from_str(call.body).unwrap();
                 let head = body["head"].as_str().unwrap().to_owned();
-                if hub.prs.iter().any(|(_, h)| *h == head) {
+                if hub.prs.iter().any(|pr| pr.open && pr.head == head) {
                     return (422, r#"{"message":"A pull request already exists"}"#.into());
                 }
                 let number = 40 + hub.prs.len() as u64;
-                hub.prs.push((number, head));
+                hub.prs.push(Pr::bots(number, &head));
                 hub.opened.push((call.token.into(), body));
                 (201, json!({ "number": number }).to_string())
             }
@@ -79,11 +160,14 @@ async fn github(hub: Shared) -> GitHub {
                 let data = json!({ "repository": { "defaultBranchRef": { "name": "trunk", "target": target } } });
                 (200, json!({ "data": data }).to_string())
             }
-            ("GET", "/repos/o/r/issues?labels=mergeloop&state=open&per_page=100&page=1") => {
-                (200, Value::from(hub.labeled.clone()).to_string())
-            }
+            ("GET", path) if path.starts_with(issues) => page(&hub.labeled, path),
             ("GET", "/repos/o/y/issues?labels=mergeloop&state=open&per_page=100&page=1") => {
                 (200, "[]".into())
+            }
+            ("GET", path) if path.starts_with("/repos/o/r/issues/") && path.contains("/events?") => {
+                let number: u64 = path["/repos/o/r/issues/".len()..].split('/').next().unwrap().parse().unwrap();
+                let events: Vec<Value> = hub.events.iter().filter(|(n, _)| *n == number).map(|(_, e)| e.clone()).collect();
+                page(&events, path)
             }
             ("GET", "/users/mp%5Bbot%5D") => (200, r#"{"id":900}"#.into()),
             ("GET", "/users/ana") => (200, r#"{"id":1}"#.into()),
@@ -98,6 +182,41 @@ async fn github(hub: Shared) -> GitHub {
         }
     })
     .await
+}
+
+/// Runs `act` on the store from another thread and connection, while the route that called the
+/// fake waits for its answer: how a test puts another call in the middle of one.
+fn aside<F, Fut>(options: &sqlx::postgres::PgConnectOptions, act: F)
+where
+    F: FnOnce(PgStore) -> Fut + Send,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let pool = PgPool::connect_with(options.clone()).await.unwrap();
+                act(PgStore::migrate(pool).await.unwrap()).await;
+            });
+        })
+        .join()
+        .unwrap();
+    });
+}
+
+/// Before GitHub answers the first request to a path starting with `prefix`, runs `act` on the
+/// store as [`aside`] does.
+fn hook<F, Fut>(hub: &Shared, pool: &PgPool, prefix: &str, act: F)
+where
+    F: FnOnce(PgStore) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    let options = (*pool.connect_options()).clone();
+    let run: Hook = Box::new(move || aside(&options, act));
+    hub.lock().unwrap().hooks.push((prefix.into(), run));
 }
 
 /// Ana, Cy and Ben signed in to workspace 1, whose repos `o/r` and `o/y` queue.
@@ -449,7 +568,7 @@ async fn builds_list_for_readers_and_for_their_holder(pool: PgPool) {
 
 async fn deliver(router: &Router, action: &str, issue: Value) -> StatusCode {
     let body = json!({
-        "action": action, "issue": issue,
+        "action": action, "issue": issue, "label": { "name": "mergeloop" },
         "installation": { "id": 1 }, "repository": { "full_name": "o/r" },
     })
     .to_string();
@@ -691,7 +810,7 @@ async fn the_app_opens_the_pr_ready_labeled_assigned_and_closing_the_issue(pool:
             fake::INSTALLATION_TOKEN.to_owned(),
             json!({
                 "head": "mergeloop/build-7", "base": "trunk", "title": "Add the thing",
-                "body": "It adds the thing.\n\nCloses #7", "draft": false,
+                "body": "Closes #7\n\nIt adds the thing.", "draft": false,
             })
         )]
     );
@@ -720,7 +839,7 @@ async fn opening_twice_or_after_a_lost_answer_opens_one_pr(pool: PgPool) {
     hub.lock()
         .unwrap()
         .prs
-        .push((40, "mergeloop/build-7".into()));
+        .push(Pr::bots(40, "mergeloop/build-7"));
 
     let (_, first) = open_pr(&router, "ana", &ana).await;
     let (status, second) = open_pr(&router, "ana", &ana).await;
@@ -779,6 +898,7 @@ async fn the_holder_reports_waiting_then_merged_which_ends_the_build(pool: PgPoo
     );
     let (_, landing) = report(&router, "ana", &ana, "landing").await;
     assert_eq!(landing["status"], "landing");
+    hub.lock().unwrap().prs[0].merged = true;
     let (_, merged) = report(&router, "ana", &ana, "merged").await;
     assert_eq!(
         (merged["status"].as_str(), merged["pr"].as_u64()),
@@ -857,7 +977,9 @@ async fn a_stale_build_with_a_pr_is_claimed_with_its_pr_and_fences_out_the_old_h
 }
 
 #[sqlx::test(migrations = false)]
-async fn an_issue_closed_while_its_build_is_claimed_cancels_the_build(pool: PgPool) {
+async fn an_issue_closed_while_its_build_is_claimed_cancels_the_build_until_given_back(
+    pool: PgPool,
+) {
     let hub = shared(vec![issue(7, &[])]);
     let (router, _) = lane(pool, &hub).await;
     turn_on(&router).await;
@@ -870,4 +992,432 @@ async fn an_issue_closed_while_its_build_is_claimed_cancels_the_build(pool: PgPo
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body.as_str().unwrap().contains("closed"), "{body}");
     assert_eq!(mint(&router, "ana", &ana).await.0, StatusCode::CONFLICT);
+}
+
+fn ana_holds(claimed: &Value) -> (u64, u64) {
+    (
+        claimed["build"].as_u64().unwrap(),
+        claimed["claim"].as_u64().unwrap(),
+    )
+}
+
+/// As if every repo's labeled issues were last read over 5 minutes ago.
+async fn sync_due(pool: &PgPool) {
+    sqlx::query("UPDATE build_syncs SET synced_at = now() - interval '6 minutes'")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn closed(number: u64) -> Value {
+    let mut closed = issue(number, &[]);
+    closed["state"] = "closed".into();
+    closed
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_same_login_takeover_still_gives_back_the_lanes_assignment(pool: PgPool) {
+    let hub = shared(vec![issue(1, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    claim(&router, "ana").await;
+    deliver(&router, "assigned", issue(1, &["ana"])).await;
+    age_claims(&pool).await;
+
+    let again = claim(&router, "ana").await;
+    let (status, _) = release(&router, "ana", &again, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let writes = hub.lock().unwrap().writes.clone();
+    assert_eq!(
+        writes
+            .last()
+            .map(|(m, p, b)| (m.as_str(), p.as_str(), b.as_str())),
+        Some((
+            "DELETE",
+            "/repos/o/r/issues/1/assignees",
+            r#"{"assignees":["ana"]}"#
+        )),
+        "{writes:?}"
+    );
+    assert_eq!(claim(&router, "ben").await["issue"], 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_held_build_whose_issue_left_the_label_never_returns_to_the_pool(pool: PgPool) {
+    let hub = shared(vec![issue(1, &[]), issue(2, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let one = claim(&router, "ana").await;
+    let two = claim(&router, "ana").await;
+
+    // #1 leaves the label by webhook; #2 by a sync that no longer lists it.
+    let mut unlabeled = issue(1, &[]);
+    unlabeled["labels"] = json!([]);
+    deliver(&router, "unlabeled", unlabeled).await;
+    hub.lock().unwrap().labeled.clear();
+    sync_due(&pool).await;
+    assert_eq!(claim(&router, "ben").await, Value::Null);
+
+    for held in [&one, &two] {
+        let (status, body) = heartbeat_says(&router, "ana", held).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("release_build"), "{body}");
+        let (status, back) = release(&router, "ana", held, None).await;
+        assert_eq!(status, StatusCode::OK, "{back}");
+    }
+    assert_eq!(
+        claim(&router, "ben").await,
+        Value::Null,
+        "neither is a task"
+    );
+    age_claims(&pool).await;
+    assert_eq!(claim(&router, "ben").await, Value::Null);
+    assert!(listed(&router).await.is_empty());
+}
+
+async fn heartbeat_says(router: &Router, who: &str, claimed: &Value) -> (StatusCode, String) {
+    let (status, body) = on_build(router, who, claimed, "heartbeat", json!({})).await;
+    (
+        status,
+        body.as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| body.to_string()),
+    )
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_sync_read_before_a_close_webhook_does_not_bring_the_task_back(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    deliver(&router, "labeled", issue(7, &[])).await;
+    let repo = RepoName::parse("o/r").unwrap();
+    // The issue closes while the sync's list is on its way back.
+    hook(
+        &hub,
+        &pool,
+        "/repos/o/r/issues?labels",
+        move |store| async move {
+            store.drop_task(1, &repo, 7).await.unwrap();
+        },
+    );
+
+    assert_eq!(claim(&router, "ana").await, Value::Null);
+    assert!(listed(&router).await.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_sync_read_before_a_label_webhook_does_not_drop_the_new_task(pool: PgPool) {
+    let hub = shared(Vec::new());
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let repo = RepoName::parse("o/r").unwrap();
+    hook(
+        &hub,
+        &pool,
+        "/repos/o/r/issues?labels",
+        move |store| async move {
+            let task = mergepatrol_store::IssueTask {
+                number: 8,
+                title: "Issue 8".into(),
+                body: String::new(),
+                assignees: Vec::new(),
+            };
+            store.upsert_task(1, &repo, &task).await.unwrap();
+        },
+    );
+
+    assert_eq!(claim(&router, "ana").await["issue"], 8);
+}
+
+/// Ana marks #7 stuck, after opening a PR for it when `pr`.
+async fn stuck(router: &Router, pr: bool) -> Value {
+    turn_on(router).await;
+    let ana = claim(router, "ana").await;
+    if pr {
+        assert_eq!(open_pr(router, "ana", &ana).await.0, StatusCode::OK);
+    }
+    let (status, _) = release(router, "ana", &ana, Some("ejected twice")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(claim(router, "ben").await, Value::Null);
+    ana
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stuck_build_is_a_task_again_once_the_label_is_put_back(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    stuck(&router, false).await;
+    // Its removal was never heard.
+    deliver(&router, "labeled", issue(7, &[])).await;
+    let ben = claim(&router, "ben").await;
+    assert_eq!((ben["issue"].as_u64(), ben["pr"].as_u64()), (Some(7), None));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stuck_build_with_a_pr_comes_back_with_its_pr(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    let ana = stuck(&router, true).await;
+    deliver(&router, "labeled", issue(7, &[])).await;
+    let ben = claim(&router, "ben").await;
+    assert_eq!(
+        (ben["issue"].as_u64(), ben["pr"].as_u64()),
+        (Some(7), Some(40))
+    );
+    assert_eq!(heartbeat(&router, "ana", &ana).await, StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrations = false)]
+async fn without_webhooks_a_stuck_build_comes_back_once_its_events_show_the_label_put_back(
+    pool: PgPool,
+) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    stuck(&router, false).await;
+    let labeled = |at: &str, name: &str| {
+        (
+            7,
+            json!({ "event": "labeled", "created_at": at, "label": { "name": name } }),
+        )
+    };
+    hub.lock().unwrap().events = vec![
+        labeled("2020-01-01T00:00:00Z", "mergeloop"),
+        labeled("2999-01-01T00:00:00Z", "bug"),
+    ];
+    sync_due(&pool).await;
+    assert_eq!(
+        claim(&router, "ben").await,
+        Value::Null,
+        "labeled before it got stuck"
+    );
+    assert!(
+        hub.lock()
+            .unwrap()
+            .reads
+            .iter()
+            .any(|p| p.starts_with("/repos/o/r/issues/7/events")),
+        "the sync read its events"
+    );
+
+    hub.lock()
+        .unwrap()
+        .events
+        .push(labeled("2999-01-01T00:00:00Z", "MergeLoop"));
+    sync_due(&pool).await;
+    assert_eq!(claim(&router, "ben").await["issue"], 7);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_sync_reads_a_bounded_number_of_pages_and_drops_nothing_it_did_not_see(pool: PgPool) {
+    let hub = shared((1..=5000).map(|n| issue(n, &["cy"])).collect());
+    let (router, state) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    // #5000 is a task the sync will not reach.
+    deliver(&router, "labeled", issue(5000, &[])).await;
+
+    assert_eq!(claim(&router, "ana").await["issue"], 5000);
+    let pages = hub
+        .lock()
+        .unwrap()
+        .reads
+        .iter()
+        .filter(|p| p.starts_with("/repos/o/r/issues?labels"))
+        .count();
+    assert!(pages <= 10, "{pages} pages");
+    let builds = state.builds.builds(1).await.unwrap();
+    assert_eq!(builds.len(), 1001, "the pages read, and #5000");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_token_minted_while_the_claim_is_given_back_is_revoked_and_refused(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    let (build, claim_n) = ana_holds(&ana);
+    hook(
+        &hub,
+        &pool,
+        "/app/installations/1/access_tokens",
+        move |store| async move {
+            let ana = mergepatrol_store::Holder {
+                installation_id: 1,
+                build,
+                login: "ana",
+                claim: claim_n,
+            };
+            store.release_build(ana, None).await.unwrap().unwrap();
+        },
+    );
+
+    let (status, body) = mint(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.as_str().unwrap().contains("no longer hold"), "{body}");
+    assert_eq!(hub.lock().unwrap().revoked_tokens, ["ghs_push"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_token_minted_while_the_lane_is_turned_off_is_revoked_and_refused(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    hook(
+        &hub,
+        &pool,
+        "/app/installations/1/access_tokens",
+        |store| async move {
+            let off = mergepatrol_store::BuildSettings { enabled: false };
+            store.set_build_settings(1, &off).await.unwrap();
+        },
+    );
+
+    let (status, body) = mint(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.as_str().unwrap().contains("build lane is off"),
+        "{body}"
+    );
+    assert_eq!(hub.lock().unwrap().revoked_tokens, ["ghs_push"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn giving_back_a_build_with_a_pr_ends_the_old_holders_claim(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    open_pr(&router, "ana", &ana).await;
+    let (status, _) = release(&router, "ana", &ana, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(heartbeat(&router, "ana", &ana).await, StatusCode::CONFLICT);
+    assert_eq!(
+        report(&router, "ana", &ana, "waiting").await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(mint(&router, "ana", &ana).await.0, StatusCode::CONFLICT);
+    assert_eq!(open_pr(&router, "ana", &ana).await.0, StatusCode::CONFLICT);
+    let again = claim(&router, "ana").await;
+    assert_eq!(again["pr"], 40);
+    assert_eq!(heartbeat(&router, "ana", &again).await, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = false)]
+async fn opening_the_pr_asks_github_afresh_whether_the_caller_may_push(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    hub.lock().unwrap().revoked.push("ghu_ana".into());
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(hub.lock().unwrap().opened.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pr_whose_label_fails_is_kept_and_labeled_on_the_next_call(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    hub.lock().unwrap().failing = vec!["/repos/o/r/issues/40/labels".into()];
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.as_str().unwrap().contains("label"), "{body}");
+    // Its issue closes before the next call: the build has a PR, so it stays.
+    deliver(&router, "closed", closed(7)).await;
+    let (_, builds) = call(&router, "ana", "GET", "/builds", Value::Null).await;
+    assert_eq!(builds[0]["pr"], 40, "{builds}");
+
+    hub.lock().unwrap().failing.clear();
+    let (status, build) = open_pr(&router, "ana", &ana).await;
+    assert_eq!((status, build["pr"].as_u64()), (StatusCode::OK, Some(40)));
+    let hub = hub.lock().unwrap();
+    assert_eq!(hub.opened.len(), 1);
+    let labels = hub
+        .writes
+        .iter()
+        .filter(|(_, p, _)| p == "/repos/o/r/issues/40/labels")
+        .count();
+    assert_eq!(labels, 1, "the failed one is not written");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pr_whose_assignment_fails_fails_the_call_until_it_is_assigned(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    hub.lock().unwrap().failing = vec!["/repos/o/r/issues/40/assignees".into()];
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.as_str().unwrap().contains("assign"), "{body}");
+
+    hub.lock().unwrap().failing.clear();
+    let (status, _) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::OK);
+    let assigned = hub
+        .lock()
+        .unwrap()
+        .writes
+        .iter()
+        .any(|(_, p, _)| p == "/repos/o/r/issues/40/assignees");
+    assert!(assigned);
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_the_apps_open_pr_from_the_builds_branch_into_the_default_branch_is_adopted(
+    pool: PgPool,
+) {
+    type Change = fn(&mut Pr);
+    let cases: [(&str, Change); 4] = [
+        ("into another base", |pr| pr.base = "release".into()),
+        ("opened by someone else", |pr| pr.author = "ana".into()),
+        ("closed", |pr| pr.open = false),
+        ("from a fork", |pr| pr.head_repo = "ana/r".into()),
+    ];
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    for (why, change) in cases {
+        let mut pr = Pr::bots(40, "mergeloop/build-7");
+        change(&mut pr);
+        {
+            let mut h = hub.lock().unwrap();
+            h.prs = vec![pr];
+            // GitHub refuses a new one, as it would for the open one, or for a branch not pushed.
+            h.failing = vec!["/repos/o/r/pulls".into()];
+        }
+
+        let (status, body) = open_pr(&router, "ana", &ana).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{why}: {body}");
+        assert!(body.as_str().unwrap().contains("#40"), "{why}: {body}");
+    }
+    let (_, builds) = call(&router, "ana", "GET", "/builds", Value::Null).await;
+    assert_eq!(builds[0]["pr"], Value::Null);
+}
+
+#[sqlx::test(migrations = false)]
+async fn merged_is_taken_only_when_github_says_the_pr_merged(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    open_pr(&router, "ana", &ana).await;
+
+    let (status, body) = report(&router, "ana", &ana, "merged").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.as_str().unwrap().contains("not merged"), "{body}");
+    hub.lock().unwrap().prs[0].merged = true;
+    let (status, merged) = report(&router, "ana", &ana, "merged").await;
+    assert_eq!(
+        (status, merged["status"].as_str()),
+        (StatusCode::OK, Some("merged"))
+    );
 }

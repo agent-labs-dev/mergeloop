@@ -17,7 +17,7 @@ pub use app::{
 pub use checks::{BranchRules, CheckState, Checks};
 pub use codeowners::CodeOwners;
 pub use files::{BranchFile, ConfigFile, GitObject, ObjectsAt, Proposal, PullRef, SYMLINK_MODE};
-pub use issues::Issue;
+pub use issues::{Issue, LanePull, Listed};
 pub use repo::{
     BranchMerge, BranchMove, HeadRepository, MergeOutcome, PrDetails, PullRequest, RepoOwner,
     RepoSnapshot, ReviewThread, SnapshotParts, StackRef, ThreadComment, TreeEntry, queued,

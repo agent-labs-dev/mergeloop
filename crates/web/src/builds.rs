@@ -7,7 +7,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use mergepatrol_core::{RepoName, RepoSettings};
-use mergepatrol_github::{ConfigFile, Installation, Issue, ScopedToken};
+use mergepatrol_github::{ConfigFile, Installation, Issue, LanePull, ScopedToken};
 use mergepatrol_store::{
     Build, BuildSettings, BuildStatus, Claimed, Holder, IssueTask, Stage, Standing,
 };
@@ -24,6 +24,9 @@ const STALE_SECS: u64 = 30 * 60;
 /// A claim reads a repo's labeled issues again once they are this old: webhooks get lost, and
 /// an App created before `issues` joined its events gets none.
 const SYNC_SECS: u64 = 5 * 60;
+/// A sync reads at most this many pages of 100 of each list, so one claim's work is bounded. A
+/// repo with more labeled issues gets the rest by webhook.
+const SYNC_PAGES: usize = 10;
 
 #[derive(Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -94,8 +97,8 @@ pub enum BuildStatusView {
     Landing,
     /// A daemon holds it, and its PR waits on a human.
     Waiting,
-    /// Its holder gave up, and said why. It is a task again once a human takes the label off
-    /// the issue and puts it back.
+    /// Its holder gave up, and said why. It is a task again once a human puts the label on the
+    /// issue again, with its PR if it has one.
     Stuck,
     /// Its PR merged.
     Merged,
@@ -202,6 +205,7 @@ pub(crate) async fn list_builds(
         builds
             .into_iter()
             .filter(|b| readable.contains(&b.repo))
+            .filter(|b| b.task || b.status.held())
             .filter(|b| !mine || (b.status.held() && b.holder.as_deref() == Some(login)))
             .map(BuildView::from)
             .collect(),
@@ -319,20 +323,48 @@ async fn lane_repos(
 async fn sync(app: &AppState, id: u64, repos: &[RepoName]) {
     for repo in repos {
         let synced = async {
-            if !app.builds.take_sync(id, repo, SYNC_SECS).await? {
+            let Some(since) = app.builds.take_sync(id, repo, SYNC_SECS).await? else {
                 return Ok(());
-            }
+            };
             let gh = installation(app, id).await?;
             let label = settings(app, &gh, id, repo).await?.0.label;
-            let issues = gh.labeled_issues(repo, &label).await?;
-            let tasks: Vec<IssueTask> = issues.into_iter().map(task).collect();
-            app.builds.sync_tasks(id, repo, &tasks).await?;
-            Ok::<_, ApiError>(())
+            let listed = gh.labeled_issues(repo, &label, SYNC_PAGES).await?;
+            let tasks: Vec<IssueTask> = listed.items.into_iter().map(task).collect();
+            app.builds
+                .sync_tasks(id, repo, &since, &tasks, listed.complete)
+                .await?;
+            unstick(app, &gh, id, repo, &label).await
         };
         if let Err(e) = synced.await {
             tracing::warn!(installation = id, %repo, error = %e.message(), "could not read the labeled issues");
         }
     }
+}
+
+/// Makes a task again each stuck build of the repo whose issue had its label put on again after
+/// it got stuck: its issue's events say so when no webhook did.
+async fn unstick(
+    app: &AppState,
+    gh: &Installation,
+    id: u64,
+    repo: &RepoName,
+    label: &str,
+) -> Result<(), ApiError> {
+    let builds = app.builds.builds(id).await?;
+    let stuck = builds
+        .iter()
+        .filter(|b| b.repo == *repo && b.status == BuildStatus::Stuck && b.task);
+    for build in stuck {
+        let at = gh.labeled_at(repo, build.issue, label, SYNC_PAGES).await?;
+        if app
+            .builds
+            .relabeled_since_stuck(id, build.id, build.claim, &at)
+            .await?
+        {
+            tracing::info!(installation = id, %repo, issue = build.issue, "a stuck build is a task again");
+        }
+    }
+    Ok(())
 }
 
 fn task(issue: Issue) -> IssueTask {
@@ -374,12 +406,7 @@ async fn claimed_view(
     let build = &claimed.build;
     let gh = installation(app, id).await?;
     let (settings, default_branch) = settings(app, &gh, id, &build.repo).await?;
-    let creds = app
-        .app_credentials()
-        .await?
-        .ok_or_else(|| ApiError::Status(StatusCode::CONFLICT, "No GitHub App yet.".into()))?;
-    let bot = format!("{}[bot]", creds.slug);
-    let author = identity(app, &gh, &bot).await?;
+    let author = identity(app, &gh, &bot(app).await?).await?;
     let co_author = identity(app, &gh, user.login()).await?;
     if build.mirrored {
         mirror(
@@ -412,6 +439,15 @@ async fn claimed_view(
         co_author,
         pr: build.pr,
     })
+}
+
+/// The App's bot's login, which opens the builds' PRs and authors their commits.
+async fn bot(app: &AppState) -> Result<String, ApiError> {
+    let creds = app
+        .app_credentials()
+        .await?
+        .ok_or_else(|| ApiError::Status(StatusCode::CONFLICT, "No GitHub App yet.".into()))?;
+    Ok(format!("{}[bot]", creds.slug))
 }
 
 /// The branch a build is pushed to, and its PR opened from.
@@ -464,8 +500,12 @@ pub(crate) async fn heartbeat_build(
     let beat = app
         .builds
         .heartbeat_build(held, body.stage.map(Into::into))
-        .await?;
-    Ok(Json(beat.ok_or_else(|| lost(build))?.into()))
+        .await?
+        .ok_or_else(|| lost(build))?;
+    if !beat.live() {
+        return Err(cancelled(build));
+    }
+    Ok(Json(beat.into()))
 }
 
 #[derive(Deserialize, TS)]
@@ -526,12 +566,22 @@ fn lost(build: u64) -> ApiError {
     ApiError::Status(
         StatusCode::CONFLICT,
         format!(
-            "You no longer hold build {build}: it was given back or is over, its issue was closed or lost its label before it had a PR, or its claim went stale and someone else took it. Stop working on it."
+            "You no longer hold build {build}: it was given back or is over, or its claim went stale and someone else took it. Stop working on it."
         ),
     )
 }
 
-/// The build `user` holds with `claim`, in a workspace whose lane is on.
+/// The holder of a build without a PR whose issue stopped being a task may only give it back.
+fn cancelled(build: u64) -> ApiError {
+    ApiError::Status(
+        StatusCode::CONFLICT,
+        format!(
+            "Build {build}'s issue was closed or lost its label before the build had a PR. Give it back with `release_build`, and stop working on it."
+        ),
+    )
+}
+
+/// The live build `user` holds with `claim`, in a workspace whose lane is on.
 async fn held(
     app: &AppState,
     caller: &Caller,
@@ -548,6 +598,9 @@ async fn held(
         .held_build(held)
         .await?
         .ok_or_else(|| lost(build))?;
+    if !build.live() {
+        return Err(cancelled(build.id));
+    }
     Ok((id, build))
 }
 
@@ -574,7 +627,9 @@ pub struct PushTokenView {
 }
 
 /// Gives the holder of a live claim a token for its build's repo, while GitHub says they may
-/// push there. Asks GitHub afresh: the token outlives any cached answer.
+/// push there. Asks GitHub afresh: the token outlives any cached answer. Once minted, checks
+/// the claim and the lane again, and revokes the token if either was lost meanwhile. A token
+/// already given outlives a later release by up to its hour, which GitHub fixes.
 pub(crate) async fn mint_push_token(
     State(app): State<AppState>,
     caller: Caller,
@@ -585,12 +640,31 @@ pub(crate) async fn mint_push_token(
     require_heard(&build)?;
     let user = caller.user()?;
     require_push_now(&app, user, &build.repo).await?;
-    let ScopedToken { token, expires_at } = installation(&app, id)
-        .await?
-        .push_token(&build.repo)
-        .await?;
+    let gh = installation(&app, id).await?;
+    let ScopedToken { token, expires_at } = gh.push_token(&build.repo).await?;
+    let held = holder(id, build.id, user.login(), body.claim);
+    still_held(&app, &gh, held, &build.repo, &token).await?;
     tracing::info!(installation = id, repo = %build.repo, issue = build.issue, login = user.login(), "minted a push token");
     Ok(Json(PushTokenView { token, expires_at }))
+}
+
+/// `held` still holds its build in a lane that is on, now that `token` was minted for it: or
+/// `token` is revoked, and the call refused.
+async fn still_held(
+    app: &AppState,
+    gh: &Installation,
+    held: Holder<'_>,
+    repo: &RepoName,
+    token: &str,
+) -> Result<(), ApiError> {
+    if app.builds.holds(held).await? {
+        return Ok(());
+    }
+    if let Err(e) = gh.revoke(token).await {
+        tracing::warn!(installation = held.installation_id, %repo, error = %format!("{e:#}"), "could not revoke a push token");
+    }
+    require_lane(app, held.installation_id).await?;
+    Err(lost(held.build))
 }
 
 /// A claim unheard for `STALE_SECS` is anyone's to take: it is no live claim.
@@ -630,13 +704,14 @@ async fn require_push_now(
 pub struct OpenBuildPr {
     pub claim: u64,
     pub title: String,
-    /// What the PR does. `Closes #<issue>` is added to it.
+    /// What the PR does. `Closes #<issue>` goes before it.
     pub body: String,
 }
 
 /// The App opens the build's PR from its pushed branch into the default branch, ready for
-/// review, labels it so it queues, and assigns the developer. Every step is safe to repeat: a
-/// build has one PR, found again by its number or by its branch.
+/// review, labels it so it queues, and assigns the developer. The PR is recorded on the build as
+/// soon as GitHub gives it; labeling and assigning are tried again on every call, and the call
+/// succeeds only once both are done.
 pub(crate) async fn open_build_pr(
     State(app): State<AppState>,
     caller: Caller,
@@ -649,44 +724,65 @@ pub(crate) async fn open_build_pr(
     }
     let (id, build) = held(&app, &caller, id, build, body.claim).await?;
     let user = caller.user()?;
-    if !user.may_push(&app, &build.repo).await? {
-        return Err(may_not_push(&build.repo));
-    }
-    let pr = queued_pr(&app, id, &build, user.login(), title, &body.body).await?;
-    let held = holder(id, build.id, user.login(), body.claim);
+    let login = user.login();
+    require_push_now(&app, user, &build.repo).await?;
+    let gh = installation(&app, id).await?;
+    let (settings, base) = settings(&app, &gh, id, &build.repo).await?;
+    let held = holder(id, build.id, login, body.claim);
+    let pr = match build.pr {
+        Some(pr) => pr,
+        None => {
+            let pr = opened(&app, &gh, &build, &base, title, &body.body).await?;
+            app.builds
+                .opened_pr(held, pr)
+                .await?
+                .ok_or_else(|| lost(build.id))?;
+            tracing::info!(installation = id, repo = %build.repo, issue = build.issue, pr, login, "opened a build's PR");
+            pr
+        }
+    };
+    queued(&gh, &build.repo, pr, &settings.label, login).await?;
     let landing = app
         .builds
-        .opened_pr(held, pr)
+        .held_build(held)
         .await?
         .ok_or_else(|| lost(build.id))?;
-    tracing::info!(installation = id, repo = %build.repo, issue = build.issue, pr, login = user.login(), "opened a build's PR");
     Ok(Json(landing.into()))
 }
 
-/// The build's PR, opened unless it has one, labeled so it queues, and assigned to `login`.
-async fn queued_pr(
-    app: &AppState,
-    id: u64,
-    build: &Build,
+/// Labels PR `pr` with `label`, so it queues, and assigns it to `login`. Both are safe to repeat.
+async fn queued(
+    gh: &Installation,
+    repo: &RepoName,
+    pr: u64,
+    label: &str,
     login: &str,
-    title: &str,
-    body: &str,
-) -> Result<u64, ApiError> {
-    let gh = installation(app, id).await?;
-    let (settings, base) = settings(app, &gh, id, &build.repo).await?;
-    let body = format!("{}\n\nCloses #{}", body.trim_end(), build.issue);
-    let pr = match build.pr {
-        Some(pr) => pr,
-        None => opened(&gh, build, &base, title, body.trim_start()).await?,
-    };
-    gh.add_label(&build.repo, pr, &settings.label).await?;
-    mirror(gh.assign(&build.repo, pr, login).await, build, "assign");
-    Ok(pr)
+) -> Result<(), ApiError> {
+    gh.add_label(repo, pr, label)
+        .await
+        .map_err(|e| refused(e, &format!("GitHub would not label PR #{pr} `{label}`")))?;
+    gh.assign(repo, pr, login)
+        .await
+        .map_err(|e| refused(e, &format!("GitHub would not assign PR #{pr} to {login}")))
 }
 
-/// A new PR from the build's branch, or the one open from it already: GitHub refuses a second,
-/// and one opened by a call whose answer was lost, or by a racing call, is found by its branch.
+/// GitHub refused a step of opening the PR, which the next call tries again.
+fn refused(e: anyhow::Error, what: &str) -> ApiError {
+    match ApiError::from(e) {
+        ApiError::Internal(e) => ApiError::Status(
+            StatusCode::BAD_GATEWAY,
+            format!("{what}: {e:#}. Call `open_build_pr` again."),
+        ),
+        limited => limited,
+    }
+}
+
+/// A new PR from the build's branch, its body after the issue's closing line, or the one the App
+/// already opened from it: GitHub refuses
+/// a second, and one opened by a call whose answer was lost, or by a racing call, is found by
+/// its branch. Any other PR from that branch is not the build's.
 async fn opened(
+    app: &AppState,
     gh: &Installation,
     build: &Build,
     base: &str,
@@ -694,17 +790,53 @@ async fn opened(
     body: &str,
 ) -> Result<u64, ApiError> {
     let (repo, head) = (&build.repo, branch(build.issue));
-    match gh.open_pr(repo, &head, base, title, body).await {
-        Ok(pr) => Ok(pr),
-        Err(e) => match gh.open_pr_from(repo, &head).await? {
-            Some(open) => Ok(open.number),
-            None => Err(ApiError::Status(
-                StatusCode::CONFLICT,
-                format!(
-                    "GitHub would not open a PR from {head} into {base}. Is the branch pushed? {e:#}"
-                ),
-            )),
-        },
+    // The server's line goes first, so no Markdown the caller's text opens can swallow it. The
+    // caller's own mentions and closing words stay: they may push to the repo, and could write
+    // the same in a PR of their own.
+    let body = format!("Closes #{}\n\n{}", build.issue, body.trim());
+    let e = match gh.open_pr(repo, &head, base, title, body.trim_end()).await {
+        Ok(pr) => return Ok(pr),
+        Err(e) => e,
+    };
+    let bot = bot(app).await?;
+    let found = gh.pulls_from(repo, &head).await?;
+    if let Some(pr) = found
+        .iter()
+        .find(|pr| not_the_builds(pr, repo, &head, base, &bot).is_none())
+    {
+        return Ok(pr.number);
+    }
+    let message = match found.first() {
+        Some(pr) => format!(
+            "GitHub would not open a PR from {head} into {base}, and PR #{} from that branch {}, so it is not this build's. Close it, or give the build back.",
+            pr.number,
+            not_the_builds(pr, repo, &head, base, &bot).unwrap_or_default()
+        ),
+        None => format!(
+            "GitHub would not open a PR from {head} into {base}. Is the branch pushed? {e:#}"
+        ),
+    };
+    Err(ApiError::Status(StatusCode::CONFLICT, message))
+}
+
+/// Why `pr` is not the PR the App opened for a build from `head` into `base`, if it is not.
+fn not_the_builds(
+    pr: &LanePull,
+    repo: &RepoName,
+    head: &str,
+    base: &str,
+    bot: &str,
+) -> Option<String> {
+    if pr.head_repo.as_deref() != Some(&*repo.to_string()) || pr.head != head {
+        Some(format!("is from another repo's {}", pr.head))
+    } else if pr.base != base {
+        Some(format!("goes into {}", pr.base))
+    } else if !pr.open {
+        Some("is closed".into())
+    } else if pr.author != bot {
+        Some(format!("was opened by {}, not the App", pr.author))
+    } else {
+        None
     }
 }
 
@@ -737,7 +869,7 @@ pub struct ReportBuild {
     pub standing: StandingView,
 }
 
-/// The holder says how the build's PR stands.
+/// The holder says how the build's PR stands. Merged only once GitHub says so.
 pub(crate) async fn report_build(
     State(app): State<AppState>,
     caller: Caller,
@@ -754,11 +886,24 @@ pub(crate) async fn report_build(
             ),
         ));
     }
+    let standing = Standing::from(body.standing);
+    if let (Standing::Merged, Some(pr)) = (standing, build.pr)
+        && !installation(&app, id)
+            .await?
+            .lane_pull(&build.repo, pr)
+            .await?
+            .merged
+    {
+        return Err(ApiError::Status(
+            StatusCode::CONFLICT,
+            format!("GitHub says PR #{pr} is not merged. Report `landing` or `waiting`."),
+        ));
+    }
     let login = caller.user()?.login();
     let held = holder(id, build.id, login, body.claim);
     let reported = app
         .builds
-        .report_build(held, body.standing.into())
+        .report_build(held, standing)
         .await?
         .ok_or_else(|| lost(build.id))?;
     tracing::info!(installation = id, repo = %reported.repo, issue = reported.issue, login, status = reported.status.as_str(), "reported a build");
@@ -766,7 +911,7 @@ pub(crate) async fn report_build(
 }
 
 /// An `issues` delivery: keeps the issue's build in step with it, while the lane is on and the
-/// repo's queue runs.
+/// repo's queue runs. The label put on again makes a stuck build a task again.
 pub(crate) async fn heard(
     app: &AppState,
     id: u64,
@@ -780,30 +925,32 @@ pub(crate) async fn heard(
         return Ok(());
     };
     let gone = matches!(payload["action"].as_str(), Some("deleted" | "transferred"));
-    if !gone && is_task(app, id, repo, &issue).await? {
-        app.builds.upsert_task(id, repo, &task(issue)).await?;
-    } else {
-        app.builds.drop_task(id, repo, issue.number).await?;
+    let label = task_label(app, id, repo).await?;
+    let Some(label) = label.filter(|l| !gone && issue.labeled(l)) else {
+        return Ok(app.builds.drop_task(id, repo, issue.number).await?);
+    };
+    let number = issue.number;
+    app.builds.upsert_task(id, repo, &task(issue)).await?;
+    let relabeled = payload["action"] == "labeled"
+        && payload["label"]["name"]
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case(&label));
+    if relabeled {
+        app.builds.relabeled(id, repo, number).await?;
     }
     Ok(())
 }
 
-/// Whether the issue is a task: the repo's queue runs, and the issue is open with its label.
-async fn is_task(
-    app: &AppState,
-    id: u64,
-    repo: &RepoName,
-    issue: &Issue,
-) -> Result<bool, ApiError> {
+/// The label that makes the repo's open issues tasks, while its queue runs.
+async fn task_label(app: &AppState, id: u64, repo: &RepoName) -> Result<Option<String>, ApiError> {
     if !app
         .store
         .repo_state(id, repo)
         .await?
         .is_some_and(|r| r.on())
     {
-        return Ok(false);
+        return Ok(None);
     }
     let gh = installation(app, id).await?;
-    let label = settings(app, &gh, id, repo).await?.0.label;
-    Ok(issue.labeled(&label))
+    Ok(Some(settings(app, &gh, id, repo).await?.0.label))
 }

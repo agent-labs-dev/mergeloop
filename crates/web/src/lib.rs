@@ -5,6 +5,7 @@ mod api;
 mod auth;
 mod billing;
 mod blog;
+mod builds;
 mod changelog;
 mod docs;
 mod gate;
@@ -29,7 +30,7 @@ use mergepatrol_billing::Billing;
 use mergepatrol_core::RepoSettings;
 use mergepatrol_github::{AppCredentials, GitHub};
 use mergepatrol_resolver::ChatGptAuth;
-use mergepatrol_store::{GITHUB_APP, Scope, Store, Vault};
+use mergepatrol_store::{BuildStore, GITHUB_APP, Scope, Store, Vault};
 use secrecy::ExposeSecret;
 
 pub use api::*;
@@ -38,6 +39,7 @@ pub use auth::{
     UserView,
 };
 pub use billing::{AccessView, BillingView, PricingView, RedirectView};
+pub use builds::*;
 pub use gate::merge_requested;
 pub use review::*;
 pub use webhook::Wake;
@@ -65,6 +67,7 @@ pub struct WebConfig {
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn Store>,
+    builds: Arc<dyn BuildStore>,
     vault: Arc<Vault>,
     public_url: Arc<str>,
     hosted_app: Option<Arc<AppCredentials>>,
@@ -98,13 +101,24 @@ impl AppState {
     }
 }
 
-pub fn router(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> Router {
-    serve(state(store, vault, config))
+pub fn router(
+    store: Arc<dyn Store>,
+    builds: Arc<dyn BuildStore>,
+    vault: Arc<Vault>,
+    config: WebConfig,
+) -> Router {
+    serve(state(store, builds, vault, config))
 }
 
-fn state(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> AppState {
+fn state(
+    store: Arc<dyn Store>,
+    builds: Arc<dyn BuildStore>,
+    vault: Arc<Vault>,
+    config: WebConfig,
+) -> AppState {
     AppState {
         store,
+        builds,
         vault,
         public_url: config.public_url.trim_end_matches('/').into(),
         hosted_app: config.hosted_app.map(Arc::new),
@@ -135,6 +149,15 @@ enum ApiError {
 impl ApiError {
     fn bad_request(m: &str) -> Self {
         Self::Status(StatusCode::BAD_REQUEST, m.to_owned())
+    }
+
+    /// For a log.
+    fn message(&self) -> String {
+        match self {
+            Self::Status(code, m) => format!("{code}: {m}"),
+            Self::GitHubLimited(_, m) => m.clone(),
+            Self::Internal(e) => format!("{e:#}"),
+        }
     }
 }
 
@@ -175,6 +198,8 @@ mod tests {
     use mergepatrol_store::{LoginCode, PgStore, Session, SessionKind};
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    mod build_lane;
 
     const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
@@ -230,44 +255,46 @@ mod tests {
     }
 
     async fn signed_in_state(pool: PgPool, config: WebConfig) -> AppState {
-        let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let pg = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let store: Arc<dyn Store> = pg.clone();
         let vault = Arc::new(Vault::new(store.clone(), KEY).unwrap());
-        let expires_at = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 600) as i64;
-        let kind = SessionKind::User {
-            login: "ada".into(),
-            avatar_url: String::new(),
-            installations: vec![1],
-        };
-        let github = UserToken {
-            access_token: "ghu_tok".into(),
+        let state = state(store, pg, vault, config);
+        sign_in(&state, "tok", "ada", "ghu_tok").await;
+        state.seen.assume_repos("ghu_x", 1, &READABLE);
+        state
+    }
+
+    /// Signs `login` in with the session `token`, holding their GitHub token `github`, which
+    /// reads the `READABLE` repos of installation 1, as GitHub said.
+    async fn sign_in(state: &AppState, token: &str, login: &str, github: &str) {
+        let user_token = UserToken {
+            access_token: github.into(),
             expires_at: Some(now() + 3600),
             refresh_token: None,
         };
-        let sealed = vault
+        let sealed = state
+            .vault
             .seal(
-                &format!("session/{}", auth::hash("tok")),
-                &serde_json::to_string(&github).unwrap(),
+                &format!("session/{}", auth::hash(token)),
+                &serde_json::to_string(&user_token).unwrap(),
             )
             .unwrap();
         let session = Session {
-            kind,
-            expires_at,
+            kind: SessionKind::User {
+                login: login.into(),
+                avatar_url: String::new(),
+                installations: vec![1],
+            },
+            expires_at: now() + 600,
             checked_at: now(),
             github: Some(sealed),
         };
-        store
-            .create_session(&auth::hash("tok"), &session)
+        state
+            .store
+            .create_session(&auth::hash(token), &session)
             .await
             .unwrap();
-        let state = state(store, vault, config);
-        for token in ["ghu_tok", "ghu_x"] {
-            state.seen.assume_repos(token, 1, &READABLE);
-        }
-        state
+        state.seen.assume_repos(github, 1, &READABLE);
     }
 
     fn web_config(hosted_app: Option<AppCredentials>, wake: Arc<Woken>) -> WebConfig {
@@ -298,9 +325,10 @@ mod tests {
 
     /// Another process on the same database: as after a restart, or on another instance.
     async fn restarted(pool: PgPool, hosted_app: Option<AppCredentials>) -> Router {
-        let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let pg = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let store: Arc<dyn Store> = pg.clone();
         let vault = Arc::new(Vault::new(store.clone(), KEY).unwrap());
-        router(store, vault, web_config(hosted_app, Arc::default()))
+        router(store, pg, vault, web_config(hosted_app, Arc::default()))
     }
 
     /// Where a redirect goes, and the cookies it sets.
@@ -1072,8 +1100,12 @@ mod tests {
             price: "price".into(),
         };
         let mut config = web_config(None, Arc::default());
-        config.billing = Some(Arc::new(Billing::new(pg, stripe, "http://localhost:8080")));
-        router(store, vault, config)
+        config.billing = Some(Arc::new(Billing::new(
+            pg.clone(),
+            stripe,
+            "http://localhost:8080",
+        )));
+        router(store, pg, vault, config)
     }
 
     async fn body(router: &Router, path: &str, cookie: &str) -> String {
@@ -1873,9 +1905,13 @@ mod tests {
                 webhook_secret: "whsec".into(),
                 price: "price".into(),
             };
-            config.billing = Some(Arc::new(Billing::new(pg, stripe, "http://localhost:8080")));
+            config.billing = Some(Arc::new(Billing::new(
+                pg.clone(),
+                stripe,
+                "http://localhost:8080",
+            )));
         }
-        let state = state(store.clone(), Arc::new(vault), config);
+        let state = state(store.clone(), pg, Arc::new(vault), config);
         state.seen.assume_repos("ghu_x", 1, &READABLE);
         for token in ["ghu_x", "ghp_y"] {
             let r = |name: &str| RepoName::parse(name).unwrap();

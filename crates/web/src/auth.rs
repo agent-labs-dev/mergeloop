@@ -26,6 +26,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use mergepatrol_analytics::WorkspaceInfo;
 use mergepatrol_core::RepoName;
 use mergepatrol_github::AppCredentials;
+pub(crate) use mergepatrol_github::percent_encode;
 use mergepatrol_github::setup::{self, Pkce, random_token};
 use mergepatrol_github::setup::{Revoked, UserInstallation, UserToken};
 use mergepatrol_store::{GITHUB_APP, LoginCode, Scope, Sealed, Session, SessionKind, Workspace};
@@ -148,6 +149,8 @@ pub struct ManifestForm {
 
 /// A signed-in user, and the installations they could access when they signed in.
 pub(crate) struct SignedIn {
+    /// Their GitHub login.
+    login: String,
     installations: Vec<u64>,
     token_hash: String,
     /// Their GitHub token, sealed. `None` for a session from before sessions kept it.
@@ -155,6 +158,41 @@ pub(crate) struct SignedIn {
 }
 
 impl SignedIn {
+    pub(crate) fn login(&self) -> &str {
+        &self.login
+    }
+
+    /// Whether GitHub says the user may push to `repo`, as it said within `SEEN_FOR`.
+    pub(crate) async fn may_push(
+        &self,
+        state: &AppState,
+        repo: &RepoName,
+    ) -> Result<bool, ApiError> {
+        let token = self.github_token(state)?;
+        let key = (hash(&token), repo.clone());
+        if state.seen.writers.get(&key).is_some() {
+            return Ok(true);
+        }
+        match state
+            .github
+            .as_user(&token)?
+            .can_write(&repo.to_string())
+            .await
+        {
+            // Only a yes is kept: one just given push access need not wait.
+            Ok(true) => state.seen.writers.put(key, ()),
+            Ok(false) => return Ok(false),
+            Err(e) if e.is::<Revoked>() => {
+                return Err(ApiError::Status(
+                    StatusCode::UNAUTHORIZED,
+                    "Sign in again first.".into(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(true)
+    }
+
     /// Refuses workspaces the user cannot access.
     pub(crate) fn workspace(&self, installation_id: u64) -> Result<u64, ApiError> {
         if self.installations.contains(&installation_id) {
@@ -248,10 +286,16 @@ impl FromRequestParts<AppState> for SignedIn {
 fn signed_in(session: Session, token_hash: String) -> Option<SignedIn> {
     match session {
         Session {
-            kind: SessionKind::User { installations, .. },
+            kind:
+                SessionKind::User {
+                    login,
+                    installations,
+                    ..
+                },
             github,
             ..
         } => Some(SignedIn {
+            login,
             installations,
             token_hash,
             github,
@@ -509,6 +553,10 @@ pub(crate) struct Seen {
     installations: Recent<RepoName, Option<u64>>,
     /// Whether each token's user administers a repo.
     admins: Recent<(String, RepoName), bool>,
+    /// The repos each token's user may push to.
+    writers: Recent<(String, RepoName), ()>,
+    /// The account ID of each login.
+    pub(crate) user_ids: Recent<String, u64>,
 }
 
 #[cfg(test)]
@@ -532,7 +580,7 @@ impl Seen {
     }
 }
 
-struct Recent<K, V>(Mutex<HashMap<K, (Instant, V)>>);
+pub(crate) struct Recent<K, V>(Mutex<HashMap<K, (Instant, V)>>);
 
 impl<K, V> Default for Recent<K, V> {
     fn default() -> Self {
@@ -541,14 +589,14 @@ impl<K, V> Default for Recent<K, V> {
 }
 
 impl<K: Eq + Hash, V: Clone> Recent<K, V> {
-    fn get(&self, key: &K) -> Option<V> {
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
         let map = self.0.lock().unwrap();
         map.get(key)
             .filter(|(at, _)| at.elapsed() < SEEN_FOR)
             .map(|(_, v)| v.clone())
     }
 
-    fn put(&self, key: K, value: V) {
+    pub(crate) fn put(&self, key: K, value: V) {
         let mut map = self.0.lock().unwrap();
         map.retain(|_, (at, _)| at.elapsed() < SEEN_FOR);
         map.insert(key, (Instant::now(), value));
@@ -1263,17 +1311,6 @@ fn error_redirect(error: &str) -> Response {
     tracing::warn!(%error, "sign-in or setup failed");
     let url = percent_encode(error);
     Redirect::to(&format!("/?error={url}")).into_response()
-}
-
-pub(crate) fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 #[cfg(test)]

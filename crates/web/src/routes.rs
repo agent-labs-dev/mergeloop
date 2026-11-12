@@ -14,7 +14,8 @@ use axum::routing::{MethodFilter, MethodRouter, on};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    AppState, api, auth, billing, changelog, mcp, need, oauth, review, review_stats, v1, webhook,
+    AppState, api, auth, billing, builds, changelog, mcp, need, oauth, review, review_stats, v1,
+    webhook,
 };
 
 pub(crate) struct Route {
@@ -65,7 +66,7 @@ pub(crate) enum Ty {
 
 /// A path parameter, the argument it is, and the argument's schema. `{owner}/{name}` is one
 /// argument: `repo`.
-pub(crate) static PATH_ARGS: [(&str, &str, Ty, &str); 5] = [
+pub(crate) static PATH_ARGS: [(&str, &str, Ty, &str); 6] = [
     (
         "id",
         "workspace",
@@ -85,6 +86,12 @@ pub(crate) static PATH_ARGS: [(&str, &str, Ty, &str); 5] = [
         "login",
         Ty::Str,
         "The GitHub login the seat is for.",
+    ),
+    (
+        "build",
+        "build",
+        Ty::Int,
+        "The build, as `claim_build` or `list_builds` gives it.",
     ),
 ];
 
@@ -237,6 +244,24 @@ pub(crate) static ROUTES: &[Route] = &[
     route!(PUT "/api/w/{id}/settings/review", review::set_review_settings, tool!("set_review_settings", Writes,
         "Sets the workspace's settings for the agent's review. A repo's config file can set its own, in `review`. Needs a MergeLoop sign-in.",
         arg("settings", Ty::Body, "`{ enabled, bars, require_resolved, depth }`: whether the repos' queues review queued PRs first; each kind's bar, `[{ kind, bar }]`, with kind `security`, `migrations`, `dependencies`, `public_api` or `other`, and bar a percent from 50 to 100: how sure the agent must be to send a change back to the author, lower sending more; or `\"always_ask\"`, to ask a human about the kind. A kind left out keeps its default; optionally whether the gate waits for every review thread to be resolved; and optionally `depth`, `quick`, `standard` or `deep`, how hard the review looks. Each optional one left out keeps what is saved."))),
+    route!(GET "/api/w/{id}/settings/builds", builds::build_settings, tool!("get_build_settings", Reads,
+        "Whether the workspace's build lane is on: its issues labeled with a repo's label are tasks that its developers' `mergeloop daemon` claims, builds on their machines, and opens PRs for. Off by default. Needs a MergeLoop sign-in.")),
+    route!(PUT "/api/w/{id}/settings/builds", builds::set_build_settings, tool!("set_build_settings", Writes,
+        "Turns the workspace's build lane on or off. Turning it off forgets its builds: the issues are read again when it is turned back on. Needs a MergeLoop sign-in.",
+        arg("enabled", Ty::Bool, "`true` on, `false` off."))),
+    route!(GET "/api/w/{id}/builds", builds::list_builds, tool!("list_builds", Reads,
+        "The build lane's builds in the repos you can read, oldest first: each issue's repo, number and title, its `status` (`ready`, a task; `claimed`, a daemon holds it; `stuck`, its holder gave up, for `reason`), who holds it (`holder`) with its `claim`, its `stage` (`building` or `reviewing`), seconds since its holder was heard from (`heard_secs`), and its PR. Refused while the lane is off. Needs a MergeLoop sign-in.",
+        opt("mine", Ty::Bool, "Only the builds your login holds. Default false."))),
+    route!(POST "/api/w/{id}/builds/claim", builds::claim_build, tool!("claim_build", Writes,
+        "Claims one task of the workspace for you, or answers null when there is none: an issue labeled with its repo's label, in a repo whose queue runs and that GitHub says you may push to, that nobody holds. Issues assigned to you come first, then unassigned ones; one assigned to someone else is never yours, unless its holder went unheard for 30 minutes. Assigns you on the issue. Returns the `build` and its `claim`, which its later calls pass, the repo, its clone URL, default branch and `verify` commands, the issue's number, title and body, the `branch` to push, the commits' `author` (the App's bot) and `co_author` (you), and the PR when the claim taken over had opened one. Heartbeat it with `heartbeat_build` at least every 30 minutes, or anyone may claim it again. Refused while the lane is off. Needs a MergeLoop sign-in.")),
+    route!(POST "/api/w/{id}/builds/{build}/heartbeat", builds::heartbeat_build, tool!("heartbeat_build", Writes,
+        "Says you are still working on a build you claimed, and what on. Refused once you no longer hold it: given back, or claimed again after 30 minutes unheard. Then stop working on it. Needs a MergeLoop sign-in.",
+        arg("claim", Ty::Int, "The `claim` that `claim_build` gave."),
+        opt("stage", Ty::OneOf(&["building", "reviewing"]), "What you are doing now."))),
+    route!(POST "/api/w/{id}/builds/{build}/release", builds::release_build, tool!("release_build", Writes,
+        "Gives back a build you claimed, so it is a task again and its issue no longer assigned to you by the claim, or marks it stuck with a reason, which goes on the issue as a comment. A stuck build is no task until a human takes the label off the issue and puts it back. Refused once you no longer hold it. Needs a MergeLoop sign-in.",
+        arg("claim", Ty::Int, "The `claim` that `claim_build` gave."),
+        opt("stuck", Ty::Str, "Why it cannot be built. Without it, the build is given back."))),
     route!(GET "/api/w/{id}/billing", billing::billing, tool!("get_billing", Reads,
         "The workspace's plan: trial or subscription, its seats, and the price. Null when self-hosted. Needs a MergeLoop sign-in.")),
     route!(POST "/api/w/{id}/billing/checkout", billing::checkout, tool!("start_checkout", Writes,

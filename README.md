@@ -206,7 +206,7 @@ The hosted MergeLoop uses one public GitHub App, which we create by hand on GitH
 | `MERGEPATROL_GITHUB_CLIENT_SECRET` | The OAuth client secret |
 | `MERGEPATROL_GITHUB_WEBHOOK_SECRET` | The webhook secret. Optional: without it, MergeLoop only polls |
 
-The App needs the permissions in `crates/github/src/setup.rs` (`manifest`), each with the reason it is there, the callback URL `<public URL>/auth/callback`, the setup URL `<public URL>/setup/installed`, and the webhook URL `<public URL>/webhooks/github`, subscribed to the events in `WEBHOOK_EVENTS` in the same file. An App created before `workflows: write` joined the manifest must be given it on GitHub, or the push of a rebase or fix of a PR that changes `.github/workflows` is refused. An App created before the `repository` event joined `WEBHOOK_EVENTS` must be subscribed to it on GitHub (the App's settings, **Permissions & events**, **Repository**). Until then, a change to a repo's merge settings reaches MergeLoop at its next merge or within 15 minutes.
+The App needs the permissions in `crates/github/src/setup.rs` (`manifest`), each with the reason it is there, the callback URL `<public URL>/auth/callback`, the setup URL `<public URL>/setup/installed`, and the webhook URL `<public URL>/webhooks/github`, subscribed to the events in `WEBHOOK_EVENTS` in the same file. An App created before `workflows: write` joined the manifest must be given it on GitHub, or the push of a rebase or fix of a PR that changes `.github/workflows` is refused. An App created before the `repository` event joined `WEBHOOK_EVENTS` must be subscribed to it on GitHub (the App's settings, **Permissions & events**, **Repository**). Until then, a change to a repo's merge settings reaches MergeLoop at its next merge or within 15 minutes. An App created before the `issues` event joined `WEBHOOK_EVENTS` must be subscribed to it the same way, for the build lane: until then, a labeled issue becomes a task only when a daemon's claim reads the repo's labeled issues again, at most every 5 minutes, and a stuck one becomes a task again only through the webhook.
 
 ### Rotate the secret key
 
@@ -348,6 +348,12 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `poll_chatgpt_login` | Finishes the ChatGPT sign-in once the user entered the code | Yes |
 | `get_review_settings` | The agent's review settings, and its track record | Yes |
 | `set_review_settings` | Turns the agent's review on or off, and sets how hard it looks and how sure it must be | Yes |
+| `get_build_settings` | Whether the workspace's build lane is on | Yes |
+| `set_build_settings` | Turns the build lane on or off | Yes |
+| `list_builds` | The build lane's builds: each issue, its status, who holds it and how lately they were heard from | Yes |
+| `claim_build` | Claims one task for you to build, in a repo you may push to | Yes |
+| `heartbeat_build` | Says you still work on a build you claimed | Yes |
+| `release_build` | Gives a build back, or marks it stuck with a reason | Yes |
 | `get_billing` | The workspace's plan and seats | Yes |
 | `start_checkout` | A Stripe page to subscribe | Yes |
 | `open_billing_portal` | A Stripe page to manage the subscription | Yes |

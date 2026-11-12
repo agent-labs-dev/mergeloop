@@ -20,7 +20,7 @@ fn browser(url: &str) -> anyhow::Result<()> {
 }
 
 fn sessions(home: &Path) -> PathBuf {
-    home.join(".mergeloop").join("session.json")
+    home.join(".mergeloop/session/session.json")
 }
 
 #[tokio::test]

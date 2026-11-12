@@ -19,9 +19,18 @@ Config file (~/.mergeloop/daemon.toml, or --config FILE; no file means these def
   workspace = \"~/.mergeloop/daemon\"
                              The daemon's folder: its clone of each repo, a worktree per
                              build, the agents' transcripts (kept 7 days)
-  access = \"workspace\"       \"workspace\": the agent has full access, without prompts,
-                             inside the workspace folder, and cannot write outside it.
+  access = \"workspace\"       \"workspace\": without prompts, the agent, what it runs and
+                             the verify commands may write only the build's own folder in
+                             the workspace, and may not read the deny_read paths.
                              \"full\": no confinement
+  deny_read = [...]          What a build may not read, in workspace access. Default: the
+                             MergeLoop session (~/.mergeloop/session) and where credentials
+                             live in a home folder: ~/.ssh, ~/.aws, ~/.gnupg, ~/.netrc,
+                             ~/.git-credentials, ~/.config/gh, ~/.config/gcloud, ~/.azure,
+                             ~/.docker/config.json, ~/.kube, ~/.npmrc, ~/.cargo/credentials,
+                             ~/.cargo/credentials.toml, ~/.pypirc, ~/.gem/credentials,
+                             ~/.codex/auth.json, ~/.claude/.credentials.json. A list here
+                             replaces it
 
   [builder]                  The agent that builds
   agent = \"claude\"           \"claude\" or \"codex\": the flags it gets, the output read
@@ -31,6 +40,30 @@ Config file (~/.mergeloop/daemon.toml, or --config FILE; no file means these def
   effort = \"\"                Default: the CLI's own
   args = []                  More arguments for every run
   timeout_minutes = 60       The longest one agent run may take";
+
+/// What a build may not read by default: the MergeLoop session, and where credentials live in
+/// a home folder. The agent CLIs read their own login themselves, outside their sandboxes, so
+/// denying it to what they run leaves them working.
+pub const DENY_READ: &[&str] = &[
+    "~/.mergeloop/session",
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.netrc",
+    "~/.git-credentials",
+    "~/.config/gh",
+    "~/.config/gcloud",
+    "~/.azure",
+    "~/.docker/config.json",
+    "~/.kube",
+    "~/.npmrc",
+    "~/.cargo/credentials",
+    "~/.cargo/credentials.toml",
+    "~/.pypirc",
+    "~/.gem/credentials",
+    "~/.codex/auth.json",
+    "~/.claude/.credentials.json",
+];
 
 /// Where the file is by default.
 pub fn default_path(home: &Path) -> PathBuf {
@@ -50,6 +83,8 @@ pub struct Config {
     pub slots: usize,
     pub workspace: PathBuf,
     pub access: AccessMode,
+    /// What a build may not read in `workspace` access.
+    pub deny_read: Vec<PathBuf>,
     pub builder: LocalAgent,
 }
 
@@ -57,7 +92,7 @@ impl Config {
     /// The access the agent runs with.
     pub fn access(&self) -> Access {
         match self.access {
-            AccessMode::Workspace => Access::Workspace(self.workspace.clone()),
+            AccessMode::Workspace => Access::workspace(&self.deny_read),
             AccessMode::Full => Access::Full,
         }
     }
@@ -86,6 +121,25 @@ impl Config {
         if !workspace.is_absolute() {
             bail!("workspace must be an absolute path, or start with ~/");
         }
+        let deny_read: Vec<PathBuf> = match file.deny_read {
+            Some(paths) => paths.iter().map(|p| expand(p, home)).collect(),
+            None => DENY_READ.iter().map(|p| expand(p, home)).collect(),
+        };
+        for path in &deny_read {
+            if !path.is_absolute() {
+                bail!(
+                    "deny_read paths must be absolute, or start with ~/: {}",
+                    path.display()
+                );
+            }
+            if workspace.starts_with(path) || path.starts_with(&workspace) {
+                bail!(
+                    "the workspace {} and the deny_read path {} overlap: a build could not read its own folder, or could read what it may not",
+                    workspace.display(),
+                    path.display()
+                );
+            }
+        }
         let b = file.builder;
         if b.timeout_minutes == 0 {
             bail!("builder.timeout_minutes must be at least 1");
@@ -95,6 +149,7 @@ impl Config {
             slots: file.slots,
             workspace,
             access: file.access,
+            deny_read,
             builder: LocalAgent {
                 vendor: b.agent,
                 command: blank(b.command).unwrap_or_else(|| b.agent.name().to_owned()),
@@ -122,6 +177,7 @@ struct File {
     slots: usize,
     workspace: Option<String>,
     access: AccessMode,
+    deny_read: Option<Vec<String>>,
     builder: AgentFile,
 }
 
@@ -131,6 +187,7 @@ impl Default for File {
             slots: 1,
             workspace: None,
             access: AccessMode::Workspace,
+            deny_read: None,
             builder: AgentFile::default(),
         }
     }
@@ -191,10 +248,14 @@ mod tests {
         assert_eq!(config.slots, 1);
         assert_eq!(config.workspace, home().join(".mergeloop/daemon"));
         assert_eq!(config.access, AccessMode::Workspace);
-        assert_eq!(
-            config.access(),
-            Access::Workspace(home().join(".mergeloop/daemon"))
+        assert!(
+            config
+                .deny_read
+                .contains(&home().join(".mergeloop/session"))
         );
+        assert!(config.deny_read.contains(&home().join(".ssh")));
+        assert_eq!(config.deny_read.len(), DENY_READ.len());
+        assert_eq!(config.access(), Access::workspace(&config.deny_read));
         let b = &config.builder;
         assert_eq!((b.vendor, b.command.as_str()), (Vendor::Claude, "claude"));
         assert_eq!((b.model.as_deref(), b.effort.as_deref()), (None, None));
@@ -229,6 +290,23 @@ timeout_minutes = 5
         assert_eq!(b.effort.as_deref(), Some("low"));
         assert_eq!(b.args, ["--enable", "x"]);
         assert_eq!(b.timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn deny_read_replaces_the_list_and_may_not_overlap_the_workspace() {
+        let config =
+            Config::parse("deny_read = [\"~/.secrets\", \"/etc/token\"]\n", &home()).unwrap();
+        assert_eq!(
+            config.deny_read,
+            [home().join(".secrets"), PathBuf::from("/etc/token")]
+        );
+        for text in [
+            "workspace = \"~/.ssh/builds\"\n",
+            "workspace = \"~/w\"\ndeny_read = [\"~/w/secret\"]\n",
+            "deny_read = [\"relative\"]\n",
+        ] {
+            assert!(Config::parse(text, &home()).is_err(), "{text}");
+        }
     }
 
     #[test]

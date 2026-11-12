@@ -3,7 +3,6 @@
 //! co-author, pushes with a minted token, and has the server open the PR. However it ends, the
 //! worktree and branch go, and the server hears how it ended.
 
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,7 +13,7 @@ use mergepatrol_resolver::{
 };
 use tokio::sync::watch;
 
-use super::folder::{self, Folder};
+use super::folder::{Checkout, Folder};
 use super::lane::{Lane, Stage, Task};
 use super::verify;
 use crate::client::{Refusal, needs_sign_in, refusal};
@@ -94,37 +93,40 @@ impl Builder {
     async fn work(&self, lane: &Lane, task: &Task) -> Result<Work> {
         lane.heartbeat(task, Stage::Building).await?;
         let token = heard(lane, task, || lane.mint(task)).await?;
-        let wt = self.folder.checkout(task, &token).await?;
-        let base = folder::rev_parse(&wt, "HEAD").await?;
-        say(task, &format!("building in {}", wt.display()));
-        let run = match self.change(task, &wt).await? {
+        let checkout = self.folder.checkout(task, &token).await?;
+        let base = Git.tree_head(&checkout.tree).await?;
+        say(
+            task,
+            &format!("building in {}", checkout.room.tree.display()),
+        );
+        let run = match self.change(task, &checkout).await? {
             Ok(run) => run,
             Err(why) => return Ok(Work::Stuck(why)),
         };
         // Ticket 07's review of the change goes here, before anything is pushed.
-        publish(lane, task, &wt, &base, &run).await
+        publish(lane, task, &checkout, &base, &run).await
     }
 
     /// The agent's change, which the verify commands pass: the agent's last run that names its
     /// commit. `Err` with why it is stuck when there is none.
-    async fn change(&self, task: &Task, wt: &Path) -> Result<Result<Resolution, String>> {
-        let run = self.run_agent(task, wt, None, "build").await?;
+    async fn change(&self, task: &Task, checkout: &Checkout) -> Result<Result<Resolution, String>> {
+        let room = &checkout.room;
+        let run = self.run_agent(task, checkout, None, "build").await?;
         if let Some(why) = stuck_by(&run.outcome) {
             return Ok(Err(why));
         }
-        let tmp = self.folder.tmp();
-        let Some(failed) = verify::run(&task.verify, wt, &self.access, &tmp).await? else {
+        let Some(failed) = verify::run(&task.verify, room, &self.access).await? else {
             return Ok(Ok(run));
         };
         say(
             task,
             &format!("`{}` failed: the agent fixes it", failed.command),
         );
-        let fix = self.run_agent(task, wt, Some(&failed), "fix").await?;
+        let fix = self.run_agent(task, checkout, Some(&failed), "fix").await?;
         if let Some(why) = stuck_by(&fix.outcome) {
             return Ok(Err(why));
         }
-        if let Some(failed) = verify::run(&task.verify, wt, &self.access, &tmp).await? {
+        if let Some(failed) = verify::run(&task.verify, room, &self.access).await? {
             return Ok(Err(format!(
                 "`{}` still fails after the agent's fix:\n```\n{}\n```",
                 failed.command,
@@ -141,7 +143,7 @@ impl Builder {
     async fn run_agent(
         &self,
         task: &Task,
-        wt: &Path,
+        checkout: &Checkout,
         failed: Option<&VerifyFailed>,
         step: &str,
     ) -> Result<Resolution> {
@@ -159,7 +161,7 @@ impl Builder {
             .join(format!("{step}.jsonl"));
         let run = self
             .agent
-            .run(wt, &prompt, &self.access, &self.folder.tmp(), &transcript)
+            .run(&checkout.room, &prompt, &self.access, &transcript)
             .await?;
         say(
             task,
@@ -183,19 +185,31 @@ fn stuck_by(outcome: &Outcome) -> Option<String> {
 async fn publish(
     lane: &Lane,
     task: &Task,
-    wt: &Path,
+    checkout: &Checkout,
     base: &str,
     run: &Resolution,
 ) -> Result<Work> {
     let subject = commit_subject(&run.text)
         .unwrap_or_else(|| format!("Build #{}: {}", task.issue, task.title));
-    if !folder::commit(wt, base, &subject, &task.author, &task.co_author).await? {
+    let (bot, dev) = (&task.author, &task.co_author);
+    let message = format!(
+        "{subject}\n\nCo-authored-by: {} <{}>\n",
+        dev.name, dev.email
+    );
+    let author = (bot.name.as_str(), bot.email.as_str());
+    if !Git.squash(&checkout.tree, base, &message, author).await? {
         return Ok(Work::Stuck("The agent changed nothing.".into()));
     }
-    let head = folder::rev_parse(wt, "HEAD").await?;
+    let head = Git.tree_head(&checkout.tree).await?;
     let token = heard(lane, task, || lane.mint(task)).await?;
-    Git.push_branch(wt, &token, &task.clone_url, &head, &task.branch)
-        .await?;
+    Git.push_branch(
+        &checkout.clone,
+        &token,
+        &task.clone_url,
+        &head,
+        &task.branch,
+    )
+    .await?;
     say(task, &format!("pushed {}", task.branch));
     let description = build_description(&run.text);
     let pr = heard(lane, task, || lane.open_pr(task, &subject, &description)).await?;

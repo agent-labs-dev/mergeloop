@@ -3,17 +3,20 @@
 //! is the developer's to name, so a wrapper that takes the CLI's flags (as `mclaude` takes
 //! `claude`'s) runs where the CLI would.
 //!
-//! What it may touch is `Access`: confined to a folder, or not at all. Each CLI enforces the
-//! confinement itself, as checked by hand on 2026-11-12 with Claude Code 2.1.321 and Codex
-//! 0.167.2 on macOS:
-//! - Claude Code: its sandbox confines the shell's writes to the working directories (the
-//!   worktree, and the folder through `--add-dir`) and to its own temp folder
-//!   `/tmp/claude-<uid>`, which its shell needs: denying it breaks every command.
-//!   `permissions.blockWritesOutsideWorkingDirectories` confines its file tools to the
-//!   working directories. Nothing prompts: anything that would is denied.
-//! - Codex: `--sandbox workspace-write` confines writes to the worktree and the folder through
-//!   `--add-dir`, without `/tmp` or `$TMPDIR`. It keeps every `.git` read-only, so the agent
-//!   cannot commit: its caller commits.
+//! What a run may touch is `Access`, around the run's `Room`. Each CLI enforces it itself, as
+//! checked by hand on 2026-11-12 with Claude Code 2.1.321 and Codex 0.167.2 on macOS:
+//! - Claude Code: its sandbox confines the shell's writes to the working directories (the tree,
+//!   and the room through `--add-dir`), with `$TMPDIR` in the room, and to its own temp folder
+//!   `/tmp/claude-<uid>`, which its shell needs: denying it breaks every command. Its
+//!   `filesystem.denyRead` denies the shell the listed paths, and `Read` deny rules deny them to
+//!   its file tools, through a symlink too. `permissions.blockWritesOutsideWorkingDirectories`
+//!   confines its file tools' writes. Nothing prompts: anything that would is denied. Only the
+//!   developer's own settings load (`--setting-sources user`): a tree's `.claude/` settings are
+//!   the repo's, or a build's own, and must not loosen any of this.
+//! - Codex: a permission profile, given in `-c`, lets commands read everything but the listed
+//!   paths and write only the room; its file-editing tool is held to the same. The developer's
+//!   `config.toml` is not read (`--ignore-user-config`; the login still is): a `sandbox_mode` in
+//!   it would replace the profile with the older sandbox settings.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -40,29 +43,83 @@ impl Vendor {
     }
 }
 
-/// What the agent may touch.
+/// One run's room: the tree it works in, inside a folder of its own that also holds its temp
+/// folder. In `workspace` access the room is all that the run, and what it runs, may write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Room {
+    pub root: PathBuf,
+    pub tree: PathBuf,
+}
+
+impl Room {
+    /// The run's `TMPDIR`.
+    pub fn tmp(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+}
+
+/// What a run may touch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Access {
-    /// Everything inside this folder, with no prompts, and no writes outside it but the CLI's
-    /// own temp folder, where it needs one (see the module's doc).
-    Workspace(PathBuf),
+    /// Writes only in the run's room, but where a CLI cannot hold to that (`caveats`), no reads
+    /// of `deny_read`, and no prompts.
+    Workspace { deny_read: Vec<PathBuf> },
     /// The whole machine, with no prompts.
     Full,
 }
 
 impl Access {
-    /// What a CLI cannot hold to in this mode, for the developer to know. `None` when it holds.
-    pub fn caveat(&self, vendor: Vendor) -> Option<&'static str> {
-        match (self, vendor) {
-            (Access::Full, _) | (Access::Workspace(_), Vendor::Codex) => None,
-            (Access::Workspace(_), Vendor::Claude) => Some(
-                "Claude Code's sandbox also lets the agent's shell write to its own temp folder, \
-/tmp/claude-<uid>: the shell does not run without it. On Linux it needs bubblewrap and socat; \
-without them Claude Code refuses to start rather than run unconfined.",
-            ),
+    /// `workspace` access that denies reads of `paths`, each by the path given and by where it
+    /// really is: a sandbox matches a path after following its symlinks.
+    pub fn workspace(paths: &[PathBuf]) -> Self {
+        let mut deny_read = Vec::new();
+        for path in paths {
+            deny_read.push(path.clone());
+            if let Ok(real) = path.canonicalize()
+                && real != *path
+            {
+                deny_read.push(real);
+            }
         }
+        Access::Workspace { deny_read }
+    }
+
+    /// What a CLI does not hold to in this mode on this machine, for the developer to know.
+    pub fn caveats(&self, vendor: Vendor) -> Vec<&'static str> {
+        let Access::Workspace { .. } = self else {
+            return vec![];
+        };
+        let mut said = match vendor {
+            Vendor::Claude => vec![
+                "Claude Code's shell can also write to its own temp folder, /tmp/claude-<uid>, \
+which every build shares: its shell does not run without it.",
+            ],
+            Vendor::Codex => vec![],
+        };
+        if cfg!(target_os = "linux") {
+            said.push(match vendor {
+                Vendor::Claude => {
+                    "On Linux, Claude Code's sandbox needs bubblewrap and socat, and refuses to \
+start without them; MergeLoop has not checked its read denials on Linux."
+                }
+                Vendor::Codex => {
+                    "On Linux, Codex's sandbox enforces the read denials; MergeLoop has not \
+checked them on Linux."
+                }
+            });
+        }
+        if cfg!(target_os = "macos") {
+            said.push(
+                "Nothing stops the agent from asking the macOS keychain for what it holds, as \
+your own programs can.",
+            );
+        }
+        said
     }
 }
+
+/// The name of the Codex permission profile a `workspace` run gets.
+const CODEX_PROFILE: &str = "mergeloop-build";
 
 /// One agent CLI, as the developer set it up.
 #[derive(Clone, Debug)]
@@ -81,24 +138,24 @@ pub struct LocalAgent {
 }
 
 impl LocalAgent {
-    /// The agent's run in `workdir`, given `prompt`. The agent's temp folder is `tmp`.
-    pub fn command(
-        &self,
-        workdir: &Path,
-        prompt: &str,
-        access: &Access,
-        tmp: &Path,
-    ) -> tokio::process::Command {
+    /// The agent's run in `room`'s tree, given `prompt`. Its temp folder is the room's.
+    pub fn command(&self, room: &Room, prompt: &str, access: &Access) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.command);
-        cmd.current_dir(workdir).env("TMPDIR", tmp);
+        cmd.current_dir(&room.tree).env("TMPDIR", room.tmp());
         match self.vendor {
-            Vendor::Claude => self.claude(&mut cmd, prompt, access),
-            Vendor::Codex => self.codex(&mut cmd, workdir, prompt, access),
+            Vendor::Claude => self.claude(&mut cmd, room, prompt, access),
+            Vendor::Codex => self.codex(&mut cmd, room, prompt, access),
         }
         cmd
     }
 
-    fn claude(&self, cmd: &mut tokio::process::Command, prompt: &str, access: &Access) {
+    fn claude(
+        &self,
+        cmd: &mut tokio::process::Command,
+        room: &Room,
+        prompt: &str,
+        access: &Access,
+    ) {
         cmd.arg("-p").arg(prompt).args([
             "--output-format",
             "stream-json",
@@ -112,7 +169,14 @@ impl LocalAgent {
             cmd.args(["--effort", effort]);
         }
         match access {
-            Access::Workspace(folder) => {
+            Access::Workspace { deny_read } => {
+                let paths: Vec<String> =
+                    deny_read.iter().map(|p| p.display().to_string()).collect();
+                // A permission rule's absolute path starts with `//`.
+                let rules: Vec<String> = paths
+                    .iter()
+                    .flat_map(|p| [format!("Read(/{p})"), format!("Read(/{p}/**)")])
+                    .collect();
                 let settings = json!({
                     "sandbox": {
                         "enabled": true,
@@ -121,14 +185,17 @@ impl LocalAgent {
                         "autoAllowBashIfSandboxed": true,
                         "allowUnsandboxedCommands": false,
                         "network": { "allowedDomains": ["*"] },
+                        "filesystem": { "denyRead": paths },
                     },
                     "permissions": {
                         "blockWritesOutsideWorkingDirectories": true,
                         "denyInsteadOfPrompting": true,
+                        "deny": rules,
                     },
                 });
-                cmd.args(["--permission-mode", "acceptEdits", "--add-dir"])
-                    .arg(folder)
+                cmd.args(["--setting-sources", "user"])
+                    .args(["--permission-mode", "acceptEdits", "--add-dir"])
+                    .arg(&room.root)
                     .arg("--settings")
                     .arg(settings.to_string());
             }
@@ -137,16 +204,10 @@ impl LocalAgent {
         cmd.args(&self.args);
     }
 
-    fn codex(
-        &self,
-        cmd: &mut tokio::process::Command,
-        workdir: &Path,
-        prompt: &str,
-        access: &Access,
-    ) {
+    fn codex(&self, cmd: &mut tokio::process::Command, room: &Room, prompt: &str, access: &Access) {
         let toml = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
         cmd.args(["exec", "--json", "--ephemeral", "--cd"])
-            .arg(workdir);
+            .arg(&room.tree);
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
         }
@@ -155,33 +216,44 @@ impl LocalAgent {
                 .arg(format!("model_reasoning_effort={}", toml(effort)));
         }
         match access {
-            Access::Workspace(folder) => {
-                cmd.args(["--sandbox", "workspace-write"])
-                    .args(["-c", "approval_policy=\"never\""])
-                    .args(["-c", "sandbox_workspace_write.network_access=true"])
-                    .args(["-c", "sandbox_workspace_write.exclude_slash_tmp=true"])
-                    .args(["-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true"])
-                    .arg("--add-dir")
-                    .arg(folder);
+            Access::Workspace { deny_read } => {
+                let path = |p: &Path| toml(&p.display().to_string());
+                let mut rules = vec![
+                    format!("{} = \"read\"", toml(":root")),
+                    format!("{} = \"write\"", path(&room.root)),
+                ];
+                rules.extend(deny_read.iter().map(|p| format!("{} = \"deny\"", path(p))));
+                cmd.arg("--ignore-user-config")
+                    .args([
+                        "-c",
+                        &format!("default_permissions={}", toml(CODEX_PROFILE)),
+                    ])
+                    .arg("-c")
+                    .arg(format!(
+                        "permissions.{CODEX_PROFILE}.filesystem={{{}}}",
+                        rules.join(", ")
+                    ))
+                    .arg("-c")
+                    .arg(format!("permissions.{CODEX_PROFILE}.network.enabled=true"))
+                    .args(["-c", "approval_policy=\"never\""]);
             }
             Access::Full => _ = cmd.arg("--dangerously-bypass-approvals-and-sandbox"),
         }
         cmd.args(&self.args).arg(prompt);
     }
 
-    /// Runs the agent in `workdir` with `prompt`, keeping its output in `transcript`. A run on
+    /// Runs the agent in `room` with `prompt`, keeping its output in `transcript`. A run on
     /// the developer's own login bills their plan, so it has no cost. An error when it could not
     /// start.
     pub async fn run(
         &self,
-        workdir: &Path,
+        room: &Room,
         prompt: &str,
         access: &Access,
-        tmp: &Path,
         transcript: &Path,
     ) -> Result<Resolution> {
-        tokio::fs::create_dir_all(tmp).await?;
-        let cmd = self.command(workdir, prompt, access, tmp);
+        tokio::fs::create_dir_all(room.tmp()).await?;
+        let cmd = self.command(room, prompt, access);
         let name = &self.command;
         let mut resolution = match self.vendor {
             Vendor::Claude => {
@@ -235,14 +307,31 @@ mod tests {
         argv.windows(pair.len()).any(|w| w == pair)
     }
 
+    fn room() -> Room {
+        Room {
+            root: "/ws/builds/1".into(),
+            tree: "/ws/builds/1/tree".into(),
+        }
+    }
+
+    fn workspace() -> Access {
+        Access::Workspace {
+            deny_read: vec!["/home/ana/.ssh".into(), "/home/ana/.netrc".into()],
+        }
+    }
+
     #[test]
     fn the_command_is_the_one_configured_and_takes_the_vendors_flags() {
         let mut claude = agent(Vendor::Claude, "mclaude");
         claude.model = Some("haiku".into());
         claude.args = vec!["--strict-mcp-config".into()];
-        let ws = Access::Workspace("/ws".into());
-        let a = argv(&claude.command(Path::new("/ws/b/1"), "do it", &ws, Path::new("/ws/tmp")));
+        let cmd = claude.command(&room(), "do it", &workspace());
+        let a = argv(&cmd);
         assert_eq!(a[0], "mclaude");
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(Path::new("/ws/builds/1/tree"))
+        );
         assert!(has(&a, &["-p", "do it"]), "{a:?}");
         assert!(has(&a, &["--output-format", "stream-json"]), "{a:?}");
         assert!(has(&a, &["--model", "haiku"]), "{a:?}");
@@ -250,73 +339,95 @@ mod tests {
         assert_eq!(a.last().unwrap(), "--strict-mcp-config");
 
         let codex = agent(Vendor::Codex, "codex");
-        let a = argv(&codex.command(Path::new("/ws/b/1"), "do it", &ws, Path::new("/ws/tmp")));
+        let a = argv(&codex.command(&room(), "do it", &workspace()));
         assert_eq!(a[..3], ["codex", "exec", "--json"]);
-        assert!(has(&a, &["--cd", "/ws/b/1"]), "{a:?}");
+        assert!(has(&a, &["--cd", "/ws/builds/1/tree"]), "{a:?}");
         assert_eq!(a.last().unwrap(), "do it");
         assert!(!a.iter().any(|x| x.contains("model_provider")), "{a:?}");
     }
 
     #[test]
-    fn workspace_access_confines_each_cli_to_the_folder_without_prompts() {
-        let ws = Access::Workspace("/ws".into());
-        let claude = argv(&agent(Vendor::Claude, "claude").command(
-            Path::new("/ws/b/1"),
-            "p",
-            &ws,
-            Path::new("/ws/tmp"),
-        ));
-        assert!(
-            has(&claude, &["--permission-mode", "acceptEdits"]),
-            "{claude:?}"
-        );
-        assert!(has(&claude, &["--add-dir", "/ws"]), "{claude:?}");
-        let settings = &claude[claude.iter().position(|a| a == "--settings").unwrap() + 1];
+    fn workspace_access_lets_claude_write_only_its_room_and_read_nothing_denied() {
+        let a = argv(&agent(Vendor::Claude, "claude").command(&room(), "p", &workspace()));
+        assert!(has(&a, &["--permission-mode", "acceptEdits"]), "{a:?}");
+        assert!(has(&a, &["--add-dir", "/ws/builds/1"]), "{a:?}");
+        assert!(has(&a, &["--setting-sources", "user"]), "{a:?}");
+        let settings = &a[a.iter().position(|x| x == "--settings").unwrap() + 1];
         let settings: serde_json::Value = serde_json::from_str(settings).unwrap();
         assert_eq!(settings["sandbox"]["enabled"], true);
         assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
         assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
         assert_eq!(
+            settings["sandbox"]["filesystem"]["denyRead"],
+            json!(["/home/ana/.ssh", "/home/ana/.netrc"])
+        );
+        assert_eq!(
+            settings["permissions"]["deny"],
+            json!([
+                "Read(//home/ana/.ssh)",
+                "Read(//home/ana/.ssh/**)",
+                "Read(//home/ana/.netrc)",
+                "Read(//home/ana/.netrc/**)"
+            ])
+        );
+        assert_eq!(
             settings["permissions"]["blockWritesOutsideWorkingDirectories"],
             true
-        );
-
-        let codex = argv(&agent(Vendor::Codex, "codex").command(
-            Path::new("/ws/b/1"),
-            "p",
-            &ws,
-            Path::new("/ws/tmp"),
-        ));
-        assert!(has(&codex, &["--sandbox", "workspace-write"]), "{codex:?}");
-        assert!(has(&codex, &["--add-dir", "/ws"]), "{codex:?}");
-        assert!(
-            has(&codex, &["-c", "approval_policy=\"never\""]),
-            "{codex:?}"
-        );
-        assert!(
-            !codex.iter().any(|a| a.contains("dangerously")),
-            "{codex:?}"
         );
     }
 
     #[test]
+    fn workspace_access_gives_codex_a_profile_that_writes_only_its_room() {
+        let a = argv(&agent(Vendor::Codex, "codex").command(&room(), "p", &workspace()));
+        assert!(a.contains(&"--ignore-user-config".to_owned()), "{a:?}");
+        assert!(
+            has(&a, &["-c", "default_permissions=\"mergeloop-build\""]),
+            "{a:?}"
+        );
+        assert!(
+            has(
+                &a,
+                &[
+                    "-c",
+                    "permissions.mergeloop-build.filesystem={\":root\" = \"read\", \
+\"/ws/builds/1\" = \"write\", \"/home/ana/.ssh\" = \"deny\", \"/home/ana/.netrc\" = \"deny\"}"
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(has(&a, &["-c", "approval_policy=\"never\""]), "{a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("dangerously") || x == "--sandbox" || x == "--add-dir"),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn a_denied_path_is_denied_where_it_really_is_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("dotfiles-ssh");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().canonicalize().unwrap().join(".ssh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let Access::Workspace { deny_read } = Access::workspace(std::slice::from_ref(&link)) else {
+            unreachable!()
+        };
+        assert_eq!(deny_read, [link, real]);
+    }
+
+    #[test]
     fn full_access_lifts_the_confinement() {
-        let claude = argv(&agent(Vendor::Claude, "claude").command(
-            Path::new("."),
-            "p",
-            &Access::Full,
-            Path::new("/t"),
-        ));
+        let claude = argv(&agent(Vendor::Claude, "claude").command(&room(), "p", &Access::Full));
         assert!(has(&claude, &["--permission-mode", "bypassPermissions"]));
         assert!(!claude.iter().any(|a| a == "--settings" || a == "--add-dir"));
-        let codex = argv(&agent(Vendor::Codex, "codex").command(
-            Path::new("."),
-            "p",
-            &Access::Full,
-            Path::new("/t"),
-        ));
+        let codex = argv(&agent(Vendor::Codex, "codex").command(&room(), "p", &Access::Full));
         assert!(codex.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
-        assert!(!codex.iter().any(|a| a == "--sandbox"));
+        assert!(
+            !codex
+                .iter()
+                .any(|a| a == "--sandbox" || a.contains("permissions"))
+        );
     }
 
     /// A CLI that prints `lines` as its output, and notes the `TMPDIR` it was given.
@@ -350,15 +461,13 @@ mod tests {
                 serde_json::json!({ "type": "result", "result": "MERGEPATROL_GIVE_UP: too vague", "is_error": false }),
             ],
         );
-        let tmp = dir.path().join("tmp");
+        let room = Room {
+            root: dir.path().to_owned(),
+            tree: dir.path().to_owned(),
+        };
+        let tmp = room.tmp();
         let run = agent(Vendor::Claude, &command)
-            .run(
-                dir.path(),
-                "p",
-                &Access::Full,
-                &tmp,
-                &dir.path().join("t.jsonl"),
-            )
+            .run(&room, "p", &Access::Full, &dir.path().join("t.jsonl"))
             .await
             .unwrap();
         assert_eq!(run.outcome, Outcome::GaveUp("too vague".into()));
@@ -380,14 +489,12 @@ mod tests {
                 serde_json::json!({ "type": "turn.completed", "usage": { "input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 1 } }),
             ],
         );
+        let room = Room {
+            root: dir.path().to_owned(),
+            tree: dir.path().to_owned(),
+        };
         let run = agent(Vendor::Codex, &command)
-            .run(
-                dir.path(),
-                "p",
-                &Access::Full,
-                &dir.path().join("tmp"),
-                &dir.path().join("t.jsonl"),
-            )
+            .run(&room, "p", &Access::Full, &dir.path().join("t.jsonl"))
             .await
             .unwrap();
         assert_eq!(run.outcome, Outcome::Resolved);
@@ -398,14 +505,12 @@ mod tests {
     #[tokio::test]
     async fn a_command_that_is_not_there_is_an_error_that_names_it() {
         let dir = tempfile::tempdir().unwrap();
+        let room = Room {
+            root: dir.path().to_owned(),
+            tree: dir.path().to_owned(),
+        };
         let err = agent(Vendor::Claude, "no-such-agent-cli")
-            .run(
-                dir.path(),
-                "p",
-                &Access::Full,
-                &dir.path().join("tmp"),
-                &dir.path().join("t.jsonl"),
-            )
+            .run(&room, "p", &Access::Full, &dir.path().join("t.jsonl"))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no-such-agent-cli"), "{err:#}");

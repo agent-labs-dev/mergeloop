@@ -36,7 +36,7 @@ async fn mergeloop(fake: &fake::Server, home: &Path, token: Option<&str>, args: 
 
 fn sign_in(fake: &fake::Server, home: &Path, session: &str) {
     fake.add_session(session);
-    let path = home.join(".mergeloop").join("session.json");
+    let path = home.join(".mergeloop/session/session.json");
     session::keep(
         &path,
         &Server::parse(&fake.url).unwrap(),
@@ -152,7 +152,7 @@ async fn help_says_what_is_sent_and_where_the_session_is_kept() {
     for said in [
         "mergeloop login",
         "mergeloop logout",
-        "~/.mergeloop/session.json",
+        "~/.mergeloop/session/session.json",
         "MERGELOOP_TOKEN",
     ] {
         assert!(help.contains(said), "{said}: {help}");

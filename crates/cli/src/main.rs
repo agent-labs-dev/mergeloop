@@ -39,7 +39,8 @@ workspace, a GitHub token only single repos. A session the server no longer take
 error: run `mergeloop login` again.
 
 Files:
-  ~/.mergeloop/session.json   The sessions, one per server, readable by you only.
+  ~/.mergeloop/session/session.json
+                              The sessions, one per server, readable by you only.
 
 Environment:
   MERGELOOP_TOKEN   A GitHub token, sent instead of the session.

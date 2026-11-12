@@ -18,6 +18,16 @@ const COMMITTER: (&str, &str) = ("MergeLoop", "mergeloop@users.noreply.github.co
 #[derive(Clone, Copy, Default)]
 pub struct Git;
 
+/// A worktree whose files someone else may have written, such as a build's agent. Git runs on
+/// it by its git dir, named here, never found through the tree's `.git`, which could point at a
+/// repo with hooks or config of its writer's. Make one with `Git::add_tree`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tree {
+    /// The worktree's own git dir, in its clone's `worktrees/`.
+    pub git_dir: PathBuf,
+    pub work_tree: PathBuf,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RebaseStep {
     Done,
@@ -216,6 +226,92 @@ impl Git {
         )
         .await?;
         Ok(())
+    }
+
+    /// A worktree of `clone` at `dir`, on local branch `branch` at `rev`. Its git dir is read
+    /// now, while nobody else has written to `dir`.
+    pub async fn add_tree(
+        &self,
+        clone: &Path,
+        dir: &Path,
+        branch: &str,
+        rev: &str,
+    ) -> Result<Tree> {
+        self.run(
+            clone,
+            &["worktree", "add", "-q", "-B", branch, path_str(dir)?, rev],
+        )
+        .await?;
+        let link = tokio::fs::read_to_string(dir.join(".git")).await?;
+        let git_dir = PathBuf::from(
+            link.trim()
+                .strip_prefix("gitdir: ")
+                .context("a worktree whose .git names no git dir")?,
+        );
+        if !git_dir.starts_with(clone.join("worktrees")) {
+            bail!(
+                "the worktree at {} has its git dir outside its clone",
+                dir.display()
+            );
+        }
+        Ok(Tree {
+            git_dir,
+            work_tree: dir.to_owned(),
+        })
+    }
+
+    /// Commits everything in `tree` since `base` as one commit, by `author` as author and
+    /// committer, on the tree's branch: what was committed on top of `base` folds into it.
+    /// `false` when there is nothing to commit.
+    pub async fn squash(
+        &self,
+        tree: &Tree,
+        base: &str,
+        message: &str,
+        author: (&str, &str),
+    ) -> Result<bool> {
+        let run = |args: &[&str]| output(self.on_tree(tree, args), "git");
+        run(&["reset", "-q", "--soft", base]).await?;
+        run(&["add", "-A"]).await?;
+        if run(&["diff", "--cached", "--quiet"]).await.is_ok() {
+            return Ok(false);
+        }
+        let mut cmd = self.on_tree(
+            tree,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "-F",
+                "-",
+            ],
+        );
+        cmd.env("GIT_AUTHOR_NAME", author.0)
+            .env("GIT_AUTHOR_EMAIL", author.1)
+            .env("GIT_COMMITTER_NAME", author.0)
+            .env("GIT_COMMITTER_EMAIL", author.1);
+        input(cmd.stdin(Stdio::piped()), message.as_bytes(), "git commit").await?;
+        Ok(true)
+    }
+
+    /// The commit `tree` is at.
+    pub async fn tree_head(&self, tree: &Tree) -> Result<String> {
+        let out = output(
+            self.on_tree(tree, &["rev-parse", "--verify", "HEAD"]),
+            "git rev-parse",
+        )
+        .await?;
+        Ok(String::from_utf8(out)?.trim().to_owned())
+    }
+
+    fn on_tree(&self, tree: &Tree, args: &[&str]) -> tokio::process::Command {
+        let git_dir = format!("--git-dir={}", tree.git_dir.display());
+        let work_tree = format!("--work-tree={}", tree.work_tree.display());
+        let mut all = vec![git_dir.as_str(), work_tree.as_str()];
+        all.extend(args);
+        self.git(&tree.work_tree, &all)
     }
 
     pub async fn remove_worktree(&self, cache: &Path, dir: &Path) -> Result<()> {
@@ -618,10 +714,13 @@ impl Git {
         )
     }
 
+    /// Every git MergeLoop runs: with no hooks, whatever the repo or its config says, so that
+    /// nothing a repo's writer left there runs as MergeLoop.
     fn git(&self, cwd: &Path, args: &[&str]) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("git");
         cmd.current_dir(cwd)
             .kill_on_drop(true)
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .env("GIT_COMMITTER_NAME", COMMITTER.0)
             .env("GIT_COMMITTER_EMAIL", COMMITTER.1)
@@ -634,7 +733,8 @@ impl Git {
         output(self.git(cwd, args), &format!("git {}", args.join(" "))).await
     }
 
-    async fn run(&self, cwd: &Path, args: &[&str]) -> Result<String> {
+    /// `git args` in `cwd`, its output: an error with git's when it fails.
+    pub async fn run(&self, cwd: &Path, args: &[&str]) -> Result<String> {
         Ok(String::from_utf8(self.output(cwd, args).await?)?)
     }
 
@@ -898,6 +998,92 @@ mod tests {
         std::fs::write(dir.join("test.txt"), "weakened\n").unwrap();
         assert!(!Git.holds(dir, &patch).await.unwrap());
         assert!(Git.patch_of(dir, &head, &[]).await.unwrap().is_empty());
+    }
+
+    /// Writes an executable script at `path` that touches `marker`.
+    fn tripwire(path: &Path, marker: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_on_a_tree_runs_nothing_that_the_tree_or_its_clone_could_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        let base = commit(&src, "a.txt", "1");
+        let clone = root.join("c.git");
+        sh(&root, &["clone", "-q", "--bare", "src", "c.git"]);
+        let dir = root.join("builds/1/tree");
+        let tree = Git
+            .add_tree(&clone, &dir, "mergeloop/build-1", &base)
+            .await
+            .unwrap();
+        assert!(
+            tree.git_dir.starts_with(clone.join("worktrees")),
+            "{tree:?}"
+        );
+        assert_eq!(tree.work_tree, dir);
+
+        let fired = root.join("fired");
+        // Hooks in the clone: off for every call.
+        for hook in ["pre-commit", "post-commit", "reference-transaction"] {
+            tripwire(&clone.join("hooks").join(hook), &fired.join(hook));
+        }
+        // A tree that points its `.git` at a repo of its own, with hooks, a filter and an
+        // fsmonitor, and a nested repo with an fsmonitor of its own.
+        let evil = dir.join("evil");
+        sh(&dir, &["init", "-q", "--bare", "evil"]);
+        tripwire(&evil.join("hooks/pre-commit"), &fired.join("tree-hook"));
+        tripwire(&root.join("monitor"), &fired.join("monitor"));
+        tripwire(&root.join("clean"), &fired.join("filter"));
+        let config = format!(
+            "[core]\n\tfsmonitor = {}\n[filter \"evil\"]\n\tclean = {}\n",
+            root.join("monitor").display(),
+            root.join("clean").display()
+        );
+        std::fs::write(evil.join("config"), &config).unwrap();
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        sh(&nested, &["init", "-q"]);
+        commit(&nested, "n.txt", "n");
+        std::fs::write(nested.join(".git/config"), &config).unwrap();
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
+
+        assert!(
+            Git.squash(&tree, &base, "Change a", ("Bot", "bot@example.com"))
+                .await
+                .unwrap()
+        );
+        let head = Git.tree_head(&tree).await.unwrap();
+        assert_eq!(
+            sh(&clone, &["rev-parse", "refs/heads/mergeloop/build-1"]),
+            head
+        );
+        assert_eq!(
+            sh(&clone, &["log", "-1", "--format=%s|%an|%cn", &head]),
+            "Change a|Bot|Bot"
+        );
+        let ran: Vec<_> = std::fs::read_dir(&fired)
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(ran.is_empty(), "ran {ran:?}");
+        // Nothing to commit is no commit.
+        assert!(
+            !Git.squash(&tree, &head, "Again", ("Bot", "bot@example.com"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

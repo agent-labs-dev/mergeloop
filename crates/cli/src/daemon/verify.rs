@@ -1,14 +1,16 @@
-//! The repo's verify commands, run by the daemon in a build's worktree. The agent may have
-//! changed what they run, so in `workspace` access they get the agent's confinement: no writes
-//! outside the workspace folder. macOS confines them with `sandbox-exec`, Linux with
-//! `bwrap` (bubblewrap); elsewhere `workspace` access is refused when the daemon starts.
+//! The repo's verify commands, run by the daemon in a build's tree. The agent may have changed
+//! what they run, so in `workspace` access they get the agent's confinement: writes only in the
+//! build's room, and no reads of the denied paths, through a symlink either. macOS confines them
+//! with `sandbox-exec`, which matches a path after following its symlinks, Linux with `bwrap`
+//! (bubblewrap), which hides each denied path that exists under an empty one; elsewhere
+//! `workspace` access is refused when the daemon starts.
 
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use mergepatrol_resolver::{Access, VerifyFailed};
+use mergepatrol_resolver::{Access, Room, VerifyFailed};
 
 /// The longest one verify command may take.
 const TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -18,7 +20,7 @@ const TAIL: usize = 6000;
 /// Whether this machine can confine the verify commands to `access`. An error says what is
 /// missing.
 pub async fn check(access: &Access) -> Result<()> {
-    let Access::Workspace(_) = access else {
+    let Access::Workspace { .. } = access else {
         return Ok(());
     };
     let (program, arg) = if cfg!(target_os = "macos") {
@@ -53,18 +55,18 @@ pub async fn check(access: &Access) -> Result<()> {
     Ok(())
 }
 
-/// Runs each command in `wt`, in order, until one fails: that one and the end of its output.
+/// Runs each command in the room's tree, in order, until one fails: that one and the end of its
+/// output.
 pub async fn run(
     commands: &[String],
-    wt: &Path,
+    room: &Room,
     access: &Access,
-    tmp: &Path,
 ) -> Result<Option<VerifyFailed>> {
-    tokio::fs::create_dir_all(tmp).await?;
+    tokio::fs::create_dir_all(room.tmp()).await?;
     for command in commands {
-        let mut cmd = shell(command, access);
-        cmd.current_dir(wt)
-            .env("TMPDIR", tmp)
+        let mut cmd = shell(command, room, access);
+        cmd.current_dir(&room.tree)
+            .env("TMPDIR", room.tmp())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -90,38 +92,63 @@ pub async fn run(
     Ok(None)
 }
 
-/// `sh -c command`, confined to the workspace folder in `workspace` access.
-fn shell(command: &str, access: &Access) -> tokio::process::Command {
-    let Access::Workspace(folder) = access else {
+/// `sh -c command`, confined to the room in `workspace` access.
+fn shell(command: &str, room: &Room, access: &Access) -> tokio::process::Command {
+    let Access::Workspace { deny_read } = access else {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", command]);
         return cmd;
     };
-    let folder = folder.to_string_lossy();
     if cfg!(target_os = "macos") {
-        let quoted = folder.replace('\\', "\\\\").replace('"', "\\\"");
-        let profile = format!(
-            "(version 1)(allow default)(deny file-write*)\
-             (allow file-write* (subpath \"{quoted}\") (literal \"/dev/null\") (literal \"/dev/zero\") \
-             (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\") (subpath \"/dev/fd\"))"
-        );
         let mut cmd = tokio::process::Command::new("sandbox-exec");
-        cmd.args(["-p", &profile, "sh", "-c", command]);
+        cmd.arg("-p")
+            .arg(profile(&room.root, deny_read))
+            .args(["sh", "-c", command]);
         cmd
     } else {
         let mut cmd = tokio::process::Command::new("bwrap");
-        cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
-            .args([
-                "--bind",
-                &folder,
-                &folder,
-                "--die-with-parent",
-                "sh",
-                "-c",
-                command,
-            ]);
+        cmd.args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--bind",
+        ])
+        .arg(&room.root)
+        .arg(&room.root);
+        for path in deny_read {
+            match std::fs::metadata(path) {
+                Ok(m) if m.is_dir() => _ = cmd.arg("--tmpfs").arg(path),
+                Ok(_) => _ = cmd.args(["--ro-bind", "/dev/null"]).arg(path),
+                // What is not there cannot be read, nor made there: the room is all it writes.
+                Err(_) => {}
+            }
+        }
+        cmd.args(["--die-with-parent", "sh", "-c", command]);
         cmd
     }
+}
+
+/// The `sandbox-exec` profile: writes only in `root` and to the terminal devices, and no reads
+/// of `deny_read`.
+fn profile(root: &Path, deny_read: &[std::path::PathBuf]) -> String {
+    let quote = |p: &Path| {
+        let p = p.to_string_lossy();
+        format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let mut profile = format!(
+        "(version 1)(allow default)(deny file-write*)\
+         (allow file-write* (subpath {}) (literal \"/dev/null\") (literal \"/dev/zero\") \
+         (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\") (subpath \"/dev/fd\"))",
+        quote(root)
+    );
+    for path in deny_read {
+        profile.push_str(&format!("(deny file-read* (subpath {}))", quote(path)));
+    }
+    profile
 }
 
 /// The last `TAIL` bytes of `s`, cut at a character.
@@ -137,6 +164,13 @@ fn tail(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn room(dir: &Path) -> Room {
+        Room {
+            root: dir.to_owned(),
+            tree: dir.to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn the_first_failing_command_is_named_with_its_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -145,28 +179,16 @@ mod tests {
             "echo broken >&2; exit 3".to_owned(),
             "touch never".to_owned(),
         ];
-        let failed = run(
-            &commands,
-            dir.path(),
-            &Access::Full,
-            &dir.path().join("tmp"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let room = room(dir.path());
+        let failed = run(&commands, &room, &Access::Full).await.unwrap().unwrap();
         assert_eq!(failed.command, "echo broken >&2; exit 3");
         assert_eq!(failed.output.trim(), "broken");
         assert!(!dir.path().join("never").exists());
         assert!(
-            run(
-                &commands[..1],
-                dir.path(),
-                &Access::Full,
-                &dir.path().join("tmp")
-            )
-            .await
-            .unwrap()
-            .is_none()
+            run(&commands[..1], &room, &Access::Full)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -180,30 +202,55 @@ mod tests {
         assert_eq!(t, "a".repeat(TAIL - 1));
     }
 
-    /// Writing inside the workspace folder works, outside it fails.
-    #[cfg(target_os = "macos")]
+    /// In the room it writes; beside it, and outside, it does not; a denied path it does not
+    /// read, nor a symlink to it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
-    async fn in_workspace_access_a_command_cannot_write_outside_the_folder() {
+    async fn in_workspace_access_a_command_writes_only_its_room_and_reads_nothing_denied() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let (ws, outside) = (root.join("ws"), root.join("outside"));
-        std::fs::create_dir_all(ws.join("wt")).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let access = Access::Workspace(ws.clone());
+        let room = Room {
+            root: root.join("ws/builds/1"),
+            tree: root.join("ws/builds/1/tree"),
+        };
+        let (sibling, decoy) = (root.join("ws/builds/2"), root.join("decoy"));
+        for d in [&room.tree, &sibling, &decoy] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(decoy.join("secret"), "DECOY").unwrap();
+        std::os::unix::fs::symlink(decoy.join("secret"), room.tree.join("link")).unwrap();
+        let access = Access::workspace(std::slice::from_ref(&decoy));
         check(&access).await.unwrap();
         let inside = vec!["echo x > made && echo y > \"$TMPDIR/t\"".to_owned()];
-        let wt = ws.join("wt");
-        assert!(
-            run(&inside, &wt, &access, &ws.join("tmp"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(wt.join("made").exists() && ws.join("tmp/t").exists());
+        assert!(run(&inside, &room, &access).await.unwrap().is_none());
+        assert!(room.tree.join("made").exists() && room.tmp().join("t").exists());
 
-        let escape = vec![format!("echo x > {}/escaped", outside.display())];
-        let failed = run(&escape, &wt, &access, &ws.join("tmp")).await.unwrap();
-        assert!(failed.is_some());
-        assert!(!outside.join("escaped").exists());
+        for (command, left) in [
+            (
+                format!("echo x > {}/escaped", sibling.display()),
+                sibling.join("escaped"),
+            ),
+            (
+                format!("echo x > {}/escaped", root.display()),
+                root.join("escaped"),
+            ),
+        ] {
+            assert!(run(&[command], &room, &access).await.unwrap().is_some());
+            assert!(!left.exists());
+        }
+        for read in [
+            format!("cat {}/secret", decoy.display()),
+            "cat link".to_owned(),
+        ] {
+            let failed = run(std::slice::from_ref(&read), &room, &access)
+                .await
+                .unwrap();
+            let failed = failed.unwrap_or_else(|| panic!("{read} read the decoy"));
+            assert!(
+                !failed.output.contains("DECOY"),
+                "{read}: {}",
+                failed.output
+            );
+        }
     }
 }

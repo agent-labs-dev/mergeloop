@@ -67,7 +67,7 @@ impl Daemon {
             },
             self.config.workspace.display()
         );
-        if let Some(caveat) = access.caveat(agent.vendor) {
+        for caveat in access.caveats(agent.vendor) {
             eprintln!("mergeloop: daemon: note: {caveat}");
         }
         let (folder, _lock) = Folder::open(&self.config.workspace)?;

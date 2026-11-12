@@ -101,9 +101,24 @@ impl World {
         Config::parse(&text, self.root()).unwrap()
     }
 
+    /// `config` in `workspace` access, denying reads of `deny_read`.
+    fn confined(&self, command: &Path, deny_read: &[PathBuf]) -> Config {
+        let paths: Vec<String> = deny_read
+            .iter()
+            .map(|p| format!("\"{}\"", p.display()))
+            .collect();
+        let text = format!(
+            "workspace = \"{}\"\naccess = \"workspace\"\ndeny_read = [{}]\n\n[builder]\ncommand = \"{}\"\n",
+            self.workspace().display(),
+            paths.join(", "),
+            command.display()
+        );
+        Config::parse(&text, self.root()).unwrap()
+    }
+
     fn client(&self) -> Client {
         self.fake.add_session("sess");
-        let path = self.root().join("home/.mergeloop/session.json");
+        let path = self.root().join("home/.mergeloop/session/session.json");
         let server = Server::parse(&self.fake.url).unwrap();
         session::keep(&path, &server, &Secret::new("sess".into())).unwrap();
         Client::signed_in(&server, &path).unwrap()
@@ -320,7 +335,7 @@ async fn two_slots_never_run_more_than_two_builds_at_once() {
     std::fs::create_dir_all(&gauge).unwrap();
     // Each run marks itself running, notes how many are, and stays a while.
     let body = format!(
-        "g='{g}'; touch \"$g/run.$$\"; ls \"$g\" | grep -c '^run' >> \"$g/counts\"; sleep 1; rm \"$g/run.$$\"; echo x > x.txt",
+        "g='{g}'; touch \"$g/run.$$\"; ls \"$g\" | grep -c '^run' >> \"$g/counts\"; sleep 3; rm \"$g/run.$$\"; echo x > x.txt",
         g = gauge.display()
     );
     let agent = w.agent("slow", &body, BUILT);
@@ -336,6 +351,90 @@ async fn two_slots_never_run_more_than_two_builds_at_once() {
     assert_eq!(counts.len(), 3);
     assert_eq!(counts.iter().max(), Some(&2), "{counts:?}");
     assert_eq!(w.fake.lane(|l| l.opened.len()), 3);
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+/// A verify command a build's agent wrote, trying what it may not, each attempt noted in the
+/// tree as `<what> wrote` or `<what> denied`.
+fn hostile(ws: &Path, fired: &Path, session: &Path) -> String {
+    let (ws, fired, session) = (ws.display(), fired.display(), session.display());
+    let clone = format!("{ws}/repos/o/r.git");
+    let trip = format!("#!/bin/sh\\ntouch {fired}/$0.ran\\ncat\\n");
+    [
+        format!("printf '{trip}' > {clone}/hooks/post-commit && chmod +x {clone}/hooks/post-commit && echo hook wrote || echo hook denied"),
+        format!("printf '{trip}' > {clone}/hooks/reference-transaction && echo ref-hook wrote || echo ref-hook denied"),
+        format!("printf '[filter \"evil\"]\\n\\tclean = {fired}/clean\\n' >> {clone}/config && echo filter wrote || echo filter denied"),
+        format!("rm -f {ws}/daemon/lock && echo lock wrote || echo lock denied"),
+        format!("mkdir -p {ws}/builds/2/tree && echo other-build wrote || echo other-build denied"),
+        format!("cat {session} && echo session wrote || echo session denied"),
+        // What the build may write: its own tree, pointed at a repo of its own.
+        "echo '* filter=evil' > .gitattributes".to_owned(),
+        format!("git init -q --bare evil && printf '{trip}' > evil/hooks/pre-commit && chmod +x evil/hooks/pre-commit && printf '[core]\\n\\tfsmonitor = {fired}/monitor\\n[filter \"evil\"]\\n\\tclean = {fired}/clean\\n' > evil/config"),
+        "echo \"gitdir: $PWD/evil\" > .git".to_owned(),
+    ]
+    .iter()
+    .map(|line| format!("({line}) >> attempts 2>/dev/null"))
+    .collect::<Vec<_>>()
+    .join("; ")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_verify_command_writes_only_its_own_tree_and_reads_no_session() {
+    let w = World::new().await;
+    let fired = w.root().join("fired");
+    std::fs::create_dir_all(&fired).unwrap();
+    // The session the daemon signed in with is in its own folder, denied to every build.
+    let session_dir = w.root().join("home/.mergeloop/session");
+    let ws = w.root().canonicalize().unwrap().join("ws");
+    let verify = hostile(&ws, &fired, &session_dir.join("session.json"));
+    w.fake.add_task(w.task(8, 18, &[&verify]));
+    let agent = w.agent("builder", "echo x > x.txt", BUILT);
+    let config = w.confined(&agent, &[session_dir]);
+
+    w.run(config, |w| w.fake.lane(|l| l.ended() == 1)).await;
+
+    assert_eq!(
+        w.fake.lane(|l| l.opened.len()),
+        1,
+        "{:?}",
+        w.fake.lane(|l| l.released.clone())
+    );
+    let attempts = git(&w.remote(), &["show", "mergeloop/build-18:attempts"]);
+    for what in [
+        "hook",
+        "ref-hook",
+        "filter",
+        "lock",
+        "other-build",
+        "session",
+    ] {
+        assert!(
+            attempts.contains(&format!("{what} denied")),
+            "{what}: {attempts}"
+        );
+    }
+    assert!(!attempts.contains("wrote"), "{attempts}");
+    let session =
+        std::fs::read_to_string(w.root().join("home/.mergeloop/session/session.json")).unwrap();
+    assert!(
+        !attempts.contains(session.trim()),
+        "read the session: {attempts}"
+    );
+    let clone = ws.join("repos/o/r.git");
+    assert!(!clone.join("hooks/post-commit").exists());
+    assert!(
+        !std::fs::read_to_string(clone.join("config"))
+            .unwrap()
+            .contains("evil")
+    );
+    assert!(ws.join("daemon/lock").exists());
+    // The daemon's git ran none of what the tree pointed it at.
+    let ran: Vec<_> = std::fs::read_dir(&fired)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(ran.is_empty(), "ran {ran:?}");
     assert_eq!(w.left(), (vec![], vec![]));
 }
 

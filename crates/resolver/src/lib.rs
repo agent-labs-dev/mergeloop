@@ -20,7 +20,7 @@ pub use chatgpt::{ChatGptAuth, ChatGptLogin, DeviceLogin};
 pub use claude::ClaudeResolver;
 pub use codex::CodexResolver;
 pub use keys::{KeyCheck, check_api_key};
-pub use local::{Access, LocalAgent, Vendor};
+pub use local::{Access, LocalAgent, Room, Vendor};
 pub use vote::{DOES_NOT_HOLD, HOLDS, claim, vote};
 
 use std::path::Path;

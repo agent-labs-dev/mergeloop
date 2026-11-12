@@ -31,12 +31,17 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// Where the sessions are kept: `~/.mergeloop/session.json`.
+/// Where the sessions are kept: `~/.mergeloop/session/session.json`. The folder holds nothing
+/// else of MergeLoop's but the file's lock and its temp files, so the daemon denies it whole to
+/// what a build runs.
 pub fn path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .context("no HOME to keep the session in")?;
-    Ok(PathBuf::from(home).join(".mergeloop").join("session.json"))
+    Ok(PathBuf::from(home)
+        .join(".mergeloop")
+        .join("session")
+        .join("session.json"))
 }
 
 /// The server's session, if one was kept.

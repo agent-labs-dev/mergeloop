@@ -4,26 +4,28 @@
 //! <workspace>/
 //!   daemon/lock               held while a daemon uses the folder: one at a time
 //!   daemon/id                 the daemon's name for itself, made once: its claims are its own
-//!   repos/<owner>/<name>.git  a bare clone of each repo it builds in
-//!   builds/<build>/           a git worktree per build, on the local branch `mergeloop/build-<issue>`
+//!   repos/<owner>/<name>.git  a bare clone of each repo it builds in, with its worktrees' git dirs
+//!   builds/<build>/           the build's room: all that the build may write
+//!     tree/                   its git worktree, on the local branch `mergeloop/build-<issue>`
+//!     tmp/                    its TMPDIR
 //!   transcripts/<build>/      the agents' output, kept 7 days
-//!   tmp/                      the agents' TMPDIR
 //! ```
 //!
-//! A build's worktree and branch go when the build ends, however it ends. Every removal is
-//! idempotent, and `reconcile` on start removes whatever a crash left of builds the daemon does
-//! not hold.
+//! Nothing of the daemon's, nor any git metadata, is in a room: what a build runs cannot change
+//! what the daemon runs next. A build's room and branch go when the build ends, however it
+//! ends. Every removal is idempotent, and `reconcile` on start removes whatever a crash left of
+//! builds the daemon does not hold.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use mergepatrol_git::Git;
+use mergepatrol_git::{Git, Tree};
+use mergepatrol_resolver::Room;
 
-use super::lane::{Identity, Task};
+use super::lane::Task;
 
 /// How long transcripts are kept.
 pub const TRANSCRIPTS_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -78,16 +80,17 @@ impl Folder {
         &self.id
     }
 
-    pub fn tmp(&self) -> PathBuf {
-        self.root.join("tmp")
-    }
-
     pub fn clone_of(&self, repo: &str) -> PathBuf {
         self.root.join("repos").join(format!("{repo}.git"))
     }
 
-    pub fn worktree(&self, build: u64) -> PathBuf {
-        self.root.join("builds").join(build.to_string())
+    /// The build's room: its tree, and its temp folder.
+    pub fn room(&self, build: u64) -> Room {
+        let root = self.root.join("builds").join(build.to_string());
+        Room {
+            tree: root.join("tree"),
+            root,
+        }
     }
 
     pub fn transcripts(&self, build: u64) -> PathBuf {
@@ -99,9 +102,9 @@ impl Folder {
         locks.entry(clone.to_owned()).or_default().clone()
     }
 
-    /// A fresh worktree for the task on its branch, at the default branch as GitHub has it now:
-    /// fetched with `token`.
-    pub async fn checkout(&self, task: &Task, token: &str) -> Result<PathBuf> {
+    /// A fresh room for the task, its tree on the task's branch at the default branch as GitHub
+    /// has it now: fetched with `token`.
+    pub async fn checkout(&self, task: &Task, token: &str) -> Result<Checkout> {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
@@ -111,46 +114,37 @@ impl Folder {
         let base = format!("refs/remotes/origin/{}", task.default_branch);
         let refspec = format!("+refs/heads/{}:{base}", task.default_branch);
         Git.fetch(&clone, token, &[&refspec]).await?;
-        let dir = self.worktree(task.build);
-        self.remove_locked(&clone, &dir, &task.branch).await?;
-        tokio::fs::create_dir_all(self.root.join("builds")).await?;
-        git(
-            &clone,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-B",
-                &task.branch,
-                path(&dir)?,
-                &base,
-            ],
-        )
-        .await?;
-        Ok(dir)
+        let room = self.room(task.build);
+        self.remove_locked(&clone, &room.root, &task.branch).await?;
+        tokio::fs::create_dir_all(room.tmp()).await?;
+        let tree = Git
+            .add_tree(&clone, &room.tree, &task.branch, &base)
+            .await?;
+        Ok(Checkout { clone, room, tree })
     }
 
-    /// Removes the build's worktree and its local branch. Nothing there is fine.
+    /// Removes the build's room and its local branch. Nothing there is fine.
     pub async fn remove(&self, task: &Task) -> Result<()> {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
-        self.remove_locked(&clone, &self.worktree(task.build), &task.branch)
+        self.remove_locked(&clone, &self.room(task.build).root, &task.branch)
             .await
     }
 
-    async fn remove_locked(&self, clone: &Path, dir: &Path, branch: &str) -> Result<()> {
-        remove_dir(dir).await?;
+    async fn remove_locked(&self, clone: &Path, room: &Path, branch: &str) -> Result<()> {
+        remove_dir(room).await?;
         if !clone.join("HEAD").exists() {
             return Ok(());
         }
-        git(clone, &["worktree", "prune"]).await?;
+        Git.run(clone, &["worktree", "prune"]).await?;
         let refname = format!("refs/heads/{branch}");
-        if git(clone, &["show-ref", "--verify", "--quiet", &refname])
+        if Git
+            .run(clone, &["show-ref", "--verify", "--quiet", &refname])
             .await
             .is_ok()
         {
-            git(clone, &["update-ref", "-d", &refname]).await?;
+            Git.run(clone, &["update-ref", "-d", &refname]).await?;
         }
         Ok(())
     }
@@ -182,28 +176,29 @@ impl Folder {
             // A clone a crash left before `git init`: nothing in it to keep.
             return remove_dir(clone).await;
         }
-        let url = git(clone, &["remote", "get-url", "origin"]).await?;
+        let url = Git.run(clone, &["remote", "get-url", "origin"]).await?;
         Git.ensure_cache(clone, url.trim()).await?;
-        git(clone, &["worktree", "prune"]).await?;
-        let used = git(clone, &["worktree", "list", "--porcelain"]).await?;
+        Git.run(clone, &["worktree", "prune"]).await?;
+        let used = Git.run(clone, &["worktree", "list", "--porcelain"]).await?;
         let used: Vec<&str> = used
             .lines()
             .filter_map(|l| l.strip_prefix("branch "))
             .collect();
-        let branches = git(
-            clone,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads/mergeloop/",
-            ],
-        )
-        .await?;
+        let branches = Git
+            .run(
+                clone,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads/mergeloop/",
+                ],
+            )
+            .await?;
         let stale = branches
             .lines()
             .filter(|b| b.starts_with(BRANCHES) && !used.contains(b));
         for branch in stale {
-            git(clone, &["update-ref", "-d", branch]).await?;
+            Git.run(clone, &["update-ref", "-d", branch]).await?;
         }
         Ok(())
     }
@@ -221,63 +216,11 @@ impl Folder {
     }
 }
 
-/// Commits everything in `wt` since `base` as one commit by `author`, with `co_author` in a
-/// trailer. The agent may have left its change uncommitted, or committed it: either way it is
-/// one commit. `false` when there is nothing to commit.
-pub async fn commit(
-    wt: &Path,
-    base: &str,
-    subject: &str,
-    author: &Identity,
-    co_author: &Identity,
-) -> Result<bool> {
-    git(wt, &["reset", "-q", "--soft", base]).await?;
-    git(wt, &["add", "-A"]).await?;
-    if git(wt, &["diff", "--cached", "--quiet"]).await.is_ok() {
-        return Ok(false);
-    }
-    let message = format!(
-        "{subject}\n\nCo-authored-by: {} <{}>\n",
-        co_author.name, co_author.email
-    );
-    let mut cmd = command(
-        wt,
-        &[
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "--no-verify",
-            "-F",
-            "-",
-        ],
-    );
-    cmd.env("GIT_AUTHOR_NAME", &author.name)
-        .env("GIT_AUTHOR_EMAIL", &author.email)
-        .env("GIT_COMMITTER_NAME", &author.name)
-        .env("GIT_COMMITTER_EMAIL", &author.email)
-        .stdin(Stdio::piped());
-    let mut child = cmd.spawn().context("git commit: spawn")?;
-    use tokio::io::AsyncWriteExt;
-    let mut stdin = child.stdin.take().context("stdin")?;
-    stdin.write_all(message.as_bytes()).await?;
-    drop(stdin);
-    let out = child.wait_with_output().await?;
-    if !out.status.success() {
-        bail!(
-            "git commit: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(true)
-}
-
-/// The commit at `rev` in `wt`.
-pub async fn rev_parse(wt: &Path, rev: &str) -> Result<String> {
-    Ok(git(wt, &["rev-parse", "--verify", rev])
-        .await?
-        .trim()
-        .to_owned())
+/// A build's checkout: its room, and its tree as git knows it, in its clone.
+pub struct Checkout {
+    pub clone: PathBuf,
+    pub room: Room,
+    pub tree: Tree,
 }
 
 /// The name kept in `dir/id`, made the first time. Written whole or not at all.
@@ -316,35 +259,4 @@ async fn remove_dir(dir: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("remove {}", dir.display())),
     }
-}
-
-fn path(p: &Path) -> Result<&str> {
-    p.to_str().context("a path that is not UTF-8")
-}
-
-fn command(cwd: &Path, args: &[&str]) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.current_dir(cwd)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    cmd
-}
-
-async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = command(cwd, args)
-        .output()
-        .await
-        .with_context(|| format!("git {}: spawn", args.join(" ")))?;
-    if !out.status.success() {
-        bail!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(out.stdout)?)
 }

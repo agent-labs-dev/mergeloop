@@ -16,7 +16,7 @@ CREATE TABLE builds (
     body TEXT NOT NULL DEFAULT '',
     -- The issue's assignees on GitHub, by login: its pre-assignment.
     assignees TEXT[] NOT NULL DEFAULT '{}',
-    -- `ready`, `claimed` or `stuck`.
+    -- `ready`; held by a daemon: `claimed`, `landing` or `waiting`; `stuck` or `merged`.
     status TEXT NOT NULL DEFAULT 'ready',
     -- The login that holds the claim, or held it last.
     holder TEXT,

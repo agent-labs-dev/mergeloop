@@ -85,11 +85,17 @@ async fn require_lane(app: &AppState, id: u64) -> Result<(), ApiError> {
 pub enum BuildStatusView {
     /// A task: a developer may claim it.
     Ready,
-    /// A daemon holds it.
+    /// A daemon holds it and builds it.
     Claimed,
+    /// A daemon holds it and lands its PR.
+    Landing,
+    /// A daemon holds it, and its PR waits on a human.
+    Waiting,
     /// Its holder gave up, and said why. It is a task again once a human takes the label off
     /// the issue and puts it back.
     Stuck,
+    /// Its PR merged.
+    Merged,
 }
 
 impl From<BuildStatus> for BuildStatusView {
@@ -97,7 +103,10 @@ impl From<BuildStatus> for BuildStatusView {
         match s {
             BuildStatus::Ready => Self::Ready,
             BuildStatus::Claimed => Self::Claimed,
+            BuildStatus::Landing => Self::Landing,
+            BuildStatus::Waiting => Self::Waiting,
             BuildStatus::Stuck => Self::Stuck,
+            BuildStatus::Merged => Self::Merged,
         }
     }
 }
@@ -191,7 +200,7 @@ pub(crate) async fn list_builds(
             .into_iter()
             .filter(|b| readable.contains(&b.repo))
             .filter(|b| {
-                !mine || (b.status == BuildStatus::Claimed && b.holder.as_deref() == Some(login))
+                !mine || (b.status.held() && b.holder.as_deref() == Some(login))
             })
             .map(BuildView::from)
             .collect(),
@@ -500,7 +509,7 @@ async fn released_on_github(gh: &Installation, released: &Build, login: &str, st
             );
             mirror(gh.comment(repo, issue, &comment).await, released, "comment");
         }
-        None if released.mirrored => {
+        None if released.mirrored && released.status == BuildStatus::Ready => {
             mirror(gh.unassign(repo, issue, login).await, released, "unassign");
         }
         None => {}

@@ -385,10 +385,12 @@ async fn user_get(token: &str, path: &str) -> Result<reqwest::Response> {
     get_as(&client()?, format!("{API}{path}"), token).await
 }
 
-/// As [`user_get`], with any client at any URL.
+/// As [`user_get`], with any client at any URL. The timeout is this call's, not the client's:
+/// a question about a token waits no longer on `AsUser`'s client than on [`client`]'s.
 async fn get_as(http: &reqwest::Client, url: String, token: &str) -> Result<reqwest::Response> {
     let res = http
         .get(url)
+        .timeout(TIMEOUT)
         .bearer_auth(token)
         .header("accept", "application/vnd.github+json")
         .send()
@@ -533,10 +535,13 @@ async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest
     }
 }
 
+/// How long a call with a user's token may take.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
+        .timeout(TIMEOUT)
         .build()?)
 }
 

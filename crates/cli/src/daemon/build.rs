@@ -43,6 +43,8 @@ pub enum Ended {
     GivenBack(String),
     /// Ended without a word to the server, which no longer has it for this daemon.
     Dropped(String),
+    /// Its PR merged before the daemon was done opening it.
+    Merged,
 }
 
 /// What the work itself came to, before the server hears of it.
@@ -91,7 +93,7 @@ impl Builder {
 
     async fn work(&self, lane: &Lane, task: &Task) -> Result<Work> {
         lane.heartbeat(task, Stage::Building).await?;
-        let token = mint(lane, task).await?;
+        let token = heard(lane, task, || lane.mint(task)).await?;
         let wt = self.folder.checkout(task, &token).await?;
         let base = folder::rev_parse(&wt, "HEAD").await?;
         say(task, &format!("building in {}", wt.display()));
@@ -191,13 +193,12 @@ async fn publish(
         return Ok(Work::Stuck("The agent changed nothing.".into()));
     }
     let head = folder::rev_parse(wt, "HEAD").await?;
-    let token = mint(lane, task).await?;
+    let token = heard(lane, task, || lane.mint(task)).await?;
     Git.push_branch(wt, &token, &task.clone_url, &head, &task.branch)
         .await?;
     say(task, &format!("pushed {}", task.branch));
-    let pr = lane
-        .open_pr(task, &subject, &build_description(&run.text))
-        .await?;
+    let description = build_description(&run.text);
+    let pr = heard(lane, task, || lane.open_pr(task, &subject, &description)).await?;
     say(task, &format!("opened PR #{pr}"));
     Ok(Work::Opened(pr))
 }
@@ -209,6 +210,8 @@ enum Settle {
     Nothing(Ended),
     /// `release_build`, stuck for the reason or given back.
     Release(Option<String>, Ended),
+    /// `report_build` `merged`: the PR merged.
+    Merged,
     /// The sign-in is no good: the daemon must stop.
     Fatal(anyhow::Error),
 }
@@ -231,6 +234,7 @@ fn settlement(work: Result<Work>) -> Settle {
         Some(Refusal::Cancelled | Refusal::MayNotPush) => {
             Settle::Release(None, Ended::GivenBack(said))
         }
+        Some(Refusal::Merged) => Settle::Merged,
         _ => Settle::Release(Some(shorten(&said)), Ended::Stuck(said)),
     }
 }
@@ -244,6 +248,14 @@ async fn settle(lane: &Lane, task: &Task, work: Result<Work>) -> Result<Ended> {
             return Err(e);
         }
         Settle::Release(stuck, ended) => (stuck, ended),
+        Settle::Merged => {
+            match lane.report_merged(task).await {
+                Err(e) if needs_sign_in(&e) => return Err(e),
+                Err(e) => say(task, &format!("could not report it merged: {e:#}")),
+                Ok(()) => {}
+            }
+            return Ok(Ended::Merged);
+        }
     };
     match lane.release(task, stuck.as_deref()).await {
         Err(e) if needs_sign_in(&e) => return Err(e),
@@ -253,14 +265,19 @@ async fn settle(lane: &Lane, task: &Task, work: Result<Work>) -> Result<Ended> {
     Ok(ended)
 }
 
-/// A token for the build's repo, heartbeating first when the server went too long without one.
-async fn mint(lane: &Lane, task: &Task) -> Result<String> {
-    match lane.mint(task).await {
+/// `call`'s answer, heartbeating and asking once more when the server went too long without a
+/// heartbeat: it acts only for a live claim.
+async fn heard<T, F: std::future::Future<Output = Result<T>>>(
+    lane: &Lane,
+    task: &Task,
+    call: impl Fn() -> F,
+) -> Result<T> {
+    match call().await {
         Err(e) if refusal(&e) == Some(Refusal::Unheard) => {
             lane.heartbeat(task, Stage::Building).await?;
-            lane.mint(task).await
+            call().await
         }
-        minted => minted,
+        answered => answered,
     }
 }
 
@@ -343,6 +360,10 @@ mod tests {
                 Settle::Nothing(Ended::Dropped(_))
             ));
         }
+        assert!(matches!(
+            settlement(Err(refused(409, Some(Refusal::Merged)))),
+            Settle::Merged
+        ));
         assert!(matches!(
             settlement(Err(refused(401, None))),
             Settle::Fatal(_)

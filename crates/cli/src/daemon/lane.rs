@@ -106,6 +106,13 @@ impl Lane {
             .with_context(|| format!("open_build_pr answered no PR: {answer}"))
     }
 
+    /// Says the build's PR merged, which ends the build.
+    pub async fn report_merged(&self, task: &Task) -> Result<()> {
+        self.on(task, "report_build", json!({ "standing": "merged" }))
+            .await
+            .map(drop)
+    }
+
     /// Gives the build back, or marks it stuck with why.
     pub async fn release(&self, task: &Task, stuck: Option<&str>) -> Result<()> {
         let args = match stuck {

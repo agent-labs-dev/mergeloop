@@ -659,3 +659,48 @@ async fn a_sign_in_refused_mid_run_stops_every_build_and_the_daemon() {
         assert_eq!(w.left(), (vec![], vec![]), "{refused}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pr_refused_for_an_unheard_claim_is_opened_after_a_heartbeat() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(8, 17, &[]));
+    w.fake.refuse(
+        "open_build_pr",
+        "unheard",
+        409,
+        "Build 8 was not heard from for 30 minutes.",
+    );
+    let agent = w.agent("my-agent", "echo built > feature.txt", BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    let tools = w.fake.lane_tools();
+    assert!(
+        in_order(
+            &tools,
+            &["open_build_pr", "heartbeat_build", "open_build_pr"]
+        ),
+        "{tools:?}"
+    );
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1);
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_whose_pr_merged_is_reported_merged_not_stuck() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(9, 18, &[]));
+    w.fake
+        .refuse("open_build_pr", "merged", 409, "PR #40 merged.");
+    let agent = w.agent("my-agent", "echo built > feature.txt", BUILT);
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.tools().contains(&"report_build".to_owned())
+    })
+    .await;
+
+    assert_eq!(w.fake.args_of("report_build")[0]["standing"], "merged");
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+    assert_eq!(w.left(), (vec![], vec![]));
+}

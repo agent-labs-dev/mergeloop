@@ -20,9 +20,13 @@ CREATE TABLE builds (
     assignees TEXT[] NOT NULL DEFAULT '{}',
     -- Whether the issue is a task now: open, with the repo's label. Only a task is claimed.
     task BOOLEAN NOT NULL DEFAULT true,
-    -- When a webhook or a sync last wrote what the row knows of its issue: a sync that began
-    -- before then leaves the row be.
+    -- When the row last stopped or started being a task: a row that is no task for a day is
+    -- pruned.
     task_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The intake write (a webhook's, or a sync's reconciliation) that last wrote what the row
+    -- knows of its issue, from `build_generations`: a sync that noted an older one leaves the
+    -- row be.
+    generation BIGINT NOT NULL DEFAULT 0,
     -- `ready`; held by a daemon: `claimed`, `landing` or `waiting`; `stuck` or `merged`.
     status TEXT NOT NULL DEFAULT 'ready',
     -- The login that holds the claim, or held it last.
@@ -38,10 +42,15 @@ CREATE TABLE builds (
     -- Why a stuck build is stuck, and since when.
     reason TEXT,
     stuck_at TIMESTAMPTZ,
+    -- When a sync last read a stuck build's issue events, to see whether its label came back.
+    stuck_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (installation_id, repo, issue)
 );
+
+-- Orders the intake writes of each repo, which run one at a time under the repo's lock.
+CREATE SEQUENCE build_generations;
 
 CREATE TABLE build_syncs (
     installation_id BIGINT NOT NULL,

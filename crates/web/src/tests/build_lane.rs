@@ -28,8 +28,10 @@ struct Hub {
     opened: Vec<(String, Value)>,
     /// Paths whose writes GitHub refuses.
     failing: Vec<String>,
-    /// Each issue's events, as the issue events API lists them.
+    /// Each issue's label events, oldest first, as GraphQL's `LabeledEvent`s.
     events: Vec<(u64, Value)>,
+    /// Issues whose label events GraphQL will not give.
+    broken_events: Vec<u64>,
     /// Installation tokens revoked.
     revoked_tokens: Vec<String>,
     /// Paths that were read.
@@ -154,6 +156,15 @@ async fn github(hub: Shared) -> GitHub {
                 (201, json!({ "number": number }).to_string())
             }
             ("GET", "/repos/o/y") => push(true),
+            ("POST", "/graphql") if call.body.contains("timelineItems") => timeline(&mut hub, call.body),
+            ("PATCH", path) if path.starts_with("/repos/o/r/pulls/") => {
+                let number: u64 = path["/repos/o/r/pulls/".len()..].parse().unwrap();
+                hub.writes.push(("PATCH".into(), path.into(), call.body.into()));
+                if let Some(pr) = hub.prs.iter_mut().find(|pr| pr.number == number) {
+                    pr.open = !call.body.contains("closed");
+                }
+                (200, "{}".into())
+            }
             ("POST", "/graphql") => {
                 let file = hub.config.as_ref().map(|text| json!({ "object": { "text": text } }));
                 let target = json!({ "oid": "abc", "c0": file, "c1": null });
@@ -163,11 +174,6 @@ async fn github(hub: Shared) -> GitHub {
             ("GET", path) if path.starts_with(issues) => page(&hub.labeled, path),
             ("GET", "/repos/o/y/issues?labels=mergeloop&state=open&per_page=100&page=1") => {
                 (200, "[]".into())
-            }
-            ("GET", path) if path.starts_with("/repos/o/r/issues/") && path.contains("/events?") => {
-                let number: u64 = path["/repos/o/r/issues/".len()..].split('/').next().unwrap().parse().unwrap();
-                let events: Vec<Value> = hub.events.iter().filter(|(n, _)| *n == number).map(|(_, e)| e.clone()).collect();
-                page(&events, path)
             }
             ("GET", "/users/mp%5Bbot%5D") => (200, r#"{"id":900}"#.into()),
             ("GET", "/users/ana") => (200, r#"{"id":1}"#.into()),
@@ -182,6 +188,41 @@ async fn github(hub: Shared) -> GitHub {
         }
     })
     .await
+}
+
+/// The issue's label events, 100 a page from the newest back, as GraphQL's `timelineItems`
+/// pages them: a page's cursor is the index of its first event. Read as `timeline/<issue>`.
+fn timeline(hub: &mut Hub, body: &str) -> (u16, String) {
+    let vars = serde_json::from_str::<Value>(body).unwrap()["variables"].clone();
+    let number = vars["number"].as_u64().unwrap();
+    hub.reads.push(format!("timeline/{number}"));
+    if hub.broken_events.contains(&number) {
+        return (
+            200,
+            json!({ "data": null, "errors": [{ "message": "broken" }] }).to_string(),
+        );
+    }
+    let events: Vec<Value> = hub
+        .events
+        .iter()
+        .filter(|(n, _)| *n == number)
+        .map(|(_, e)| e.clone())
+        .collect();
+    let end = vars["before"]
+        .as_str()
+        .map_or(events.len(), |c| c.parse().unwrap());
+    let start = end.saturating_sub(100);
+    let items = json!({
+        "pageInfo": { "hasPreviousPage": start > 0, "startCursor": start.to_string() },
+        "nodes": events[start..end],
+    });
+    let data = json!({ "repository": { "issue": { "timelineItems": items } } });
+    (200, json!({ "data": data }).to_string())
+}
+
+/// A label event, as GraphQL gives it.
+fn labeled(at: &str, name: &str) -> Value {
+    json!({ "createdAt": at, "label": { "name": name } })
 }
 
 /// Runs `act` on the store from another thread and connection, while the route that called the
@@ -216,6 +257,27 @@ where
 {
     let options = (*pool.connect_options()).clone();
     let run: Hook = Box::new(move || aside(&options, act));
+    hub.lock().unwrap().hooks.push((prefix.into(), run));
+}
+
+/// Before GitHub answers the first request to a path starting with `prefix`, runs `sql` on the
+/// database from another thread and connection.
+fn hook_sql(hub: &Shared, pool: &PgPool, prefix: &str, sql: &'static str) {
+    let options = (*pool.connect_options()).clone();
+    let run: Hook = Box::new(move || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let pool = PgPool::connect_with(options.clone()).await.unwrap();
+                    sqlx::query(sql).execute(&pool).await.unwrap();
+                });
+            });
+        });
+    });
     hub.lock().unwrap().hooks.push((prefix.into(), run));
 }
 
@@ -1175,12 +1237,7 @@ async fn without_webhooks_a_stuck_build_comes_back_once_its_events_show_the_labe
     let hub = shared(vec![issue(7, &[])]);
     let (router, _) = lane(pool.clone(), &hub).await;
     stuck(&router, false).await;
-    let labeled = |at: &str, name: &str| {
-        (
-            7,
-            json!({ "event": "labeled", "created_at": at, "label": { "name": name } }),
-        )
-    };
+    let labeled = |at: &str, name: &str| (7, labeled(at, name));
     hub.lock().unwrap().events = vec![
         labeled("2020-01-01T00:00:00Z", "mergeloop"),
         labeled("2999-01-01T00:00:00Z", "bug"),
@@ -1192,11 +1249,7 @@ async fn without_webhooks_a_stuck_build_comes_back_once_its_events_show_the_labe
         "labeled before it got stuck"
     );
     assert!(
-        hub.lock()
-            .unwrap()
-            .reads
-            .iter()
-            .any(|p| p.starts_with("/repos/o/r/issues/7/events")),
+        hub.lock().unwrap().reads.iter().any(|p| p == "timeline/7"),
         "the sync read its events"
     );
 
@@ -1493,4 +1546,280 @@ async fn mcp_says_which_refusal_a_daemon_must_act_on(pool: PgPool) {
     )
     .await;
     assert_eq!(refusal(&blank), (json!(400), Value::Null));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_label_put_back_after_a_long_history_in_the_second_it_got_stuck_brings_it_back(
+    pool: PgPool,
+) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    stuck(&router, false).await;
+    sqlx::query("UPDATE builds SET stuck_at = '2026-11-12T12:00:00.800Z'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Over ten pages of older events, then the label put back in the same second.
+    let mut events: Vec<(u64, Value)> = (0..1500)
+        .map(|_| (7, labeled("2020-01-01T00:00:00Z", "mergeloop")))
+        .collect();
+    events.push((7, labeled("2026-11-12T12:00:00Z", "MergeLoop")));
+    hub.lock().unwrap().events = events;
+    sync_due(&pool).await;
+
+    assert_eq!(claim(&router, "ben").await["issue"], 7);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_sync_checks_a_bounded_number_of_stuck_builds_and_one_failing_skips_none(pool: PgPool) {
+    let hub = shared((1..=7).map(|n| issue(n, &[])).collect());
+    let (router, state) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    for _ in 1..=7 {
+        let ana = claim(&router, "ana").await;
+        let (status, _) = release(&router, "ana", &ana, Some("no")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    {
+        let mut hub = hub.lock().unwrap();
+        hub.events = (1..=7)
+            .map(|n| (n, labeled("2999-01-01T00:00:00Z", "mergeloop")))
+            .collect();
+        hub.broken_events = vec![1];
+        hub.reads.clear();
+    }
+    sync_due(&pool).await;
+    claim(&router, "ben").await;
+
+    let read: Vec<String> = hub
+        .lock()
+        .unwrap()
+        .reads
+        .iter()
+        .filter(|p| p.starts_with("timeline/"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        read,
+        [
+            "timeline/1",
+            "timeline/2",
+            "timeline/3",
+            "timeline/4",
+            "timeline/5"
+        ]
+    );
+    let stuck: Vec<u64> = state
+        .builds
+        .builds(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.status == mergepatrol_store::BuildStatus::Stuck)
+        .map(|b| b.issue)
+        .collect();
+    assert_eq!(
+        stuck,
+        [1, 6, 7],
+        "#1 failed, #6 and #7 wait for the next sync"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stale_claim_on_a_closed_issue_is_retired_by_the_next_sync(pool: PgPool) {
+    let hub = shared(vec![issue(1, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    deliver(&router, "closed", closed(1)).await;
+    hub.lock().unwrap().labeled.clear();
+    sync_due(&pool).await;
+    assert_eq!(claim(&router, "ben").await, Value::Null);
+    assert_eq!(
+        heartbeat_says(&router, "ana", &ana).await.0,
+        StatusCode::CONFLICT,
+        "cancelled, still hers"
+    );
+
+    age_claims(&pool).await;
+    sync_due(&pool).await;
+    assert_eq!(claim(&router, "ben").await, Value::Null);
+    let writes = hub.lock().unwrap().writes.clone();
+    assert_eq!(
+        writes
+            .last()
+            .map(|(m, p, b)| (m.as_str(), p.as_str(), b.as_str())),
+        Some((
+            "DELETE",
+            "/repos/o/r/issues/1/assignees",
+            r#"{"assignees":["ana"]}"#
+        )),
+        "{writes:?}"
+    );
+    let (_, body) = heartbeat_says(&router, "ana", &ana).await;
+    assert!(body.contains("no longer hold"), "{body}");
+    assert!(listed(&router).await.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn opening_the_pr_needs_a_live_claim(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    age_claims(&pool).await;
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.as_str().unwrap().contains("30 minutes"), "{body}");
+    assert!(hub.lock().unwrap().opened.is_empty());
+}
+
+/// Before GitHub answers the first request to `prefix`, Ana gives `claimed` back.
+fn given_back_during(hub: &Shared, pool: &PgPool, prefix: &str, claimed: &Value) {
+    let (build, claim_n) = ana_holds(claimed);
+    hook(hub, pool, prefix, move |store| async move {
+        let ana = mergepatrol_store::Holder {
+            installation_id: 1,
+            build,
+            login: "ana",
+            claim: claim_n,
+        };
+        store.release_build(ana, None).await.unwrap().unwrap();
+    });
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pr_opened_while_its_build_is_given_back_is_closed_saying_why(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, state) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    given_back_during(&hub, &pool, "/repos/o/r/pulls", &ana);
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.as_str().unwrap().contains("no longer hold"), "{body}");
+    let builds = state.builds.builds(1).await.unwrap();
+    assert_eq!(builds[0].pr, None);
+    let hub = hub.lock().unwrap();
+    assert!(!hub.prs[0].open, "closed");
+    let paths: Vec<&str> = hub
+        .writes
+        .iter()
+        .map(|(_, p, _)| p.as_str())
+        .filter(|p| p.contains("/40"))
+        .collect();
+    assert_eq!(
+        paths,
+        ["/repos/o/r/issues/40/comments", "/repos/o/r/pulls/40"],
+        "said why, closed, neither labeled nor assigned"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pr_adopted_while_its_build_is_given_back_is_left_open(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    {
+        let mut h = hub.lock().unwrap();
+        h.prs = vec![Pr::bots(40, "mergeloop/build-7")];
+        h.failing = vec!["/repos/o/r/pulls".into()];
+    }
+    given_back_during(&hub, &pool, "/repos/o/r/pulls?", &ana);
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let hub = hub.lock().unwrap();
+    assert!(hub.prs[0].open, "not this call's to close");
+    assert!(
+        hub.writes.iter().all(|(_, p, _)| !p.contains("/40")),
+        "{:?}",
+        hub.writes
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_build_with_a_pr_given_back_after_its_issue_closed_is_claimed_and_listed(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    assert_eq!(open_pr(&router, "ana", &ana).await.0, StatusCode::OK);
+    deliver(&router, "closed", closed(7)).await;
+    assert_eq!(release(&router, "ana", &ana, None).await.0, StatusCode::OK);
+
+    let ben = claim(&router, "ben").await;
+    assert_eq!(
+        (ben["issue"].as_u64(), ben["pr"].as_u64()),
+        (Some(7), Some(40))
+    );
+    let (status, _) = release(&router, "ben", &ben, Some("ejected twice")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, builds) = call(&router, "ana", "GET", "/builds", Value::Null).await;
+    assert_eq!(
+        (builds[0]["status"].as_str(), builds[0]["pr"].as_u64()),
+        (Some("stuck"), Some(40)),
+        "{builds}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_token_whose_claim_cannot_be_read_after_minting_is_revoked(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    hook_sql(
+        &hub,
+        &pool,
+        "/app/installations/1/access_tokens",
+        "ALTER TABLE build_settings RENAME TO build_settings_gone",
+    );
+
+    let (status, body) = mint(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(hub.lock().unwrap().revoked_tokens, ["ghs_push"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_recorded_pr_closed_or_merged_is_not_labeled_and_says_which(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    hub.lock().unwrap().failing = vec!["/repos/o/r/issues/40/labels".into()];
+    assert_eq!(
+        open_pr(&router, "ana", &ana).await.0,
+        StatusCode::BAD_GATEWAY
+    );
+    {
+        let mut h = hub.lock().unwrap();
+        h.failing.clear();
+        h.prs[0].open = false;
+    }
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.as_str()
+            .unwrap()
+            .contains("#40 was closed without merging"),
+        "{body}"
+    );
+    hub.lock().unwrap().prs[0].merged = true;
+    let args = json!({ "workspace": 1, "build": ana["build"], "claim": ana["claim"], "title": "T", "body": "B" });
+    let merged = mcp_tool(&router, "ana", "open_build_pr", args).await;
+    assert_eq!(refusal(&merged), (json!(409), json!("merged")));
+    let hub = hub.lock().unwrap();
+    assert!(
+        hub.writes
+            .iter()
+            .all(|(_, p, _)| p != "/repos/o/r/issues/40/labels"
+                && p != "/repos/o/r/issues/40/assignees"),
+        "{:?}",
+        hub.writes
+    );
 }

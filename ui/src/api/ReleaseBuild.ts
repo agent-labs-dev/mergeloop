@@ -2,7 +2,7 @@
 
 export type ReleaseBuild = { claim: bigint, 
 /**
- * Marks it stuck, for this reason, which goes on the issue. Without it, the build is a
- * task again.
+ * Marks it stuck, for this reason, which goes on the issue. Without it, the build is given
+ * back: a task again while its issue is one, and, with a PR, anyone's to take at once.
  */
 stuck?: string, };

@@ -161,13 +161,17 @@ enum Refusal {
     Unheard,
     /// GitHub says the caller may not push to the repo: give the build back.
     MayNotPush,
+    /// The build's PR merged: report it merged.
+    Merged,
 }
 
 impl Refusal {
     fn status(self) -> StatusCode {
         match self {
             Self::MayNotPush => StatusCode::FORBIDDEN,
-            Self::LaneOff | Self::Lost | Self::Cancelled | Self::Unheard => StatusCode::CONFLICT,
+            Self::LaneOff | Self::Lost | Self::Cancelled | Self::Unheard | Self::Merged => {
+                StatusCode::CONFLICT
+            }
         }
     }
 
@@ -179,6 +183,7 @@ impl Refusal {
             Self::Cancelled => "cancelled",
             Self::Unheard => "unheard",
             Self::MayNotPush => "may_not_push",
+            Self::Merged => "merged",
         }
     }
 }

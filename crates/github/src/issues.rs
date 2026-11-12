@@ -104,38 +104,73 @@ impl Installation {
         })
     }
 
-    /// When `label` was put on the issue, each time, as RFC 3339, from at most `max_pages`
-    /// pages of its events.
-    pub async fn labeled_at(
+    /// When `label` was last put on the issue, as RFC 3339 to the second, from at most
+    /// `max_pages` pages of 100 of its label events, newest first. The label is matched by name,
+    /// case aside: a label renamed since is not followed.
+    pub async fn last_labeled_at(
         &self,
         repo: &RepoName,
         issue: u64,
         label: &str,
         max_pages: usize,
-    ) -> Result<Vec<String>> {
-        let path = format!("/repos/{repo}/issues/{issue}/events?");
-        let events = self.pages(&path, max_pages).await?.items;
-        Ok(events
-            .iter()
-            .filter(|e| e["event"] == "labeled")
-            .filter(|e| {
-                e["label"]["name"]
-                    .as_str()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(label))
-            })
-            .filter_map(|e| e["created_at"].as_str().map(str::to_owned))
-            .collect())
+    ) -> Result<Option<String>> {
+        let query = "query($owner: String!, $name: String!, $number: Int!, $before: String) {
+              repository(owner: $owner, name: $name) {
+                issue(number: $number) {
+                  timelineItems(last: 100, before: $before, itemTypes: [LABELED_EVENT]) {
+                    pageInfo { hasPreviousPage startCursor }
+                    nodes { ... on LabeledEvent { createdAt label { name } } }
+                  }
+                }
+              }
+            }";
+        let mut before = Value::Null;
+        for _ in 0..max_pages {
+            let vars = json!({ "owner": repo.owner, "name": repo.name, "number": issue, "before": before });
+            let data: Value = self.graphql("last_labeled_at", query, vars).await?;
+            let items = &data["repository"]["issue"]["timelineItems"];
+            let newest = items["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .find(|e| {
+                    e["label"]["name"]
+                        .as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(label))
+                });
+            if let Some(at) = newest.and_then(|e| e["createdAt"].as_str()) {
+                return Ok(Some(at.to_owned()));
+            }
+            before = items["pageInfo"]["startCursor"].clone();
+            if items["pageInfo"]["hasPreviousPage"] != true || before.is_null() {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Closes PR `number`, after saying why on it.
+    pub async fn close_pr(&self, repo: &RepoName, number: u64, why: &str) -> Result<()> {
+        self.comment(repo, number, why).await?;
+        let _: Value = self
+            .rest(
+                Method::PATCH,
+                &format!("/repos/{repo}/pulls/{number}"),
+                Some(json!({ "state": "closed" })),
+            )
+            .await?;
+        Ok(())
     }
 
     /// A list API's items, 100 a page, from at most `max_pages` pages.
     async fn pages(&self, path: &str, max_pages: usize) -> Result<Listed<Value>> {
         let mut items = Vec::new();
         for page in 1..=max_pages {
-            let sep = if path.ends_with('?') { "" } else { "&" };
             let batch: Vec<Value> = self
                 .rest(
                     Method::GET,
-                    &format!("{path}{sep}per_page=100&page={page}"),
+                    &format!("{path}&per_page=100&page={page}"),
                     None,
                 )
                 .await?;
@@ -309,20 +344,70 @@ mod tests {
         assert_eq!((issues.items.len(), issues.complete), (300, false));
     }
 
-    #[tokio::test]
-    async fn labeled_at_gives_when_the_label_was_put_on_in_any_case() {
-        let gh = fake::answered_by(|_, path, _| {
-            assert_eq!(path, "/repos/o/r/issues/7/events?per_page=100&page=1");
-            let events = json!([
-                { "event": "labeled", "created_at": "t1", "label": { "name": "MergeLoop" } },
-                { "event": "unlabeled", "created_at": "t2", "label": { "name": "mergeloop" } },
-                { "event": "labeled", "created_at": "t3", "label": { "name": "bug" } },
-            ]);
-            (200, events.to_string())
+    /// Answers `last_labeled_at`'s queries from `pages`, newest last, as GitHub pages
+    /// backwards: the cursor of a page is its index.
+    async fn timeline(pages: Vec<Value>) -> (Installation, Arc<Mutex<Vec<Value>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let gh = fake::answered_by(move |_, path, body| {
+            assert_eq!(path, "/graphql");
+            let vars: Value = serde_json::from_str::<Value>(body).unwrap()["variables"].clone();
+            seen.lock().unwrap().push(vars["before"].clone());
+            let at = match vars["before"].as_str() {
+                Some(cursor) => cursor.parse::<usize>().unwrap() - 1,
+                None => pages.len() - 1,
+            };
+            let items = json!({
+                "pageInfo": { "hasPreviousPage": at > 0, "startCursor": at.to_string() },
+                "nodes": pages[at],
+            });
+            let data = json!({ "repository": { "issue": { "timelineItems": items } } });
+            (200, json!({ "data": data }).to_string())
         })
         .await;
+        (gh, asked)
+    }
+
+    fn labeled(at: &str, name: &str) -> Value {
+        json!({ "createdAt": at, "label": { "name": name } })
+    }
+
+    #[tokio::test]
+    async fn the_newest_time_the_label_was_put_on_is_read_from_the_newest_page_back() {
+        let (gh, asked) = timeline(vec![
+            json!([labeled("t1", "mergeloop")]),
+            json!([labeled("t2", "bug")]),
+            json!([
+                labeled("t3", "MergeLoop"),
+                labeled("t4", "mergeloop"),
+                labeled("t5", "bug")
+            ]),
+        ])
+        .await;
         let repo = RepoName::parse("o/r").unwrap();
-        let at = gh.labeled_at(&repo, 7, "mergeloop", 10).await.unwrap();
-        assert_eq!(at, ["t1"]);
+        let at = gh.last_labeled_at(&repo, 7, "mergeloop", 10).await.unwrap();
+        assert_eq!(at.as_deref(), Some("t4"));
+        assert_eq!(*asked.lock().unwrap(), [Value::Null], "one page was enough");
+    }
+
+    #[tokio::test]
+    async fn an_older_page_is_read_only_while_the_newer_lack_the_label_and_pages_are_left() {
+        let pages = vec![
+            json!([labeled("t1", "mergeloop")]),
+            json!([labeled("t2", "bug")]),
+            json!([labeled("t3", "bug")]),
+        ];
+        let repo = RepoName::parse("o/r").unwrap();
+        let (gh, asked) = timeline(pages.clone()).await;
+        let at = gh.last_labeled_at(&repo, 7, "mergeloop", 3).await.unwrap();
+        assert_eq!(at.as_deref(), Some("t1"));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [Value::Null, json!("2"), json!("1")]
+        );
+
+        let (gh, _) = timeline(pages).await;
+        let at = gh.last_labeled_at(&repo, 7, "mergeloop", 2).await.unwrap();
+        assert_eq!(at, None, "past its budget");
     }
 }

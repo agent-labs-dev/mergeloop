@@ -2,8 +2,10 @@
 //! developer's daemon claims, builds, opens a PR for and lands, or gives back or marks stuck.
 //!
 //! A build records whether its issue is a task, and webhooks and syncs change that record: they
-//! never delete a build, so a held one keeps its holder and its PR, and a sync that began before
-//! a webhook's write leaves that row be.
+//! never delete a build, so a held one keeps its holder and its PR. The intake writes of a repo
+//! (a webhook's change, a sync's reconciliation) run one at a time under the repo's lock, each
+//! with a new generation it stamps on the rows it writes; a sync's reconciliation writes only
+//! rows no newer than the generation it noted before it read GitHub's list.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -156,9 +158,10 @@ impl Build {
     }
 }
 
-/// When a sync of a repo began: it writes only to builds that no webhook or sync wrote since.
+/// The repo's generation when a sync of it began: it writes only to builds that no webhook or
+/// sync wrote since.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SyncStart(String);
+pub struct SyncStart(i64);
 
 /// A build just claimed, and who held it before, when a stale claim was taken over.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,8 +206,9 @@ pub trait BuildStore: Send + Sync {
     /// and its holder may go on only if it has a PR.
     async fn drop_task(&self, installation_id: u64, repo: &RepoName, issue: u64) -> Result<()>;
     /// `issues` are the repo's tasks as GitHub listed them after `since`: upserts each, and,
-    /// when the list is `complete`, makes every other build no task. Leaves be every build a
-    /// webhook or sync wrote after `since`, so an older list never undoes a newer write.
+    /// when the list is `complete`, makes every other build no task, and stamps it as this
+    /// sync's. Leaves be every build a webhook or sync wrote after `since`, so an older list never
+    /// undoes a newer write.
     async fn sync_tasks(
         &self,
         installation_id: u64,
@@ -214,30 +218,53 @@ pub trait BuildStore: Send + Sync {
         complete: bool,
     ) -> Result<()>;
     /// Whether to read the repo's labeled issues now: they were last read over `every_secs`
-    /// ago, or never. A yes marks them read, so one caller of many reads them, and says when.
+    /// ago, or never. A yes marks them read, so one caller of many reads them, and notes the
+    /// repo's generation, taken under its lock, so no intake write is half done.
     async fn take_sync(
         &self,
         installation_id: u64,
         repo: &RepoName,
         every_secs: u64,
     ) -> Result<Option<SyncStart>>;
-    /// The stuck build `build`, stuck with `claim`, is a task again if its issue is one and
-    /// one of `labeled_at` (RFC 3339) is after it got stuck. Whether it is.
+    /// The stuck build `build`, stuck with `claim`, is a task again if its issue is one and its
+    /// label was put on (`labeled_at`, RFC 3339) in the second it got stuck or later: GitHub
+    /// gives whole seconds. Whether it is.
     async fn relabeled_since_stuck(
         &self,
         installation_id: u64,
         build: u64,
         claim: u64,
-        labeled_at: &[String],
+        labeled_at: &str,
     ) -> Result<bool>;
-    /// The repos with a build that some caller could claim: ready, or held and stale.
+    /// Up to `limit` of the repo's stuck builds whose issue is a task, those checked for their
+    /// label coming back longest ago first, marked checked now.
+    async fn stuck_to_check(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        limit: u64,
+    ) -> Result<Vec<Build>>;
+    /// Ends each held claim in the repo on a build without a PR whose issue is no task, whose
+    /// holder was not heard from for `stale_secs`: the build is ready, out of the pool, and the
+    /// claim's assignee is taken off. The builds, with the holder and whether the claim had
+    /// assigned them, for GitHub. A live holder's build is never touched.
+    async fn retire_stale(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        stale_secs: u64,
+    ) -> Result<Vec<Build>>;
+    /// The repos with a build that some caller could claim, as `claim_build` chooses them.
     async fn claimable_repos(&self, installation_id: u64, stale_secs: u64)
     -> Result<Vec<RepoName>>;
-    /// Gives `login` one build in `repos` whose issue is a task, atomically: a ready one
-    /// assigned to them, else a ready one assigned to no one, else a held one whose holder was
-    /// last heard from over `stale_secs` ago or gave it back, which keeps its status and PR.
-    /// Never a ready one assigned to someone else. Taking back one's own keeps what its claim
-    /// assigned.
+    /// Gives `login` one build in `repos`, atomically: a ready one assigned to them, else a
+    /// ready one assigned to no one, else a held one whose holder was last heard from over
+    /// `stale_secs` ago or gave it back, which keeps its status and PR. Never a ready one
+    /// assigned to someone else. Taking back one's own keeps what its claim assigned.
+    ///
+    /// Work without a PR is given only while its issue is a task. A held build with a PR is
+    /// given whether or not its issue still is: its PR lands whatever the issue does, and
+    /// someone must land it.
     async fn claim_build(
         &self,
         installation_id: u64,
@@ -331,18 +358,32 @@ fn build(r: &sqlx::postgres::PgRow) -> Result<Build> {
     })
 }
 
-/// Adds or updates a task; `$7`, a sync's start, guards a sync's write.
+/// Adds or updates a task, as intake write `$7`; `$8`, a sync's note, guards a sync's write.
 macro_rules! upsert_task {
     ($guard:literal) => {
         concat!(
-            "INSERT INTO builds (installation_id, repo, issue, title, body, assignees)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO builds (installation_id, repo, issue, title, body, assignees, generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (installation_id, repo, issue) DO UPDATE SET title = excluded.title,
                body = excluded.body, assignees = excluded.assignees, task = true,
-               task_at = now(), updated_at = now()",
+               task_at = CASE WHEN builds.task THEN builds.task_at ELSE now() END,
+               generation = excluded.generation, updated_at = now()",
             $guard
         )
     };
+}
+
+/// Takes the repo's intake lock until `tx` ends, and gives the generation of the write made
+/// under it. Two repos whose keys hash alike only wait on each other.
+async fn intake(tx: &mut sqlx::PgConnection, installation_id: u64, repo: &str) -> Result<i64> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::TEXT || '/' || $2), 29)")
+        .bind(installation_id.to_string())
+        .bind(repo)
+        .execute(&mut *tx)
+        .await?;
+    Ok(sqlx::query_scalar("SELECT nextval('build_generations')")
+        .fetch_one(&mut *tx)
+        .await?)
 }
 
 /// A stuck build made a task again: ready, or, with a PR, landing and free to take.
@@ -413,9 +454,14 @@ impl BuildStore for PgStore {
         repo: &RepoName,
         issue: &IssueTask,
     ) -> Result<()> {
-        upsert(upsert_task!(""), installation_id, &repo.to_string(), issue)
-            .execute(&self.pool)
+        let repo = repo.to_string();
+        let mut tx = self.pool.begin().await?;
+        let generation = intake(&mut tx, installation_id, &repo).await?;
+        upsert(upsert_task!(""), installation_id, &repo, issue)
+            .bind(generation)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -432,16 +478,23 @@ impl BuildStore for PgStore {
     async fn drop_task(&self, installation_id: u64, repo: &RepoName, issue: u64) -> Result<()> {
         // A build that was never a task still records that it is none: a sync that began
         // earlier must not make it one.
+        let repo = repo.to_string();
+        let mut tx = self.pool.begin().await?;
+        let generation = intake(&mut tx, installation_id, &repo).await?;
         sqlx::query(
-            "INSERT INTO builds (installation_id, repo, issue, task) VALUES ($1, $2, $3, false)
+            "INSERT INTO builds (installation_id, repo, issue, task, generation)
+             VALUES ($1, $2, $3, false, $4)
              ON CONFLICT (installation_id, repo, issue) DO UPDATE SET task = false,
-               task_at = now(), updated_at = now()",
+               task_at = CASE WHEN builds.task THEN now() ELSE builds.task_at END,
+               generation = $4, updated_at = now()",
         )
         .bind(installation_id as i64)
-        .bind(repo.to_string())
+        .bind(&repo)
         .bind(issue as i64)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -455,33 +508,40 @@ impl BuildStore for PgStore {
     ) -> Result<()> {
         let repo = repo.to_string();
         let mut tx = self.pool.begin().await?;
+        let generation = intake(&mut tx, installation_id, &repo).await?;
         for issue in issues {
             upsert(
-                upsert_task!(" WHERE builds.task_at < $7::TIMESTAMPTZ"),
+                upsert_task!(" WHERE builds.generation <= $8"),
                 installation_id,
                 &repo,
                 issue,
             )
-            .bind(&since.0)
+            .bind(generation)
+            .bind(since.0)
             .execute(&mut *tx)
             .await?;
         }
         if complete {
+            // Every build it saw absent is this sync's, already no task or not, so an older
+            // list cannot bring one back.
             let numbers: Vec<i64> = issues.iter().map(|i| i.number as i64).collect();
             sqlx::query(
-                "UPDATE builds SET task = false, task_at = now(), updated_at = now()
-                 WHERE installation_id = $1 AND repo = $2 AND task
-                   AND task_at < $3::TIMESTAMPTZ AND NOT issue = ANY($4)",
+                "UPDATE builds SET task = false,
+                   task_at = CASE WHEN task THEN now() ELSE task_at END,
+                   generation = $3, updated_at = now()
+                 WHERE installation_id = $1 AND repo = $2 AND generation <= $4
+                   AND NOT issue = ANY($5)",
             )
             .bind(installation_id as i64)
             .bind(&repo)
-            .bind(&since.0)
+            .bind(generation)
+            .bind(since.0)
             .bind(&numbers)
             .execute(&mut *tx)
             .await?;
         }
-        // A day on, no sync that began before a build stopped being a task is still running:
-        // its record is no longer needed.
+        // A day on, no sync that noted a generation before a build stopped being a task is
+        // still running: its record is no longer needed.
         sqlx::query(
             "DELETE FROM builds WHERE installation_id = $1 AND repo = $2 AND NOT task
                AND status IN ('ready', 'merged') AND task_at < now() - interval '1 day'",
@@ -500,18 +560,22 @@ impl BuildStore for PgStore {
         repo: &RepoName,
         every_secs: u64,
     ) -> Result<Option<SyncStart>> {
-        let taken = sqlx::query_scalar(
+        let repo = repo.to_string();
+        let mut tx = self.pool.begin().await?;
+        let generation = intake(&mut tx, installation_id, &repo).await?;
+        let taken: Option<i32> = sqlx::query_scalar(
             "INSERT INTO build_syncs (installation_id, repo) VALUES ($1, $2)
              ON CONFLICT (installation_id, repo) DO UPDATE SET synced_at = now()
              WHERE build_syncs.synced_at < now() - make_interval(secs => $3)
-             RETURNING synced_at::TEXT",
+             RETURNING 1",
         )
         .bind(installation_id as i64)
-        .bind(repo.to_string())
+        .bind(&repo)
         .bind(every_secs as f64)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(taken.map(SyncStart))
+        tx.commit().await?;
+        Ok(taken.map(|_| SyncStart(generation)))
     }
 
     async fn relabeled_since_stuck(
@@ -519,12 +583,12 @@ impl BuildStore for PgStore {
         installation_id: u64,
         build: u64,
         claim: u64,
-        labeled_at: &[String],
+        labeled_at: &str,
     ) -> Result<bool> {
         let done = sqlx::query(concat!(
             unstuck!(),
             " AND id = $2 AND claim = $3
-              AND EXISTS (SELECT 1 FROM unnest($4::TEXT[]) AS at WHERE at::TIMESTAMPTZ > stuck_at)"
+              AND $4::TIMESTAMPTZ >= date_trunc('second', stuck_at)"
         ))
         .bind(installation_id as i64)
         .bind(build as i64)
@@ -535,17 +599,67 @@ impl BuildStore for PgStore {
         Ok(done.rows_affected() == 1)
     }
 
+    async fn stuck_to_check(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        limit: u64,
+    ) -> Result<Vec<Build>> {
+        let rows = sqlx::query(concat!(
+            "UPDATE builds SET stuck_checked_at = now() WHERE id IN (
+               SELECT id FROM builds
+               WHERE installation_id = $1 AND repo = $2 AND status = 'stuck' AND task
+               ORDER BY stuck_checked_at NULLS FIRST, id LIMIT $3 FOR UPDATE SKIP LOCKED)
+             RETURNING ",
+            columns!()
+        ))
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut builds: Vec<Build> = rows.iter().map(build).collect::<Result<_>>()?;
+        builds.sort_by_key(|b| b.id);
+        Ok(builds)
+    }
+
+    async fn retire_stale(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        stale_secs: u64,
+    ) -> Result<Vec<Build>> {
+        let rows = sqlx::query(concat!(
+            "UPDATE builds SET status = 'ready', claim = claim + 1,
+               assignees = CASE WHEN mirrored THEN array_remove(assignees, holder) ELSE assignees END,
+               stage = NULL, heartbeat_at = NULL, updated_at = now()
+             WHERE installation_id = $1 AND repo = $2 AND NOT task AND pr IS NULL
+               AND status IN ",
+            held!(),
+            " AND (heartbeat_at IS NULL OR heartbeat_at < now() - make_interval(secs => $3))
+             RETURNING ",
+            columns!()
+        ))
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(stale_secs as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(build).collect()
+    }
+
     async fn claimable_repos(
         &self,
         installation_id: u64,
         stale_secs: u64,
     ) -> Result<Vec<RepoName>> {
         let rows = sqlx::query(concat!(
-            "SELECT DISTINCT repo FROM builds WHERE installation_id = $1 AND task AND (status = 'ready'
+            "SELECT DISTINCT repo FROM builds WHERE installation_id = $1 AND (
+               (status = 'ready' AND task)
                OR (status IN ",
             held!(),
-            " AND (heartbeat_at IS NULL
-               OR heartbeat_at < now() - make_interval(secs => $2)))) ORDER BY repo"
+            " AND (task OR pr IS NOT NULL) AND (heartbeat_at IS NULL
+                 OR heartbeat_at < now() - make_interval(secs => $2)))) ORDER BY repo"
         ))
         .bind(installation_id as i64)
         .bind(stale_secs as f64)
@@ -572,9 +686,9 @@ impl BuildStore for PgStore {
             "WITH pick AS (
                SELECT id AS pick_id, status AS old_status, holder AS old_holder, mirrored AS old_mirrored
                FROM builds
-               WHERE installation_id = $1 AND repo = ANY($3) AND task AND (
-                 (status = 'ready' AND (assignees = '{}' OR $2 = ANY(assignees)))
-                 OR (status IN ", held!(), " AND (heartbeat_at IS NULL
+               WHERE installation_id = $1 AND repo = ANY($3) AND (
+                 (status = 'ready' AND task AND (assignees = '{}' OR $2 = ANY(assignees)))
+                 OR (status IN ", held!(), " AND (task OR pr IS NOT NULL) AND (heartbeat_at IS NULL
                    OR heartbeat_at < now() - make_interval(secs => $4))))
                ORDER BY status = 'ready' DESC, $2 = ANY(assignees) DESC, id
                LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -1352,11 +1466,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let again = |at: &'static str| {
-            let at = [at.to_owned()];
             let store = &store;
             async move {
                 store
-                    .relabeled_since_stuck(1, stuck.id, stuck.claim, &at)
+                    .relabeled_since_stuck(1, stuck.id, stuck.claim, at)
                     .await
                     .unwrap()
             }
@@ -1441,5 +1554,144 @@ mod tests {
             store.take_sync(1, &r, 0).await.unwrap().is_some(),
             "once it is due"
         );
+    }
+
+    fn tasks(builds: Vec<Build>) -> Vec<(u64, bool)> {
+        builds.into_iter().map(|b| (b.issue, b.task)).collect()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_older_list_reconciled_last_leaves_be_what_a_newer_sync_saw(pool: PgPool) {
+        let store = store(pool).await;
+        let r = repo("o/r");
+        // #7 left the label long ago; then it was labeled and unlabeled, both unheard.
+        store.drop_task(1, &r, 7).await.unwrap();
+        let older = store.take_sync(1, &r, 0).await.unwrap().unwrap();
+        let newer = store.take_sync(1, &r, 0).await.unwrap().unwrap();
+        // The newer sync lists #7 absent and is reconciled first; the older listed it labeled.
+        store.sync_tasks(1, &r, &newer, &[], true).await.unwrap();
+        store
+            .sync_tasks(1, &r, &older, &[issue(7, &[])], true)
+            .await
+            .unwrap();
+        assert_eq!(tasks(store.builds(1).await.unwrap()), [(7, false)]);
+        assert_eq!(claim(&store, "ana").await, None);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_repos_intake_writes_wait_on_one_another(pool: PgPool) {
+        let store = store(pool.clone()).await;
+        let r = repo("o/r");
+        let mut first = pool.begin().await.unwrap();
+        intake(&mut first, 1, "o/r").await.unwrap();
+
+        let other = PgStore { pool: pool.clone() };
+        let other_repo = tokio::spawn(async move {
+            other.drop_task(1, &repo("o/y"), 1).await.unwrap();
+        });
+        let other = PgStore { pool: pool.clone() };
+        let same_repo = tokio::spawn(async move {
+            let since = other.take_sync(1, &repo("o/r"), 0).await.unwrap().unwrap();
+            other
+                .sync_tasks(1, &repo("o/r"), &since, &[], true)
+                .await
+                .unwrap();
+        });
+        other_repo.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !same_repo.is_finished(),
+            "o/r's sync waits on the write in flight"
+        );
+
+        first.commit().await.unwrap();
+        same_repo.await.unwrap();
+        assert!(store.builds(1).await.unwrap().iter().all(|b| b.repo != r));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_build_with_a_pr_given_back_after_its_issue_closed_is_taken_by_the_next_claim(
+        pool: PgPool,
+    ) {
+        let store = store(pool.clone()).await;
+        let r = repo("o/r");
+        let pr = landing(&store).await;
+        store.drop_task(1, &r, 1).await.unwrap();
+        store.release_build(held(&pr, "ana"), None).await.unwrap();
+        assert_eq!(store.claimable_repos(1, STALE).await.unwrap(), [r]);
+        let ben = claim(&store, "ben").await.unwrap();
+        assert_eq!((ben.status, ben.pr), (BuildStatus::Landing, Some(40)));
+
+        heard_ago(&pool, ben.id, STALE as i64 + 1).await;
+        let cy = claim(&store, "cy").await.unwrap();
+        assert_eq!(cy.pr, Some(40), "a stale one too");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_label_put_back_in_the_second_the_build_got_stuck_counts(pool: PgPool) {
+        let store = store(pool.clone()).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let ana = claim(&store, "ana").await.unwrap();
+        let stuck = store
+            .release_build(held(&ana, "ana"), Some("no"))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE builds SET stuck_at = '2026-11-12T12:00:00.800Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let again = |at| store.relabeled_since_stuck(1, stuck.id, stuck.claim, at);
+        assert!(!again("2026-11-12T11:59:59Z").await.unwrap());
+        assert!(again("2026-11-12T12:00:00Z").await.unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn stuck_builds_are_checked_a_few_at_a_time_longest_unchecked_first(pool: PgPool) {
+        let store = store(pool).await;
+        let r = repo("o/r");
+        for n in 1..=3 {
+            store.upsert_task(1, &r, &issue(n, &[])).await.unwrap();
+            let b = claim(&store, "ana").await.unwrap();
+            store
+                .release_build(held(&b, "ana"), Some("no"))
+                .await
+                .unwrap();
+        }
+        let checked = |limit| {
+            let (store, r) = (&store, &r);
+            async move {
+                let builds = store.stuck_to_check(1, r, limit).await.unwrap();
+                builds.into_iter().map(|b| b.issue).collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(checked(2).await.len(), 2);
+        assert_eq!(checked(1).await, [3], "the one not checked yet");
+        assert_eq!(checked(1).await, [1]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_stale_claim_on_an_issue_that_is_no_task_is_retired_and_a_live_one_kept(
+        pool: PgPool,
+    ) {
+        let store = store(pool.clone()).await;
+        let r = repo("o/r");
+        store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
+        let ana = claim(&store, "ana").await.unwrap();
+        store.upsert_task(1, &r, &issue(1, &["ana"])).await.unwrap();
+        store.drop_task(1, &r, 1).await.unwrap();
+        assert!(store.retire_stale(1, &r, STALE).await.unwrap().is_empty());
+        assert!(store.held_build(held(&ana, "ana")).await.unwrap().is_some());
+
+        heard_ago(&pool, ana.id, STALE as i64 + 1).await;
+        let retired = store.retire_stale(1, &r, STALE).await.unwrap();
+        let shown: Vec<_> = retired
+            .iter()
+            .map(|b| (b.status, b.holder.as_deref(), b.mirrored, b.assignees.len()))
+            .collect();
+        assert_eq!(shown, [(BuildStatus::Ready, Some("ana"), true, 0)]);
+        assert_eq!(store.held_build(held(&ana, "ana")).await.unwrap(), None);
+        assert_eq!(claim(&store, "ben").await, None, "still no task");
     }
 }

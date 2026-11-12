@@ -283,6 +283,8 @@ pub enum Refusal {
     Unheard,
     /// GitHub says the caller may not push: give it back.
     MayNotPush,
+    /// The build's PR merged: report it merged.
+    Merged,
 }
 
 impl Refusal {
@@ -293,6 +295,7 @@ impl Refusal {
             "cancelled" => Refusal::Cancelled,
             "unheard" => Refusal::Unheard,
             "may_not_push" => Refusal::MayNotPush,
+            "merged" => Refusal::Merged,
             _ => return None,
         })
     }

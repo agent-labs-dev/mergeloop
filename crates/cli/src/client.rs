@@ -1,6 +1,6 @@
 //! MergeLoop's MCP endpoint, called as a signed-in user or as a GitHub token's.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,22 +15,37 @@ pub const LONGEST_WAIT: u64 = 50;
 /// Calls in a row that may fail, as on a dropped connection, before the command gives up.
 const RETRIES: u32 = 5;
 
-/// A MergeLoop server, by its URL without a trailing slash: how sessions are keyed.
+/// A MergeLoop server, by its canonical URL: lowercase host, no default port, no trailing slash.
+/// Every way of writing one server names one session, and every request goes to that URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Server(String);
 
 impl Server {
-    pub fn new(url: &str) -> Self {
-        Server(url.trim_end_matches('/').to_owned())
+    /// The server at `url`: `http` or `https`, with a host, and nothing a server URL has no use
+    /// for (a user, a query, a fragment).
+    pub fn parse(url: &str) -> Result<Self> {
+        let parsed =
+            reqwest::Url::parse(url).with_context(|| format!("{url} is not a server's URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!("{url} is not a server's URL: use http:// or https:// and a host");
+        }
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!("{url} is not a server's URL: it has a user, a query or a fragment");
+        }
+        Ok(Server(parsed.as_str().trim_end_matches('/').to_owned()))
     }
 
     /// `MERGELOOP_URL`, or the hosted MergeLoop.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self> {
         let url = std::env::var("MERGELOOP_URL")
             .ok()
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| "https://mergeloop.ai".into());
-        Server::new(&url)
+        Server::parse(&url).context("MERGELOOP_URL")
     }
 
     pub fn url(&self) -> &str {
@@ -75,11 +90,12 @@ impl Client {
     }
 
     /// What `mergeloop [PR]` and `mergeloop call` send, the first there is: `MERGELOOP_TOKEN`,
-    /// the server's session, or `gh auth token`.
-    pub fn for_command(server: Server, sessions: &Path) -> Result<Self> {
+    /// the server's session, or `gh auth token`. The sessions are looked for, and `HOME`
+    /// needed, only without `MERGELOOP_TOKEN`.
+    pub fn for_command(server: Server, sessions: impl FnOnce() -> Result<PathBuf>) -> Result<Self> {
         let credential = match std::env::var("MERGELOOP_TOKEN") {
             Ok(t) if !t.is_empty() => Credential::GitHub(Secret::new(t)),
-            _ => match session::find(sessions, &server)? {
+            _ => match session::find(&sessions()?, &server)? {
                 Some(s) => Credential::Session(s),
                 None => Credential::GitHub(Secret::new(gh(&["auth", "token"]).context(
                     "no MERGELOOP_TOKEN, no `mergeloop login`, and `gh auth token` has none: run `gh auth login`",
@@ -207,4 +223,56 @@ impl Client {
 enum Retry {
     Yes(anyhow::Error),
     No(anyhow::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> String {
+        Server::parse(s).unwrap().url().to_owned()
+    }
+
+    #[test]
+    fn one_server_written_many_ways_is_one_server() {
+        for alias in [
+            "https://mergeloop.ai",
+            "https://mergeloop.ai/",
+            "https://MERGELOOP.ai",
+            "https://mergeloop.ai:443",
+            "HTTPS://MergeLoop.AI:443/",
+        ] {
+            assert_eq!(url(alias), "https://mergeloop.ai", "{alias}");
+        }
+        assert_eq!(url("http://127.0.0.1:8080/"), "http://127.0.0.1:8080");
+        assert_eq!(url("http://localhost:80"), "http://localhost");
+    }
+
+    #[test]
+    fn what_reaches_another_server_stays_another_server() {
+        let base = url("https://mergeloop.ai");
+        for other in [
+            "http://mergeloop.ai",
+            "https://mergeloop.ai:8443",
+            "https://eu.mergeloop.ai",
+            "https://mergeloop.ai/ml",
+        ] {
+            assert_ne!(url(other), base, "{other}");
+        }
+        assert_eq!(url("https://x.dev/ml/"), "https://x.dev/ml");
+    }
+
+    #[test]
+    fn a_url_with_a_user_query_or_fragment_or_no_host_is_refused() {
+        for bad in [
+            "https://me:pw@mergeloop.ai",
+            "https://mergeloop.ai/?a=1",
+            "https://mergeloop.ai/#x",
+            "ftp://mergeloop.ai",
+            "mergeloop.ai",
+            "",
+        ] {
+            assert!(Server::parse(bad).is_err(), "{bad}");
+        }
+    }
 }

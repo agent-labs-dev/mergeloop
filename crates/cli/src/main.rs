@@ -71,7 +71,7 @@ enum Cmd {
 }
 
 async fn run(args: &[String]) -> Result<u8> {
-    let server = Server::from_env();
+    let server = Server::from_env()?;
     match parse(args)? {
         Cmd::Help => {
             println!("{USAGE}");
@@ -96,14 +96,14 @@ async fn run(args: &[String]) -> Result<u8> {
         }
         Cmd::Call { tool, args } => {
             let args = call_args(args.as_deref())?;
-            let client = Client::for_command(server, &session::path()?)?;
+            let client = Client::for_command(server, session::path)?;
             let (text, is_error) = client.tool(&tool, args).await?;
             println!("{text}");
             Ok(if is_error { 1 } else { 0 })
         }
         Cmd::Land { pr, after } => {
             let (repo, number) = resolve(pr)?;
-            let client = Client::for_command(server, &session::path()?)?;
+            let client = Client::for_command(server, session::path)?;
             land(&client, &repo, number, after).await
         }
     }

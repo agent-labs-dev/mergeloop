@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -45,19 +46,37 @@ pub fn find(path: &Path, server: &Server) -> Result<Option<Secret>> {
 
 /// Keeps the server's session, in place of one it had.
 pub fn keep(path: &Path, server: &Server, session: &Secret) -> Result<()> {
-    let mut sessions = read(path)?;
-    sessions.insert(server.url().to_owned(), session.0.clone());
-    write(path, &sessions)
+    change(path, |sessions| {
+        sessions.insert(server.url().to_owned(), session.0.clone());
+    })
 }
 
 /// Forgets the server's session, and returns it.
 pub fn forget(path: &Path, server: &Server) -> Result<Option<Secret>> {
+    Ok(change(path, |sessions| sessions.remove(server.url()))?.map(Secret))
+}
+
+/// Reads the sessions, changes them, and writes them back, while holding the folder's lock:
+/// two commands that change the file at once each see the other's change.
+fn change<T>(path: &Path, f: impl FnOnce(&mut BTreeMap<String, String>) -> T) -> Result<T> {
+    let dir = path.parent().context("the session file has no folder")?;
+    private_dir(dir)?;
+    let lock = dir.join(".session.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .and_then(|file| file.lock().map(|()| file))
+        .with_context(|| format!("lock {}", lock.display()))?;
     let mut sessions = read(path)?;
-    let Some(session) = sessions.remove(server.url()) else {
-        return Ok(None);
-    };
-    write(path, &sessions)?;
-    Ok(Some(Secret(session)))
+    let before = sessions.clone();
+    let out = f(&mut sessions);
+    if sessions != before {
+        write(path, &sessions)?;
+    }
+    drop(lock);
+    Ok(out)
 }
 
 /// Each server's URL and its session. No file is no sessions.
@@ -77,11 +96,12 @@ fn read(path: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 /// Writes the file whole, readable by its owner only, in a folder only they may enter: a new
-/// file renamed over the old, so a crash leaves one or the other.
+/// file, named for this write alone, renamed over the old, so a crash leaves one or the other.
 fn write(path: &Path, sessions: &BTreeMap<String, String>) -> Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().context("the session file has no folder")?;
-    private_dir(dir)?;
-    let tmp = dir.join(format!(".session-{}.tmp", std::process::id()));
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".session-{}-{n}.tmp", std::process::id()));
     let mut file = private_file(&tmp)?;
     let written = file
         .write_all(serde_json::to_string_pretty(sessions)?.as_bytes())
@@ -146,7 +166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
         std::fs::write(&path, "sess-123 not json").unwrap();
-        let err = find(&path, &Server::new("http://x")).unwrap_err();
+        let err = find(&path, &Server::parse("http://x").unwrap()).unwrap_err();
         let said = format!("{err:#}");
         assert!(
             said.contains("session.json") && !said.contains("sess-123"),
@@ -158,17 +178,42 @@ mod tests {
     fn each_server_keeps_its_own_session() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m").join("session.json");
-        let (a, b) = (Server::new("http://a"), Server::new("http://b"));
+        let (a, b) = (
+            Server::parse("http://a").unwrap(),
+            Server::parse("http://b").unwrap(),
+        );
         assert!(find(&path, &a).unwrap().is_none());
         keep(&path, &a, &Secret::new("sa".into())).unwrap();
         keep(&path, &b, &Secret::new("sb".into())).unwrap();
         assert_eq!(forget(&path, &a).unwrap().unwrap().expose(), "sa");
         assert!(find(&path, &a).unwrap().is_none());
         assert_eq!(find(&path, &b).unwrap().unwrap().expose(), "sb");
-        // Only the file is left in the folder: no temporary file.
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
-        );
+        // Only the file and its lock are left in the folder: no temporary file.
+        let mut left: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [".session.lock", "session.json"]);
+    }
+
+    #[test]
+    fn sessions_kept_and_forgotten_at_once_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m").join("session.json");
+        let server = |i: usize| Server::parse(&format!("http://s{i}")).unwrap();
+        keep(&path, &server(0), &Secret::new("gone".into())).unwrap();
+        std::thread::scope(|s| {
+            for i in 1..=16 {
+                let path = &path;
+                s.spawn(move || keep(path, &server(i), &Secret::new(format!("s{i}"))).unwrap());
+            }
+            s.spawn(|| forget(&path, &server(0)).unwrap());
+        });
+        assert!(find(&path, &server(0)).unwrap().is_none());
+        for i in 1..=16 {
+            let kept = find(&path, &server(i)).unwrap();
+            assert_eq!(kept.map(|s| s.0), Some(format!("s{i}")), "server {i}");
+        }
     }
 }

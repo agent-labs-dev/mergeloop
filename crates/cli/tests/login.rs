@@ -27,7 +27,7 @@ fn sessions(home: &Path) -> PathBuf {
 async fn login_keeps_a_session_that_later_calls_send() {
     let fake = fake::Server::start().await;
     let home = tempfile::tempdir().unwrap();
-    let server = Server::new(&fake.url);
+    let server = Server::parse(&fake.url).unwrap();
 
     let who = login::login(&server, &sessions(home.path()), browser)
         .await
@@ -52,7 +52,7 @@ async fn only_its_owner_may_read_the_session() {
     std::fs::write(&path, "{}").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    login::login(&Server::new(&fake.url), &path, browser)
+    login::login(&Server::parse(&fake.url).unwrap(), &path, browser)
         .await
         .unwrap();
 
@@ -68,14 +68,14 @@ async fn a_session_belongs_to_the_server_it_was_made_on() {
     let home = tempfile::tempdir().unwrap();
     let path = sessions(home.path());
 
-    login::login(&Server::new(&fake.url), &path, browser)
+    login::login(&Server::parse(&fake.url).unwrap(), &path, browser)
         .await
         .unwrap();
 
-    let err = Client::signed_in(&Server::new(&other.url), &path).unwrap_err();
+    let err = Client::signed_in(&Server::parse(&other.url).unwrap(), &path).unwrap_err();
     assert!(format!("{err:#}").contains("mergeloop login"), "{err:#}");
     // A trailing slash names the same server.
-    Client::signed_in(&Server::new(&format!("{}/", fake.url)), &path).unwrap();
+    Client::signed_in(&Server::parse(&format!("{}/", fake.url)).unwrap(), &path).unwrap();
 }
 
 #[tokio::test]
@@ -83,7 +83,7 @@ async fn logout_ends_the_session_on_the_server_and_forgets_it() {
     let fake = fake::Server::start().await;
     let home = tempfile::tempdir().unwrap();
     let path = sessions(home.path());
-    let server = Server::new(&fake.url);
+    let server = Server::parse(&fake.url).unwrap();
     login::login(&server, &path, browser).await.unwrap();
     assert!(fake.takes("session-1"));
 
@@ -105,7 +105,7 @@ async fn a_session_the_server_rejects_says_to_log_in_once() {
     let fake = fake::Server::start().await;
     let home = tempfile::tempdir().unwrap();
     let path = sessions(home.path());
-    let server = Server::new(&fake.url);
+    let server = Server::parse(&fake.url).unwrap();
     login::login(&server, &path, browser).await.unwrap();
     fake.seen.lock().unwrap().sessions.clear();
     let before = fake.bearers().len();

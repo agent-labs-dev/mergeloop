@@ -39,7 +39,7 @@ fn sign_in(fake: &fake::Server, home: &Path, session: &str) {
     let path = home.join(".mergeloop").join("session.json");
     session::keep(
         &path,
-        &Server::new(&fake.url),
+        &Server::parse(&fake.url).unwrap(),
         &Secret::new(session.to_owned()),
     )
     .unwrap();
@@ -158,4 +158,22 @@ async fn help_says_what_is_sent_and_where_the_session_is_kept() {
         assert!(help.contains(said), "{said}: {help}");
     }
     assert!(fake.bearers().is_empty(), "help calls nobody");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_given_mergeloop_token_needs_no_home() {
+    let fake = fake::Server::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mergeloop"));
+    cmd.args(["call", "pull_status", "{}"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("MERGELOOP_URL", &fake.url)
+        .env("MERGELOOP_TOKEN", fake::GITHUB_TOKEN)
+        .current_dir(home.path());
+
+    let out = cmd.output().await.unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fake.bearers(), [fake::GITHUB_TOKEN]);
 }

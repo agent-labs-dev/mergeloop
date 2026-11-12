@@ -125,6 +125,26 @@ async fn give_back_held(lane: &Lane) -> Result<()> {
     Ok(())
 }
 
+/// When the claim loop next asks for a task: when the first workspace wakes, or a poll from now
+/// when none sleeps. Never while every slot is taken: a build ending wakes it then.
+fn wake(asleep: &HashMap<u64, Instant>, free: bool, poll: Duration) -> Option<Instant> {
+    free.then(|| {
+        asleep
+            .values()
+            .min()
+            .copied()
+            .unwrap_or_else(|| Instant::now() + poll)
+    })
+}
+
+/// Sleeps until `wake`, or forever.
+async fn sleep_until(wake: Option<Instant>) {
+    match wake {
+        Some(wake) => tokio::time::sleep_until(wake).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// What the claim loop keeps between its turns.
 struct State {
     builds: JoinSet<Result<Ended>>,
@@ -163,12 +183,7 @@ impl Slots {
             if *stopping.borrow() && state.builds.is_empty() {
                 break;
             }
-            let wake = state
-                .asleep
-                .values()
-                .min()
-                .copied()
-                .unwrap_or_else(|| Instant::now() + self.poll);
+            let wake = wake(&state.asleep, state.builds.len() < self.slots, self.poll);
             tokio::select! {
                 Some(done) = state.builds.join_next() => match done {
                     Ok(Ok(_)) => {}
@@ -178,7 +193,7 @@ impl Slots {
                     }
                     Err(e) => eprintln!("mergeloop: a build panicked: {e}"),
                 },
-                () = tokio::time::sleep_until(wake), if !*stopping.borrow() => {}
+                () = sleep_until(wake), if !*stopping.borrow() => {}
                 () = &mut stop, if !*stopping.borrow() => {
                     eprintln!("mergeloop: stopping: giving back what it holds");
                     stopping.send_replace(true);
@@ -242,5 +257,21 @@ impl Slots {
             task.build, task.repo, task.issue, task.title
         );
         Ok(Some(task))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_every_slot_taken_a_passed_deadline_does_not_wake_the_loop() {
+        let poll = Duration::from_secs(30);
+        let passed = Instant::now() - Duration::from_secs(5);
+        let asleep = HashMap::from([(2, passed)]);
+        assert_eq!(wake(&asleep, false, poll), None);
+        assert_eq!(wake(&asleep, true, poll), Some(passed));
+        let none = wake(&HashMap::new(), true, poll).unwrap();
+        assert!(none > Instant::now() + poll - Duration::from_secs(1));
     }
 }

@@ -113,3 +113,58 @@ fn exists(pid: i32) -> bool {
     let found = unsafe { libc::kill(pid, 0) } == 0;
     found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process group of its own, `sh` with a `sleep` child, reaped as it dies.
+    fn group() -> u32 {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 60 & sleep 60"]);
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || child.wait());
+        pid
+    }
+
+    #[test]
+    fn only_a_build_and_a_group_of_its_own_are_read_from_a_name() {
+        assert_eq!(parse(Path::new("/g/7.4242")), Some((7, 4242)));
+        for name in ["7.1", "7.0", "7.-5", "x.4242", "74242"] {
+            assert_eq!(parse(&Path::new("/g").join(name)), None, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_group_is_gone_when_stop_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = Groups::new(dir.path().join("groups"));
+        let pgid = group();
+        groups.track(3, pgid);
+        groups.stop(3).await.unwrap();
+        assert!(!exists(-(pgid as i32)), "the group outlived stop");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("groups"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_whose_leader_started_at_another_time_is_a_stranger_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = Groups::new(dir.path().join("groups"));
+        let pgid = group();
+        std::fs::create_dir_all(dir.path().join("groups")).unwrap();
+        let noted = dir.path().join(format!("groups/4.{pgid}"));
+        std::fs::write(&noted, "Mon Jan  1 00:00:00 2001").unwrap();
+        groups.stop_all().await.unwrap();
+        assert!(exists(pgid as i32), "a stranger was stopped");
+        assert!(!noted.exists(), "it is forgotten all the same");
+        // SAFETY: the test's own group.
+        unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+    }
+}

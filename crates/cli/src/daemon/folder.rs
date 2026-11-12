@@ -120,7 +120,13 @@ impl Folder {
         let tree = Git
             .add_tree(&clone, &room.tree, &task.branch, &base)
             .await?;
-        Ok(Checkout { clone, room, tree })
+        let remote = Git.remote_head(&clone, token, &task.branch).await?;
+        Ok(Checkout {
+            clone,
+            room,
+            tree,
+            remote,
+        })
     }
 
     /// Removes the build's room and its local branch. Nothing there is fine.
@@ -221,6 +227,8 @@ pub struct Checkout {
     pub clone: PathBuf,
     pub room: Room,
     pub tree: Tree,
+    /// Where the task's branch was on GitHub at checkout: the push replaces only that.
+    pub remote: Option<String>,
 }
 
 /// The name kept in `dir/id`, made the first time. Written whole or not at all.

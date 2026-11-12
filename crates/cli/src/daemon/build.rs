@@ -202,14 +202,21 @@ async fn publish(
     }
     let head = Git.tree_head(&checkout.tree).await?;
     let token = heard(lane, task, || lane.mint(task)).await?;
-    Git.push_branch(
-        &checkout.clone,
-        &token,
-        &task.clone_url,
-        &head,
-        &task.branch,
-    )
-    .await?;
+    // A branch that moved since checkout is someone's work: never pushed over.
+    let seen = checkout.remote.as_deref().unwrap_or_default();
+    let (clone, branch) = (&checkout.clone, &task.branch);
+    if let Err(e) = Git
+        .push_leased(clone, &token, &task.clone_url, &head, branch, seen)
+        .await
+    {
+        if Git.remote_head(clone, &token, branch).await? != checkout.remote {
+            return Ok(Work::Stuck(format!(
+                "The branch {branch} changed on GitHub while the build ran, so the build did not \
+                 push over it. Look at what is on it, then put the label on again to build anew."
+            )));
+        }
+        return Err(e);
+    }
     say(task, &format!("pushed {}", task.branch));
     let description = build_description(&run.text);
     let pr = heard(lane, task, || lane.open_pr(task, &subject, &description)).await?;

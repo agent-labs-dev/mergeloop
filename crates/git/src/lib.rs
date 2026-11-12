@@ -132,7 +132,26 @@ impl Git {
         Ok(())
     }
 
-    /// Pushes `sha` to `branch` at `url`, only while the branch is at `expected`. The token goes
+    /// The commit `branch` is at on `origin`, or `None` when it has no such branch. The token goes
+    /// in as `fetch`'s does.
+    pub async fn remote_head(
+        &self,
+        repo: &Path,
+        token: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let refname = format!("refs/heads/{branch}");
+        let mut cmd = self.git(repo, &["ls-remote", "origin", &refname]);
+        authorize(&mut cmd, token);
+        let out = String::from_utf8(output(cmd, "git ls-remote").await?)?;
+        Ok(out
+            .lines()
+            .find_map(|l| l.strip_suffix(refname.as_str()))
+            .map(|sha| sha.trim().to_owned()))
+    }
+
+    /// Pushes `sha` to `branch` at `url`, only while the branch is at `expected`: absent, when
+    /// `expected` is empty. The token goes
     /// in as `fetch`'s does.
     pub async fn push_leased(
         &self,
@@ -146,23 +165,6 @@ impl Git {
         let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
         let refspec = format!("{sha}:refs/heads/{branch}");
         let mut cmd = self.git(repo, &["push", "-q", "--no-verify", &lease, url, &refspec]);
-        authorize(&mut cmd, token);
-        output(cmd, "git push").await?;
-        Ok(())
-    }
-
-    /// Pushes `rev` to `branch` at `url`, in place of whatever the branch was: for a branch only
-    /// its pusher writes. The token goes in as `fetch`'s does.
-    pub async fn push_branch(
-        &self,
-        repo: &Path,
-        token: &str,
-        url: &str,
-        rev: &str,
-        branch: &str,
-    ) -> Result<()> {
-        let refspec = format!("+{rev}:refs/heads/{branch}");
-        let mut cmd = self.git(repo, &["push", "-q", "--no-verify", url, &refspec]);
         authorize(&mut cmd, token);
         output(cmd, "git push").await?;
         Ok(())
@@ -1083,33 +1085,6 @@ mod tests {
             !Git.squash(&tree, &head, "Again", ("Bot", "bot@example.com"))
                 .await
                 .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn push_branch_replaces_what_the_branch_was() {
-        let tmp = tempfile::tempdir().unwrap();
-        let remote = tmp.path().join("remote.git");
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        sh(
-            tmp.path(),
-            &["init", "-q", "--bare", remote.to_str().unwrap()],
-        );
-        sh(&work, &["init", "-q"]);
-        let first = commit(&work, "a", "1");
-        let url = remote.to_str().unwrap();
-        Git.push_branch(&work, "", url, &first, "mergeloop/build-7")
-            .await
-            .unwrap();
-        sh(&work, &["checkout", "-q", "--orphan", "other"]);
-        let unrelated = commit(&work, "b", "2");
-        Git.push_branch(&work, "", url, &unrelated, "mergeloop/build-7")
-            .await
-            .unwrap();
-        assert_eq!(
-            sh(&remote, &["rev-parse", "refs/heads/mergeloop/build-7"]),
-            unrelated
         );
     }
 }

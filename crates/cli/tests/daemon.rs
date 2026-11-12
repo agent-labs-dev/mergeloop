@@ -439,6 +439,47 @@ async fn a_hostile_verify_command_writes_only_its_own_tree_and_reads_no_session(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_branch_that_moved_under_the_build_is_not_overwritten_and_the_build_is_stuck() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(9, 19, &[]));
+    let main = git(&w.remote(), &["rev-parse", "main"]).trim().to_owned();
+    // Someone pushes to the build's branch while the agent works.
+    let body = format!(
+        "git --git-dir='{}' update-ref refs/heads/mergeloop/build-19 {main}; echo x > x.txt",
+        w.remote().display()
+    );
+    let agent = w.agent("raced", &body, BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().unwrap_or_default();
+    assert!(why.contains("mergeloop/build-19 changed"), "{released:?}");
+    assert_eq!(
+        git(&w.remote(), &["rev-parse", "mergeloop/build-19"]).trim(),
+        main
+    );
+    assert!(w.fake.lane(|l| l.opened.is_empty()));
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_left_from_before_the_build_is_replaced() {
+    let w = World::new().await;
+    git(&w.remote(), &["branch", "mergeloop/build-20", "main"]);
+    w.fake.add_task(w.task(10, 20, &[]));
+    let agent = w.agent("builder", "echo x > x.txt", BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1);
+    let pushed = w.pushed("mergeloop/build-20").unwrap();
+    assert_eq!(pushed[0], "Add the feature");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed() {
     let w = World::new().await;
     // What a crash left: the clone, a worktree on its branch, and a branch alone.
@@ -530,7 +571,8 @@ async fn a_daemon_names_itself_once_and_keeps_its_name() {
     };
 
     w.run(w.config(1, &agent), |w| claimed(w) >= 1).await;
-    w.run(w.config(1, &agent), |w| claimed(w) >= 2).await;
+    let (before, listed) = (claimed(&w), w.fake.args_of("list_builds").len());
+    w.run(w.config(1, &agent), |w| claimed(w) > before).await;
 
     let names: Vec<Value> = w
         .fake
@@ -541,7 +583,7 @@ async fn a_daemon_names_itself_once_and_keeps_its_name() {
     let first = names[0].as_str().expect("a claim names its daemon");
     assert!(first.len() >= 16, "{first}");
     assert!(names.iter().all(|n| n == first), "{names:?}");
-    assert_eq!(w.fake.args_of("list_builds")[1]["daemon"], first);
+    assert_eq!(w.fake.args_of("list_builds")[listed]["daemon"], first);
 }
 
 #[tokio::test(flavor = "multi_thread")]

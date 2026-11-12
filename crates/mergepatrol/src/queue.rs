@@ -883,15 +883,40 @@ async fn review_hold(
     Ok(None)
 }
 
-/// Dismisses the changes MergeLoop's review asked for on PRs its review gate lets go on, as
-/// GitHub would not merge them otherwise. One that fails stays: GitHub turns the merge down,
-/// and says why.
-async fn withdraw_change_requests(gh: &dyn GitHub, repo: &RepoName, layers: &[PullRequest]) {
+/// Shows on GitHub that the review gate lets the PRs go on: MergeLoop dismisses the changes its
+/// review asked for, and, when its review ran, approves each layer at the head it reviewed, of
+/// `heads`, as (PR, head, unresolved threads), unless its approval still stands. Never a PR the
+/// App opened, which GitHub won't let it approve. One that fails stays: GitHub turns the merge
+/// down, and says why.
+async fn pass_review(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    reviewed: bool,
+    layers: &[PullRequest],
+    heads: &[(PrNumber, &str, u32)],
+) {
     for pr in layers.iter().filter(|pr| pr.changes_requested_by_viewer()) {
         let why = "MergeLoop's review no longer holds this PR.";
         let dismissed = gh.dismiss_reviews_marked(repo, pr.number, &REVIEW_MARKS, why);
         if let Err(e) = dismissed.await {
             tracing::warn!(%repo, pr = pr.number, error = %format!("{e:#}"), "could not dismiss the review's request for changes");
+        }
+    }
+    if !reviewed {
+        return;
+    }
+    let unapproved = layers
+        .iter()
+        .filter(|pr| !pr.viewer_did_author && !pr.approved_by_viewer());
+    for pr in unapproved {
+        let Some(&(_, head, _)) = heads.iter().find(|(n, ..)| *n == pr.number) else {
+            continue;
+        };
+        let short = &head[..7.min(head.len())];
+        let body =
+            format!("MergeLoop's review approves `{short}`: nothing it found holds this PR.");
+        if let Err(e) = gh.approve(repo, pr.number, head, &body).await {
+            tracing::warn!(%repo, pr = pr.number, error = %format!("{e:#}"), "could not approve the PR");
         }
     }
 }
@@ -1194,7 +1219,7 @@ async fn sync_lane(
             )
             .await?;
             if hold.is_none() {
-                withdraw_change_requests(gh, repo, &unit.layers).await;
+                pass_review(gh, repo, read.review.enabled, &unit.layers, &heads).await;
             }
             hold
         } {
@@ -3017,7 +3042,7 @@ async fn run_job(
                         ctx.reviews.notify_one();
                     }
                     if hold.is_none() {
-                        withdraw_change_requests(gh, repo, &now.layers).await;
+                        pass_review(gh, repo, review.enabled, &now.layers, &reviewed).await;
                     }
                     hold
                 } {

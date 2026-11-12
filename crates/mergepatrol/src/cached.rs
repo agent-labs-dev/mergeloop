@@ -452,6 +452,16 @@ impl GitHub for Cached<'_> {
     ) -> Result<usize> {
         GitHub::dismiss_reviews_marked(self.gh, repo, number, marks, message).await
     }
+    async fn approve(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        head: &str,
+        body: &str,
+    ) -> Result<()> {
+        let approved = GitHub::approve(self.gh, repo, number, head, body).await;
+        self.marking(repo, vec![Change::Pr(number)], approved).await
+    }
     async fn set_body(&self, repo: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         GitHub::set_body(self.gh, repo, number, body).await
     }

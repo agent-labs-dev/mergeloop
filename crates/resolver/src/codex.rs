@@ -88,7 +88,7 @@ impl CodexResolver {
 
 /// What a `codex exec --json` run has said so far.
 #[derive(Default)]
-struct Run {
+pub(crate) struct Run {
     turns: u32,
     /// The agent's last message: its answer, once the run is over.
     last_message: String,
@@ -119,7 +119,7 @@ fn usage(u: &Value) -> Option<Usage> {
 }
 
 impl Run {
-    fn on(&mut self, event: &Value, max_turns: u32) -> Result<()> {
+    pub(crate) fn on(&mut self, event: &Value, max_turns: u32) -> Result<()> {
         match event["type"].as_str() {
             Some("item.completed") => {
                 let item = &event["item"];
@@ -155,7 +155,7 @@ impl Run {
     }
 
     /// `priced` is the model to price the run's tokens on, `None` when they bill nothing.
-    fn end(self, ended: Ended, priced: Option<&str>) -> Resolution {
+    pub(crate) fn end(self, ended: Ended, priced: Option<&str>) -> Resolution {
         Resolution {
             turns: self.turns,
             // Codex reports tokens, not what they cost.

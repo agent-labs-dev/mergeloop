@@ -88,32 +88,49 @@ impl ClaudeResolver {
         transcript_path: &Path,
     ) -> Result<Resolution> {
         let cmd = self.command(workdir, prompt, access)?;
-        let mut turns = 0;
-        let mut result = None;
+        let mut run = Run::default();
         let ended = cli::stream(cmd, "claude", self.timeout, transcript_path, |event| {
-            match event["type"].as_str() {
-                Some("assistant") => {
-                    turns += 1;
-                    if turns > self.max_turns {
-                        bail!("Claude went over {} turns", self.max_turns);
-                    }
-                }
-                Some("result") => result = Some(event.clone()),
-                _ => {}
-            }
-            Ok(())
+            run.on(event, self.max_turns)
         })
         .await?;
-        Ok(Resolution {
-            turns,
-            cost_usd: result.as_ref().and_then(cost_usd),
+        Ok(run.end(ended))
+    }
+}
+
+/// What a `claude -p --output-format stream-json` run has said so far.
+#[derive(Default)]
+pub(crate) struct Run {
+    turns: u32,
+    /// The `result` event, the run's last.
+    result: Option<Value>,
+}
+
+impl Run {
+    pub(crate) fn on(&mut self, event: &Value, max_turns: u32) -> Result<()> {
+        match event["type"].as_str() {
+            Some("assistant") => {
+                self.turns += 1;
+                if self.turns > max_turns {
+                    bail!("Claude went over {max_turns} turns");
+                }
+            }
+            Some("result") => self.result = Some(event.clone()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn end(self, ended: Ended) -> Resolution {
+        let result = self.result.as_ref();
+        Resolution {
+            turns: self.turns,
+            cost_usd: result.and_then(cost_usd),
             text: result
-                .as_ref()
                 .and_then(|r| r["result"].as_str())
                 .unwrap_or_default()
                 .to_owned(),
-            outcome: outcome(ended, result.as_ref()),
-        })
+            outcome: outcome(ended, result),
+        }
     }
 }
 

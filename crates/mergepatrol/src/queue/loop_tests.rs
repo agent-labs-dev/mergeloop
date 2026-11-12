@@ -71,6 +71,8 @@ struct State {
     comments: Vec<(PrNumber, String)>,
     /// The PRs whose request for changes MergeLoop dismissed, in order.
     dismissed: Vec<PrNumber>,
+    /// The PRs MergeLoop approved, and the head it approved, in order.
+    approved: Vec<(PrNumber, String)>,
     /// The reviews posted on each PR: their body, and how many threads they start.
     reviews: Vec<(PrNumber, String, usize)>,
     /// Each of those reviews' state: `COMMENTED`, `CHANGES_REQUESTED` until it is dismissed,
@@ -173,6 +175,7 @@ impl State {
                 maintainer_can_modify: false,
                 head_repository: None,
                 unresolved_threads: 0,
+                viewer_did_author: false,
                 details: Default::default(),
             },
         );
@@ -723,6 +726,22 @@ impl GitHub for Fake {
             pr.details = Default::default();
         });
         Ok(1)
+    }
+    async fn approve(&self, _: &RepoName, number: PrNumber, head: &str, _: &str) -> Result<()> {
+        self.with_mut(|s| {
+            s.approved.push((number, head.to_owned()));
+            let pr = s.prs.get_mut(&number).unwrap();
+            pr.review_decision = Some("APPROVED".into());
+            pr.details = serde_json::from_value(serde_json::json!({
+                "url": "", "createdAt": "", "additions": 0, "deletions": 0, "changedFiles": 0,
+                "author": null, "reviewRequests": { "nodes": [] }, "commits": null,
+                "latestOpinionatedReviews": { "nodes": [
+                    { "state": "APPROVED", "viewerDidAuthor": true, "author": null },
+                ] },
+            }))
+            .unwrap();
+        });
+        Ok(())
     }
     async fn sticky_comment(&self, _: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -2652,7 +2671,75 @@ async fn a_pr_goes_on_once_its_author_resolves_every_comment_with_no_human() {
     threads(0);
     run.drain().await;
     assert_eq!(run.gh.with(|s| s.dismissed.clone()), [1]);
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
     assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mergeloop_approves_the_head_its_review_approved_once() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    // Branch rules wait for an approval, which MergeLoop's own gives.
+    run.gh
+        .with_mut(|s| s.prs.get_mut(&1).unwrap().review_decision = Some("REVIEW_REQUIRED".into()));
+    run.tick().await;
+    assert!(run.gh.with(|s| s.approved.is_empty()), "not reviewed yet");
+    run.store.finish_review(1, ReviewStatus::Approved);
+    // The tick that approves read the PR before: the next sees the approval.
+    run.tick().await;
+    run.drain().await;
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
+    assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mergeloop_approves_again_once_github_dismisses_its_approval_on_a_push() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    let require_review =
+        |s: &mut State| s.prs.get_mut(&1).unwrap().review_decision = Some("REVIEW_REQUIRED".into());
+    run.gh.with_mut(require_review);
+    run.tick().await;
+    run.store.finish_review(1, ReviewStatus::Approved);
+    run.tick().await;
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
+    // The author pushes, and the branch's rules dismiss stale approvals.
+    run.gh.with_mut(|s| {
+        s.push(1, "pushed");
+        s.prs.get_mut(&1).unwrap().details = Default::default();
+        require_review(s);
+    });
+    run.tick().await;
+    run.tick().await;
+    assert_eq!(run.gh.with(|s| s.approved.len()), 1, "not reviewed yet");
+    run.store.finish_review(1, ReviewStatus::Approved);
+    run.tick().await;
+    let approved = run.gh.with(|s| s.approved.clone());
+    assert_eq!(approved, [(1, "pr-1-v0".into()), (1, "pushed".into())]);
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert_eq!(run.gh.with(|s| s.approved.len()), 2, "approved once a head");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mergeloop_never_approves_a_pr_it_opened_or_did_not_review() {
+    // A PR the App opened: GitHub won't let it approve its own.
+    let run = Run::new(Fake::new(|s| {
+        s.add_pr(1);
+        s.prs.get_mut(&1).unwrap().viewer_did_author = true;
+    }));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    run.tick().await;
+    run.store.finish_review(1, ReviewStatus::Approved);
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert!(run.gh.with(|s| s.approved.is_empty()));
+
+    // A workspace with the review off.
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert!(run.gh.with(|s| s.approved.is_empty()));
 }
 
 #[tokio::test(start_paused = true)]

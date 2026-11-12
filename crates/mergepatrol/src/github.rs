@@ -94,6 +94,14 @@ pub trait GitHub: Send + Sync {
         marks: &[&str],
         message: &str,
     ) -> Result<usize>;
+    /// Approves the PR at `head` as the App, with `body`.
+    async fn approve(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        head: &str,
+        body: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -232,6 +240,15 @@ impl GitHub for Installation {
         message: &str,
     ) -> Result<usize> {
         Installation::dismiss_reviews_marked(self, repo, number, marks, message).await
+    }
+    async fn approve(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        head: &str,
+        body: &str,
+    ) -> Result<()> {
+        Installation::approve(self, repo, number, head, body).await
     }
     async fn set_body(&self, repo: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         Installation::set_body(self, repo, number, body).await

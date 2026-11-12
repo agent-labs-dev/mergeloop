@@ -78,6 +78,9 @@ pub struct PullRequest {
     /// not ask.
     #[serde(default, rename = "reviewThreads", deserialize_with = "unresolved")]
     pub unresolved_threads: u32,
+    /// Whoever read the PR opened it: read as the App, a PR MergeLoop opened.
+    #[serde(default)]
+    pub viewer_did_author: bool,
     #[serde(flatten)]
     pub details: PrDetails,
 }
@@ -214,6 +217,15 @@ impl PullRequest {
             .latest_opinionated_reviews
             .iter()
             .any(|r| r.state == "CHANGES_REQUESTED" && r.viewer_did_author)
+    }
+
+    /// Whether, read as the App, MergeLoop's own review approves the PR: its approval, which
+    /// GitHub has not dismissed on a push.
+    pub fn approved_by_viewer(&self) -> bool {
+        self.details
+            .latest_opinionated_reviews
+            .iter()
+            .any(|r| r.state == "APPROVED" && r.viewer_did_author)
     }
 
     /// Why GitHub would not merge this PR yet, if it would not. Changes only MergeLoop's own
@@ -393,7 +405,7 @@ macro_rules! summary_fields {
         "number state title body isDraft isCrossRepository reviewDecision baseRefName headRefName headRefOid labels(first: 100) { nodes { name } } stack { number baseRefName }
   maintainerCanModify headRepository { nameWithOwner owner { __typename } }
   url createdAt additions deletions changedFiles author { __typename login avatarUrl }
-  latestOpinionatedReviews(first: 20) { nodes { state viewerDidAuthor author { login avatarUrl } } }
+  viewerDidAuthor latestOpinionatedReviews(first: 20) { nodes { state viewerDidAuthor author { login avatarUrl } } }
   reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login avatarUrl } } } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
     };
@@ -1215,20 +1227,19 @@ impl Installation {
         Ok(())
     }
 
-    /// Reviews the PR at `head` as the App: `APPROVE` or `COMMENT`, with `body`.
-    pub async fn review(
+    /// Approves the PR at `head` as the App, with `body`.
+    pub async fn approve(
         &self,
         repo: &RepoName,
         number: PrNumber,
         head: &str,
-        event: &str,
         body: &str,
     ) -> Result<()> {
         let _: Value = self
             .rest(
                 Method::POST,
                 &format!("/repos/{repo}/pulls/{number}/reviews"),
-                Some(json!({ "commit_id": head, "event": event, "body": body })),
+                Some(json!({ "commit_id": head, "event": "APPROVE", "body": body })),
             )
             .await?;
         Ok(())

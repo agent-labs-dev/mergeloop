@@ -40,6 +40,8 @@ pub struct Daemon {
     pub poll: Duration,
     /// How often a build heartbeats.
     pub heartbeat_every: Duration,
+    /// Runs in each build once its room is made: for tests.
+    pub in_room: Option<build::InRoom>,
 }
 
 impl Daemon {
@@ -49,6 +51,7 @@ impl Daemon {
             client,
             poll: Duration::from_secs(30),
             heartbeat_every: Duration::from_secs(5 * 60),
+            in_room: None,
         }
     }
 
@@ -98,6 +101,7 @@ impl Daemon {
             access,
             folder,
             heartbeat_every: self.heartbeat_every,
+            in_room: self.in_room,
         };
         Slots {
             lanes,
@@ -149,9 +153,23 @@ async fn sleep_until(wake: Option<Instant>) {
     }
 }
 
+/// What a build task that failed said: its panic's message.
+fn panicked(e: tokio::task::JoinError) -> String {
+    match e.try_into_panic() {
+        Ok(panic) => panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_else(|| "it panicked".into()),
+        Err(e) => e.to_string(),
+    }
+}
+
 /// What the claim loop keeps between its turns.
 struct State {
     builds: JoinSet<Result<Ended>>,
+    /// The build each task runs, to settle it should the task fail.
+    running: HashMap<tokio::task::Id, (Lane, Task)>,
     /// When each workspace may be asked for a task again.
     asleep: HashMap<u64, Instant>,
     /// The workspace to ask first next time.
@@ -172,6 +190,7 @@ impl Slots {
         let (stopping, stop_rx) = watch::channel(false);
         let mut state = State {
             builds: JoinSet::new(),
+            running: HashMap::new(),
             asleep: HashMap::new(),
             next: 0,
             failed: None,
@@ -189,14 +208,25 @@ impl Slots {
             }
             let wake = wake(&state.asleep, state.builds.len() < self.slots, self.poll);
             tokio::select! {
-                Some(done) = state.builds.join_next() => match done {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
+                Some(done) = state.builds.join_next_with_id() => {
+                    let ended = match done {
+                        Ok((id, ended)) => {
+                            state.running.remove(&id);
+                            ended.map(drop)
+                        }
+                        Err(e) => match state.running.remove(&e.id()) {
+                            Some((lane, task)) => {
+                                let why = panicked(e);
+                                self.builder.failed(&lane, &task, &why).await
+                            }
+                            None => Ok(()),
+                        },
+                    };
+                    if let Err(e) = ended {
                         state.failed.get_or_insert(e);
                         stopping.send_replace(true);
                     }
-                    Err(e) => eprintln!("mergeloop: a build panicked: {e}"),
-                },
+                }
                 () = sleep_until(wake), if !*stopping.borrow() => {}
                 () = &mut stop, if !*stopping.borrow() => {
                     eprintln!("mergeloop: stopping: giving back what it holds");
@@ -221,10 +251,12 @@ impl Slots {
             state.next = (state.next + 1) % self.lanes.len();
             match self.claim(lane).await {
                 Ok(Some(task)) => {
-                    let (builder, lane, stop) = (self.builder.clone(), lane.clone(), stop.clone());
-                    state
+                    let (builder, stop) = (self.builder.clone(), stop.clone());
+                    let (l, t) = (lane.clone(), task.clone());
+                    let spawned = state
                         .builds
-                        .spawn(async move { builder.build(&lane, &task, stop).await });
+                        .spawn(async move { builder.build(&l, &t, stop).await });
+                    state.running.insert(spawned.id(), (lane.clone(), task));
                 }
                 Ok(None) => _ = state.asleep.insert(lane.workspace, now + self.poll),
                 Err(e) if needs_sign_in(&e) => return Err(e),

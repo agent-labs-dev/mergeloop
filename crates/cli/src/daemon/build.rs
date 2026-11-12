@@ -29,7 +29,12 @@ pub struct Builder {
     pub access: Access,
     /// How often a build tells the server it is alive. The server lets 30 minutes pass.
     pub heartbeat_every: Duration,
+    /// Runs in each build once its room is made: for tests.
+    pub in_room: Option<InRoom>,
 }
+
+/// A step a test puts into each build.
+pub type InRoom = std::sync::Arc<dyn Fn(&Task) + Send + Sync>;
 
 /// How a build ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -84,6 +89,16 @@ impl Builder {
         ended
     }
 
+    /// Settles a build whose task failed, as when the daemon has a bug: released as stuck, saying
+    /// so, and cleaned up. An error only when the sign-in is no good.
+    pub async fn failed(&self, lane: &Lane, task: &Task, why: &str) -> Result<()> {
+        let why = format!("The daemon failed while building it: {why}");
+        say(task, &why);
+        let settled = settle(lane, task, Ok(Work::Stuck(why))).await;
+        self.clean_up(task).await;
+        settled.map(drop)
+    }
+
     /// Stops what the build left running, then removes its room and branch.
     pub async fn clean_up(&self, task: &Task) {
         if let Err(e) = self.folder.groups().stop(task.build).await {
@@ -102,6 +117,9 @@ impl Builder {
         lane.heartbeat(task, Stage::Building).await?;
         let token = heard(lane, task, || lane.mint(task)).await?;
         let checkout = self.folder.checkout(task, &token).await?;
+        if let Some(in_room) = &self.in_room {
+            in_room(task);
+        }
         let base = Git.tree_head(&checkout.tree).await?;
         say(
             task,

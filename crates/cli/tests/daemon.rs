@@ -9,6 +9,7 @@ use std::time::Duration;
 use mergeloop_cli::client::{Client, Server};
 use mergeloop_cli::daemon::Daemon;
 use mergeloop_cli::daemon::config::Config;
+use mergeloop_cli::daemon::lane::Task;
 use mergeloop_cli::session::{self, Secret};
 use serde_json::{Value, json};
 
@@ -487,6 +488,39 @@ async fn a_branch_left_from_before_the_build_is_replaced() {
     assert_eq!(w.fake.lane(|l| l.opened.len()), 1);
     let pushed = w.pushed("mergeloop/build-20").unwrap();
     assert_eq!(pushed[0], "Add the feature");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_that_panics_is_released_as_stuck_and_cleaned_up_and_the_daemon_goes_on() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(12, 22, &[]));
+    w.fake.add_task(w.task(13, 23, &[]));
+    let agent = w.agent("builder", "echo x > x.txt", BUILT);
+    let mut daemon = Daemon::new(w.config(1, &agent), w.client());
+    daemon.poll = Duration::from_millis(50);
+    daemon.in_room = Some(std::sync::Arc::new(|task: &Task| {
+        assert_ne!(task.build, 12, "a bug in the daemon");
+    }));
+    let stop = until(|| w.fake.lane(|l| l.ended() == 2));
+    tokio::time::timeout(Duration::from_secs(60), daemon.run(stop))
+        .await
+        .expect("the daemon stops in time")
+        .unwrap();
+
+    let released = w.fake.lane(|l| l.released.clone());
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0].0, 12);
+    assert!(
+        released[0]
+            .1
+            .as_deref()
+            .unwrap_or_default()
+            .contains("a bug in the daemon"),
+        "{released:?}"
+    );
+    assert_eq!(w.fake.args_of("release_build")[0]["claim"], 1);
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1, "the next build goes on");
+    assert_eq!(w.left(), (vec![], vec![]));
 }
 
 #[tokio::test(flavor = "multi_thread")]

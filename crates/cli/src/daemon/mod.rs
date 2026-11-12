@@ -6,12 +6,14 @@
 //! - `config`: the config file.
 //! - `lane`: the build lane's tools, for one workspace.
 //! - `folder`: the workspace folder: clones, worktrees, transcripts, and their cleanup.
+//! - `groups`: the process groups builds run, stopped with them.
 //! - `verify`: the repo's verify commands, confined like the agent.
 //! - `build`: one build, from a claimed task to its open PR.
 
 pub mod build;
 pub mod config;
 pub mod folder;
+pub mod groups;
 pub mod lane;
 pub mod verify;
 
@@ -71,6 +73,8 @@ impl Daemon {
             eprintln!("mergeloop: daemon: note: {caveat}");
         }
         let (folder, _lock) = Folder::open(&self.config.workspace)?;
+        // What a crash left running goes before what it left on disk.
+        folder.groups().stop_all().await?;
         folder.reconcile(&[]).await?;
         let workspaces = lane::workspaces(&self.client).await?;
         if workspaces.is_empty() {

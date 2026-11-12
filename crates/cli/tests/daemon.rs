@@ -216,8 +216,18 @@ async fn a_task_is_built_pushed_as_the_bot_with_the_developer_and_its_pr_opened(
     w.fake.add_task(w.task(1, 7, &["test -f feature.txt"]));
     let agent = w.agent("my-agent", "echo built > feature.txt", BUILT);
 
-    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
-        .await;
+    // Once the build is over: its slot claims again.
+    let claims = |w: &World| {
+        w.fake
+            .tools()
+            .iter()
+            .filter(|t| *t == "claim_build")
+            .count()
+    };
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| l.ended() == 1) && claims(w) >= 2
+    })
+    .await;
 
     let [subject, author, committer, body] = w.pushed("mergeloop/build-7").unwrap();
     assert_eq!(subject, "Add the feature");
@@ -636,18 +646,91 @@ async fn a_cancelled_build_is_given_back_not_stuck() {
     assert_eq!(w.runs(), 0);
 }
 
+/// Whether process `pid` still runs.
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The pids noted in `file`, one a line, once there are `n`.
+async fn pids(file: &Path, n: usize) -> Vec<String> {
+    until(|| std::fs::read_to_string(file).is_ok_and(|p| p.lines().count() >= n)).await;
+    let pids = std::fs::read_to_string(file).unwrap();
+    pids.lines().map(str::to_owned).collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stopped_mid_build_it_gives_the_build_back_and_cleans_up() {
     let w = World::new().await;
     w.fake.add_task(w.task(7, 16, &[]));
-    let agent = w.agent("sleeper", "touch started; sleep 30", BUILT);
+    let noted = w.root().join("pids");
+    let body = format!("sleep 60 & echo $! >> '{}'; sleep 60", noted.display());
+    let agent = w.agent("sleeper", &body, BUILT);
 
-    let started = w.root().join("runs");
+    let started = noted.clone();
     w.run(w.config(1, &agent), move |_| started.exists()).await;
 
     assert_eq!(w.fake.lane(|l| l.released.clone()), [(7, None)]);
     assert!(w.pushed("mergeloop/build-16").is_none());
     assert_eq!(w.left(), (vec![], vec![]));
+    let left = pids(&noted, 1).await;
+    assert!(!alive(&left[0]), "the agent's child outlived the build");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_agent_and_verify_leave_running_ends_with_their_run() {
+    let w = World::new().await;
+    let noted = w.root().join("pids");
+    let bg = format!("sleep 60 & echo $! >> '{}'", noted.display());
+    w.fake.add_task(w.task(11, 21, &[&bg]));
+    let agent = w.agent("leaver", &format!("{bg}; echo x > x.txt"), BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1);
+    for pid in pids(&noted, 2).await {
+        assert!(!alive(&pid), "{pid} outlived its run");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_start_it_stops_the_processes_a_crashed_daemon_left() {
+    let w = World::new().await;
+    // A build's process group, as a daemon killed mid-build left it, noted in its folder.
+    let mut left = std::process::Command::new("sh");
+    left.args(["-c", "sleep 60 & sleep 60"]);
+    std::os::unix::process::CommandExt::process_group(&mut left, 0);
+    let mut left = left.spawn().unwrap();
+    let pid = left.id().to_string();
+    // Reaped once it dies, as an orphan of a dead daemon would be.
+    let reaped = std::thread::spawn(move || left.wait());
+    let started = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid])
+        .output()
+        .unwrap();
+    let groups = w.workspace().join("daemon/groups");
+    std::fs::create_dir_all(&groups).unwrap();
+    std::fs::write(groups.join(format!("77.{pid}")), &started.stdout).unwrap();
+    let agent = w.agent("idle", "", BUILT);
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.tools().contains(&"claim_build".to_owned())
+    })
+    .await;
+
+    let _ = reaped.join();
+    let gone = std::process::Command::new("kill")
+        .args(["-0", "--", &format!("-{pid}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!gone.success(), "the group outlived the crash");
+    assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

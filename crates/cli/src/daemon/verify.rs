@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use mergepatrol_resolver::{Access, Room, VerifyFailed};
 
+use super::groups::Groups;
+
 /// The longest one verify command may take.
 const TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How much of a failed command's output the agent is shown.
@@ -56,23 +58,35 @@ pub async fn check(access: &Access) -> Result<()> {
 }
 
 /// Runs each command in the room's tree, in order, until one fails: that one and the end of its
-/// output.
+/// output. Each runs in a process group of its own, noted in `groups` for `build`, and whatever
+/// it leaves running is stopped when it ends.
 pub async fn run(
     commands: &[String],
     room: &Room,
     access: &Access,
+    groups: &Groups,
+    build: u64,
 ) -> Result<Option<VerifyFailed>> {
     tokio::fs::create_dir_all(room.tmp()).await?;
     for command in commands {
         let mut cmd = shell(command, room, access);
         cmd.current_dir(&room.tree)
             .env("TMPDIR", room.tmp())
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(TIMEOUT, cmd.output()).await {
-            Ok(out) => out.with_context(|| format!("run `{command}`"))?,
+        let mut child = cmd.spawn().with_context(|| format!("run `{command}`"))?;
+        if let Some(pid) = child.id() {
+            groups.track(build, pid);
+        }
+        let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
+        let waited = tokio::time::timeout(TIMEOUT, child.wait()).await;
+        // Ends what it left running, which may hold its output open.
+        groups.stop(build).await?;
+        let status = match waited {
+            Ok(status) => status.with_context(|| format!("run `{command}`"))?,
             Err(_) => {
                 return Ok(Some(VerifyFailed {
                     command: command.clone(),
@@ -80,9 +94,9 @@ pub async fn run(
                 }));
             }
         };
-        if !out.status.success() {
-            let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
-            output.push_str(&String::from_utf8_lossy(&out.stderr));
+        if !status.success() {
+            let mut output = stdout.await.unwrap_or_default();
+            output.push_str(&stderr.await.unwrap_or_default());
             return Ok(Some(VerifyFailed {
                 command: command.clone(),
                 output: tail(&output),
@@ -90,6 +104,20 @@ pub async fn run(
         }
     }
     Ok(None)
+}
+
+/// All of `pipe`, read as it comes, so a full pipe never blocks the command.
+fn read(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = pipe.read_to_end(&mut bytes).await;
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
 }
 
 /// `sh -c command`, confined to the room in `workspace` access.
@@ -171,6 +199,13 @@ mod tests {
         }
     }
 
+    /// A note of process groups, in a folder of its own.
+    fn groups() -> (tempfile::TempDir, Groups) {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = Groups::new(dir.path().join("groups"));
+        (dir, groups)
+    }
+
     #[tokio::test]
     async fn the_first_failing_command_is_named_with_its_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -180,12 +215,16 @@ mod tests {
             "touch never".to_owned(),
         ];
         let room = room(dir.path());
-        let failed = run(&commands, &room, &Access::Full).await.unwrap().unwrap();
+        let (_g, groups) = groups();
+        let failed = run(&commands, &room, &Access::Full, &groups, 1)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(failed.command, "echo broken >&2; exit 3");
         assert_eq!(failed.output.trim(), "broken");
         assert!(!dir.path().join("never").exists());
         assert!(
-            run(&commands[..1], &room, &Access::Full)
+            run(&commands[..1], &room, &Access::Full, &groups, 1)
                 .await
                 .unwrap()
                 .is_none()
@@ -221,8 +260,14 @@ mod tests {
         std::os::unix::fs::symlink(decoy.join("secret"), room.tree.join("link")).unwrap();
         let access = Access::workspace(std::slice::from_ref(&decoy));
         check(&access).await.unwrap();
+        let (_g, groups) = groups();
+        let confined = |commands: &[String]| {
+            let commands = commands.to_vec();
+            let (room, access, groups) = (room.clone(), access.clone(), groups.clone());
+            async move { run(&commands, &room, &access, &groups, 1).await }
+        };
         let inside = vec!["echo x > made && echo y > \"$TMPDIR/t\"".to_owned()];
-        assert!(run(&inside, &room, &access).await.unwrap().is_none());
+        assert!(confined(&inside).await.unwrap().is_none());
         assert!(room.tree.join("made").exists() && room.tmp().join("t").exists());
 
         for (command, left) in [
@@ -235,16 +280,14 @@ mod tests {
                 root.join("escaped"),
             ),
         ] {
-            assert!(run(&[command], &room, &access).await.unwrap().is_some());
+            assert!(confined(&[command]).await.unwrap().is_some());
             assert!(!left.exists());
         }
         for read in [
             format!("cat {}/secret", decoy.display()),
             "cat link".to_owned(),
         ] {
-            let failed = run(std::slice::from_ref(&read), &room, &access)
-                .await
-                .unwrap();
+            let failed = confined(std::slice::from_ref(&read)).await.unwrap();
             let failed = failed.unwrap_or_else(|| panic!("{read} read the decoy"));
             assert!(
                 !failed.output.contains("DECOY"),

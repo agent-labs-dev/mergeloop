@@ -89,9 +89,14 @@ impl ClaudeResolver {
     ) -> Result<Resolution> {
         let cmd = self.command(workdir, prompt, access)?;
         let mut run = Run::default();
-        let ended = cli::stream(cmd, "claude", self.timeout, transcript_path, |event| {
-            run.on(event, self.max_turns)
-        })
+        let ended = cli::stream(
+            cmd,
+            "claude",
+            self.timeout,
+            transcript_path,
+            |event| run.on(event, self.max_turns),
+            |_| {},
+        )
         .await?;
         Ok(run.end(ended))
     }

@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 getrandom = "0.4.3"
+libc = "0.2.191"
 mergepatrol-git = { version = "0.1.0", path = "../git" }
 mergepatrol-resolver = { version = "0.1.0", path = "../resolver" }
 reqwest = { version = "0.13.5", features = ["form", "json"] }

@@ -77,9 +77,14 @@ impl CodexResolver {
     async fn run(&self, workdir: &Path, prompt: String, transcript: &Path) -> Result<Resolution> {
         let cmd = self.command(workdir, prompt)?;
         let mut run = Run::default();
-        let ended = cli::stream(cmd, "codex", self.timeout, transcript, |event| {
-            run.on(event, self.max_turns)
-        })
+        let ended = cli::stream(
+            cmd,
+            "codex",
+            self.timeout,
+            transcript,
+            |event| run.on(event, self.max_turns),
+            |_| {},
+        )
         .await?;
         let priced = (!self.on_plan).then_some(self.model.as_str());
         Ok(run.end(ended, priced))

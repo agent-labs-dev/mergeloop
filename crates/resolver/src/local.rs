@@ -141,7 +141,10 @@ impl LocalAgent {
     /// The agent's run in `room`'s tree, given `prompt`. Its temp folder is the room's.
     pub fn command(&self, room: &Room, prompt: &str, access: &Access) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.command);
-        cmd.current_dir(&room.tree).env("TMPDIR", room.tmp());
+        // Its own process group, so that whatever it leaves running can be stopped with it.
+        cmd.current_dir(&room.tree)
+            .env("TMPDIR", room.tmp())
+            .process_group(0);
         match self.vendor {
             Vendor::Claude => self.claude(&mut cmd, room, prompt, access),
             Vendor::Codex => self.codex(&mut cmd, room, prompt, access),
@@ -251,6 +254,7 @@ impl LocalAgent {
         prompt: &str,
         access: &Access,
         transcript: &Path,
+        spawned: impl FnOnce(u32),
     ) -> Result<Resolution> {
         tokio::fs::create_dir_all(room.tmp()).await?;
         let cmd = self.command(room, prompt, access);
@@ -258,17 +262,27 @@ impl LocalAgent {
         let mut resolution = match self.vendor {
             Vendor::Claude => {
                 let mut run = claude::Run::default();
-                let ended = cli::stream(cmd, name, self.timeout, transcript, |e| {
-                    run.on(e, self.max_turns)
-                })
+                let ended = cli::stream(
+                    cmd,
+                    name,
+                    self.timeout,
+                    transcript,
+                    |e| run.on(e, self.max_turns),
+                    spawned,
+                )
                 .await?;
                 run.end(ended)
             }
             Vendor::Codex => {
                 let mut run = codex::Run::default();
-                let ended: Ended = cli::stream(cmd, name, self.timeout, transcript, |e| {
-                    run.on(e, self.max_turns)
-                })
+                let ended: Ended = cli::stream(
+                    cmd,
+                    name,
+                    self.timeout,
+                    transcript,
+                    |e| run.on(e, self.max_turns),
+                    spawned,
+                )
                 .await?;
                 run.end(ended, None)
             }
@@ -467,7 +481,13 @@ mod tests {
         };
         let tmp = room.tmp();
         let run = agent(Vendor::Claude, &command)
-            .run(&room, "p", &Access::Full, &dir.path().join("t.jsonl"))
+            .run(
+                &room,
+                "p",
+                &Access::Full,
+                &dir.path().join("t.jsonl"),
+                |_| {},
+            )
             .await
             .unwrap();
         assert_eq!(run.outcome, Outcome::GaveUp("too vague".into()));
@@ -494,7 +514,13 @@ mod tests {
             tree: dir.path().to_owned(),
         };
         let run = agent(Vendor::Codex, &command)
-            .run(&room, "p", &Access::Full, &dir.path().join("t.jsonl"))
+            .run(
+                &room,
+                "p",
+                &Access::Full,
+                &dir.path().join("t.jsonl"),
+                |_| {},
+            )
             .await
             .unwrap();
         assert_eq!(run.outcome, Outcome::Resolved);
@@ -510,7 +536,13 @@ mod tests {
             tree: dir.path().to_owned(),
         };
         let err = agent(Vendor::Claude, "no-such-agent-cli")
-            .run(&room, "p", &Access::Full, &dir.path().join("t.jsonl"))
+            .run(
+                &room,
+                "p",
+                &Access::Full,
+                &dir.path().join("t.jsonl"),
+                |_| {},
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no-such-agent-cli"), "{err:#}");

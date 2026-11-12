@@ -4,6 +4,7 @@
 //! <workspace>/
 //!   daemon/lock               held while a daemon uses the folder: one at a time
 //!   daemon/id                 the daemon's name for itself, made once: its claims are its own
+//!   daemon/groups/            the process groups of running builds (`groups`)
 //!   repos/<owner>/<name>.git  a bare clone of each repo it builds in, with its worktrees' git dirs
 //!   builds/<build>/           the build's room: all that the build may write
 //!     tree/                   its git worktree, on the local branch `mergeloop/build-<issue>`
@@ -25,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use mergepatrol_git::{Git, Tree};
 use mergepatrol_resolver::Room;
 
+use super::groups::Groups;
 use super::lane::Task;
 
 /// How long transcripts are kept.
@@ -56,7 +58,14 @@ impl Folder {
             .truncate(false)
             .write(true)
             .open(own.join("lock"))?;
-        if lock.try_lock().is_err() {
+        // A child forked in this process shares the lock until it execs: give it a moment.
+        let locked = (0..50).any(|_| {
+            lock.try_lock().is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                false
+            }
+        });
+        if !locked {
             bail!(
                 "another mergeloop daemon is using {}: stop it, or give this one another workspace",
                 root.display()
@@ -78,6 +87,11 @@ impl Folder {
     /// claimed, and another daemon, of the same login too, holds none of them.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The process groups the builds run.
+    pub fn groups(&self) -> Groups {
+        Groups::new(self.root.join("daemon").join("groups"))
     }
 
     pub fn clone_of(&self, repo: &str) -> PathBuf {

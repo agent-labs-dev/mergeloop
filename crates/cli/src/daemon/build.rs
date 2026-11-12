@@ -80,6 +80,15 @@ impl Builder {
             () = stopped(stop) => Err(Stopped.into()),
         };
         let ended = settle(lane, task, work).await;
+        self.clean_up(task).await;
+        ended
+    }
+
+    /// Stops what the build left running, then removes its room and branch.
+    pub async fn clean_up(&self, task: &Task) {
+        if let Err(e) = self.folder.groups().stop(task.build).await {
+            say(task, &format!("could not stop what it left running: {e:#}"));
+        }
         if let Err(e) = self.folder.remove(task).await {
             say(task, &format!("could not clean up: {e:#}"));
         }
@@ -87,7 +96,6 @@ impl Builder {
             .folder
             .prune_transcripts(std::time::SystemTime::now())
             .await;
-        ended
     }
 
     async fn work(&self, lane: &Lane, task: &Task) -> Result<Work> {
@@ -115,7 +123,9 @@ impl Builder {
         if let Some(why) = stuck_by(&run.outcome) {
             return Ok(Err(why));
         }
-        let Some(failed) = verify::run(&task.verify, room, &self.access).await? else {
+        let groups = self.folder.groups();
+        let verify = || verify::run(&task.verify, room, &self.access, &groups, task.build);
+        let Some(failed) = verify().await? else {
             return Ok(Ok(run));
         };
         say(
@@ -126,7 +136,7 @@ impl Builder {
         if let Some(why) = stuck_by(&fix.outcome) {
             return Ok(Err(why));
         }
-        if let Some(failed) = verify::run(&task.verify, room, &self.access).await? {
+        if let Some(failed) = verify().await? {
             return Ok(Err(format!(
                 "`{}` still fails after the agent's fix:\n```\n{}\n```",
                 failed.command,
@@ -159,10 +169,15 @@ impl Builder {
             .folder
             .transcripts(task.build)
             .join(format!("{step}.jsonl"));
+        let groups = self.folder.groups();
+        let spawned = |pid| groups.track(task.build, pid);
         let run = self
             .agent
-            .run(&checkout.room, &prompt, &self.access, &transcript)
-            .await?;
+            .run(&checkout.room, &prompt, &self.access, &transcript, spawned)
+            .await;
+        // What the agent left running ends with its run.
+        groups.stop(task.build).await?;
+        let run = run?;
         say(
             task,
             &format!("the agent's {step} run ended: {:?}", run.outcome),

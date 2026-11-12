@@ -295,8 +295,13 @@ pub trait BuildStore: Send + Sync {
     /// Whether `holder` holds a live build, in a workspace whose lane is on, all read at once.
     async fn holds(&self, holder: Holder<'_>) -> Result<bool>;
     /// The holder opened PR `pr` for the build: it is landing. `None` when it holds the claim
-    /// no more, or the build has another PR.
+    /// no more, the build has another PR, or `pr` is being closed as an orphan.
     async fn opened_pr(&self, holder: Holder<'_>, pr: u64) -> Result<Option<Build>>;
+    /// PR `pr` was opened for the build and its opener could not record it. True when no holder
+    /// recorded it either: it is to be closed, and none adopts it from now on. False when a
+    /// holder did, so it is theirs and stays open. One statement decides, against
+    /// [`Self::opened_pr`] on the same row.
+    async fn orphaned_pr(&self, installation_id: u64, build: u64, pr: u64) -> Result<bool>;
     /// The holder says how the build's PR stands. `None` when it holds the claim no more, or
     /// the build has no PR.
     async fn report_build(&self, holder: Holder<'_>, standing: Standing) -> Result<Option<Build>>;
@@ -821,7 +826,7 @@ impl BuildStore for PgStore {
                    updated_at = now()
                  WHERE",
                 fence!(),
-                " AND (pr IS NULL OR pr = $6) RETURNING ",
+                " AND (pr IS NULL OR pr = $6) AND orphan_pr IS DISTINCT FROM $6 RETURNING ",
                 columns!()
             ),
             holder,
@@ -830,6 +835,23 @@ impl BuildStore for PgStore {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(build).transpose()
+    }
+
+    async fn orphaned_pr(&self, installation_id: u64, build: u64, pr: u64) -> Result<bool> {
+        // A build whose row is gone records nothing, so its PR is an orphan too.
+        let orphan: bool = sqlx::query_scalar(
+            "WITH mark AS (
+               UPDATE builds SET orphan_pr = $3
+               WHERE installation_id = $1 AND id = $2 AND pr IS DISTINCT FROM $3 RETURNING 1)
+             SELECT EXISTS (SELECT 1 FROM mark)
+                 OR NOT EXISTS (SELECT 1 FROM builds WHERE installation_id = $1 AND id = $2)",
+        )
+        .bind(installation_id as i64)
+        .bind(build as i64)
+        .bind(pr as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(orphan)
     }
 
     async fn report_build(&self, holder: Holder<'_>, standing: Standing) -> Result<Option<Build>> {

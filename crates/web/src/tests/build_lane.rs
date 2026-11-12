@@ -1787,6 +1787,91 @@ async fn a_pr_adopted_while_its_build_is_given_back_is_left_open(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_pr_its_opener_could_not_record_stays_open_once_the_next_holder_recorded_it(
+    pool: PgPool,
+) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, state) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    let (build, claim_n) = ana_holds(&ana);
+    // While GitHub creates Ana's PR #40, she gives the build back, and Ben claims it, finds
+    // #40 on the branch and records it.
+    hook(&hub, &pool, "/repos/o/r/pulls", move |store| async move {
+        let holder = |login, claim| mergepatrol_store::Holder {
+            installation_id: 1,
+            build,
+            login,
+            daemon: None,
+            claim,
+        };
+        store
+            .release_build(holder("ana", claim_n), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let repo = RepoName::parse("o/r").unwrap();
+        let ben = store
+            .claim_build(1, "ben", None, &[repo], 1800)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ben.build.id, build);
+        store
+            .opened_pr(holder("ben", ben.build.claim), 40)
+            .await
+            .unwrap()
+            .unwrap();
+    });
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.as_str().unwrap().contains("no longer hold"), "{body}");
+    let builds = state.builds.builds(1).await.unwrap();
+    assert_eq!(
+        (builds[0].holder.as_deref(), builds[0].pr),
+        (Some("ben"), Some(40))
+    );
+    let hub = hub.lock().unwrap();
+    assert!(hub.prs[0].open, "Ben's now, not Ana's to close");
+    assert!(
+        hub.writes.iter().all(|(_, p, _)| !p.contains("/40")),
+        "{:?}",
+        hub.writes
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pr_being_closed_as_unrecorded_is_not_adopted(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, state) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    let (build, _) = ana_holds(&ana);
+    // An earlier holder's call opened #40 and could not record it, and its close has not
+    // reached GitHub.
+    assert!(state.builds.orphaned_pr(1, build, 40).await.unwrap());
+    {
+        let mut h = hub.lock().unwrap();
+        h.prs = vec![Pr::bots(40, "mergeloop/build-7")];
+        h.failing = vec!["/repos/o/r/pulls".into()];
+    }
+
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.as_str().unwrap().contains("again"), "{body}");
+    assert_eq!(state.builds.builds(1).await.unwrap()[0].pr, None);
+    assert!(!hub.lock().unwrap().prs[0].open, "closed, not adopted");
+
+    // GitHub now takes a new PR from the branch, and the build goes on with that one.
+    hub.lock().unwrap().failing.clear();
+    let (status, body) = open_pr(&router, "ana", &ana).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pr = state.builds.builds(1).await.unwrap()[0].pr;
+    assert!(pr.is_some_and(|pr| pr != 40), "{pr:?}");
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_build_with_a_pr_given_back_after_its_issue_closed_is_claimed_and_listed(pool: PgPool) {
     let hub = shared(vec![issue(7, &[])]);
     let (router, _) = lane(pool.clone(), &hub).await;

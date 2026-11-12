@@ -42,6 +42,9 @@ CREATE TABLE builds (
     stage TEXT,
     heartbeat_at TIMESTAMPTZ,
     pr BIGINT,
+    -- A PR opened for the build that its opener could not record. It is being closed, and no
+    -- holder adopts it.
+    orphan_pr BIGINT,
     -- Why a stuck build is stuck, and since when.
     reason TEXT,
     stuck_at TIMESTAMPTZ,

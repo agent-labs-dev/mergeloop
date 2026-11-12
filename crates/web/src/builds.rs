@@ -810,8 +810,8 @@ pub struct OpenBuildPr {
 /// The App opens the build's PR from its pushed branch into the default branch, ready for
 /// review, labels it so it queues, and assigns the developer. Only a live claim acts, so no
 /// takeover happens while it does. The PR is recorded on the build, fenced, as soon as GitHub
-/// gives it, and labeled and assigned only once recorded: a PR this call opened that it could
-/// not record is closed, so none is left open that no build points at. Labeling and assigning
+/// gives it, and labeled and assigned only once recorded: a PR this call opened that neither it
+/// nor a later holder recorded is closed, so none is left open that no build points at. Labeling and assigning
 /// are tried again on every call, and the call succeeds only once both are done on an open PR.
 pub(crate) async fn open_build_pr(
     State(app): State<AppState>,
@@ -836,16 +836,7 @@ pub(crate) async fn open_build_pr(
         None => {
             let (pr, created) = opened(&app, &gh, &build, &base, title, &body.body).await?;
             if app.builds.opened_pr(held, pr).await?.is_none() {
-                if created {
-                    let why = format!(
-                        "MergeLoop closed this PR: the build that opened it was given back or taken over by someone else before it could record it. Build {} goes on without it.",
-                        build.id
-                    );
-                    if let Err(e) = gh.close_pr(&build.repo, pr, &why).await {
-                        tracing::warn!(installation = id, repo = %build.repo, pr, error = %format!("{e:#}"), "could not close a PR no build records");
-                    }
-                }
-                return Err(lost(build.id));
+                return Err(unrecorded(&app, &gh, held, &build, pr, created).await?);
             }
             tracing::info!(installation = id, repo = %build.repo, issue = build.issue, pr, login, created, "recorded a build's PR");
             pr
@@ -858,6 +849,52 @@ pub(crate) async fn open_build_pr(
         .await?
         .ok_or_else(|| lost(build.id))?;
     Ok(Json(landing.into()))
+}
+
+/// Why PR `pr` could not be recorded on `build`, after closing it when it is an orphan.
+///
+/// A PR this call opened is an orphan unless a later holder recorded it meanwhile: they found
+/// it on the branch, and it is theirs. A PR this call found, while it still holds the build, was
+/// refused because an earlier call is closing it as an orphan: it is closed here too, in case
+/// that close never reached GitHub, and the next call opens a new one.
+async fn unrecorded(
+    app: &AppState,
+    gh: &Installation,
+    held: Holder<'_>,
+    build: &Build,
+    pr: u64,
+    created: bool,
+) -> Result<ApiError, ApiError> {
+    let (id, repo) = (held.installation_id, &build.repo);
+    let orphan = match created {
+        true => app.builds.orphaned_pr(id, build.id, pr).await?,
+        false => matches!(app.builds.held_build(held).await?, Some(b) if b.pr.is_none()),
+    };
+    if !orphan {
+        return Ok(lost(build.id));
+    }
+    let why = format!(
+        "MergeLoop closed this PR: the build that opened it was given back or taken over by someone else before it could record it. Build {} goes on without it.",
+        build.id
+    );
+    let closed = gh.close_pr(repo, pr, &why).await;
+    if let Err(e) = &closed {
+        tracing::warn!(installation = id, repo = %repo, pr, error = %format!("{e:#}"), "could not close a PR no build records");
+    }
+    Ok(match created {
+        true => lost(build.id),
+        false => ApiError::Status(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "PR #{pr} from this branch is one an earlier call could not record, so MergeLoop {} it. Call `open_build_pr` again.",
+                if closed.is_ok() {
+                    "closed"
+                } else {
+                    "is closing"
+                }
+            ),
+        ),
+    })
 }
 
 /// PR `pr`, while it is open. Closed without merging, the build cannot go on with it; merged,

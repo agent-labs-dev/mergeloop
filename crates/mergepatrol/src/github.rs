@@ -22,6 +22,9 @@ pub trait GitHub: Send + Sync {
     async fn pull_head(&self, repo: &RepoName, number: PrNumber) -> Result<String>;
     /// Whether `head` needs a rebase onto `base`.
     async fn behind(&self, repo: &RepoName, base: &str, head: &str) -> Result<bool>;
+    /// What `head` changes since it left `base`, as an id a restack keeps. `None` when
+    /// GitHub does not show the whole diff.
+    async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>>;
     /// Whether workflow runs on `sha` wait for a maintainer's approval.
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool>;
     /// Whether PR `number` changes a file under `dir`.
@@ -122,6 +125,9 @@ impl GitHub for Installation {
     }
     async fn behind(&self, repo: &RepoName, base: &str, head: &str) -> Result<bool> {
         Installation::behind(self, repo, base, head).await
+    }
+    async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        Installation::diff_id(self, repo, base, head).await
     }
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool> {
         Installation::awaiting_approval(self, repo, sha).await

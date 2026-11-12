@@ -5,8 +5,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use mergepatrol_core::{
     AgentSettings, ConfigPath, ConfigText, EFFORTS, Entry, EntryState, FixCiSettings, Labels, Lane,
-    ModelOverrides, Person, PrSummary, Provider, RepoName, RepoSettings, Spend, SpendTask, Stage,
-    Step, TaskModel, WorkspaceDefaults, current_step,
+    LayerSummary, ModelOverrides, Person, PrSummary, Provider, RepoName, RepoSettings, Spend,
+    SpendTask, Stage, Step, TaskModel, WorkspaceDefaults, current_step,
 };
 use mergepatrol_github::{
     App, BranchFile, ConfigFile, GitObject, Installation, Proposal, PullRef, SYMLINK_MODE, setup,
@@ -90,6 +90,9 @@ pub struct EntryView {
     pub pull: PullView,
     /// A stack's PRs, bottom to top: `number` is the stack's. Empty for a PR.
     pub layers: Vec<u32>,
+    /// A stack's PRs as of the last tick, bottom to top. Empty for a PR, and for a stack until
+    /// the tick after it was saved without them.
+    pub stack: Vec<LayerView>,
     /// The agent's review of the PR, or of the stack's layer it is held for, else its top: the
     /// newest, of whatever head.
     pub review: Option<crate::review::ReviewBriefView>,
@@ -117,6 +120,47 @@ pub struct PullView {
     pub requested: Vec<PersonView>,
     /// The head commit's combined checks. `None` without checks.
     pub checks: Option<ChecksView>,
+}
+
+/// What the dashboard shows of a PR of a stack.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct LayerView {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub head_ref: String,
+    /// `None` for a deleted account.
+    pub author: Option<PersonView>,
+    pub additions: u32,
+    pub deletions: u32,
+    /// The head commit's combined checks. `None` without checks.
+    pub checks: Option<ChecksView>,
+}
+
+impl From<LayerSummary> for LayerView {
+    fn from(l: LayerSummary) -> Self {
+        LayerView {
+            number: l.number as u32,
+            title: l.title,
+            url: l.url,
+            head_ref: l.head_ref,
+            author: l.author.map(PersonView::from),
+            additions: l.additions as u32,
+            deletions: l.deletions as u32,
+            checks: checks_view(l.checks.as_deref()),
+        }
+    }
+}
+
+/// GitHub's combined state of a commit's checks, as the dashboard shows it.
+fn checks_view(state: Option<&str>) -> Option<ChecksView> {
+    match state {
+        Some("SUCCESS") => Some(ChecksView::Passed),
+        Some("FAILURE" | "ERROR") => Some(ChecksView::Failed),
+        Some(_) => Some(ChecksView::Pending),
+        None => None,
+    }
 }
 
 #[derive(Serialize, TS)]
@@ -170,11 +214,12 @@ impl EntryView {
             number,
             priority,
             state,
-            summary: pr,
+            summary: mut pr,
             layers,
             heads: _,
             recheck: _,
         } = e;
+        let stack = std::mem::take(&mut pr.stack);
         let stage = state.stage().map(StageView::from);
         let (fixes, fix_budget) = (pr.fixes, pr.fix_budget);
         let (state, detail, hold) = match state {
@@ -198,6 +243,7 @@ impl EntryView {
             hold,
             pull: pr.into(),
             layers: layers.into_iter().map(|n| n as u32).collect(),
+            stack: stack.into_iter().map(LayerView::from).collect(),
             review,
         }
     }
@@ -230,12 +276,7 @@ impl From<PrSummary> for PullView {
                 })
                 .collect(),
             requested: pr.requested.into_iter().map(PersonView::from).collect(),
-            checks: match pr.checks.as_deref() {
-                Some("SUCCESS") => Some(ChecksView::Passed),
-                Some("FAILURE" | "ERROR") => Some(ChecksView::Failed),
-                Some(_) => Some(ChecksView::Pending),
-                None => None,
-            },
+            checks: checks_view(pr.checks.as_deref()),
         }
     }
 }
@@ -2856,6 +2897,34 @@ mod tests {
         assert_eq!(json["number"], 1);
         assert_eq!(json["title"], "");
         assert!(json.get("pull").is_none());
+    }
+
+    #[test]
+    fn a_stack_shows_each_of_its_prs() {
+        let layer = |number, title: &str, checks: &str| LayerSummary {
+            number,
+            title: title.into(),
+            checks: Some(checks.into()),
+            additions: 3,
+            ..LayerSummary::default()
+        };
+        let mut e = Entry {
+            layers: vec![7, 8],
+            ..entry(10, false, EntryState::Waiting)
+        };
+        e.summary.stack = vec![layer(7, "base", "SUCCESS"), layer(8, "top", "PENDING")];
+        let json = serde_json::to_value(EntryView::new(e, None, None)).unwrap();
+        assert_eq!(json["stack"][0]["number"], 7);
+        assert_eq!(json["stack"][1]["title"], "top");
+        assert_eq!(json["stack"][1]["checks"], "pending");
+        assert_eq!(json["stack"][0]["additions"], 3);
+
+        let pr = serde_json::to_value(EntryView::new(
+            entry(5, false, EntryState::Waiting),
+            None,
+            None,
+        ));
+        assert_eq!(pr.unwrap()["stack"], serde_json::json!([]));
     }
 
     #[test]

@@ -25,7 +25,7 @@ async fn a_fix_after_escalation_settles_the_requests_sent_back_before_it() {
     let head = world.pr(1).head_ref_oid;
     let current = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     let settings = world.ctx.config.repo_defaults.clone();
@@ -61,7 +61,7 @@ async fn a_fix_after_an_intervening_failed_review_settles_the_original_request()
     let head = world.pr(1).head_ref_oid;
     let failed = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     let settings = world.ctx.config.repo_defaults.clone();
@@ -85,7 +85,7 @@ async fn a_fix_after_an_intervening_failed_review_settles_the_original_request()
     let head = world.pr(1).head_ref_oid;
     let current = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     world

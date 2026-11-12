@@ -13,7 +13,7 @@ fn repo() -> RepoName {
 }
 
 async fn finished(store: &PgStore, head: &str, asked: bool) -> i64 {
-    let r = store.start_review(1, &repo(), 8, head).await.unwrap();
+    let r = store.start_review(1, &repo(), 8, head, None).await.unwrap();
     let claim = store
         .claim_review(Duration::from_secs(600))
         .await

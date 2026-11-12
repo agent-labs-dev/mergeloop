@@ -163,7 +163,7 @@ pub(crate) static ROUTES: &[Route] = &[
     route!(GET "/api/v1/repos/{owner}/{name}/pulls", v1::pulls,
         Agent::Exempt("For other apps, by repo and with an ETag. An agent calls `pull_status`, which says the same where MergeLoop is installed.")),
     route!(GET "/api/w/{id}/lanes", api::lanes, tool!("list_queue", Reads,
-        "The queues, one per repo and branch PRs merge into, each in the order it takes them, with each PR's `stage` (`rebase`, `checks`, `review` or `lane`), what the queue is doing with its active PR as `step` (`rebasing`, `checks`, `fixing` or `merging`), and the `fixes` it has used of its `fix_budget`. Without a `repo`, those of the workspace's repos you can read: that needs a MergeLoop sign-in.",
+        "The queues, one per repo and branch PRs merge into, each in the order it takes them, with each PR's `stage` (`rebase`, `checks`, `review` or `lane`), what the queue is doing with its active PR as `step` (`rebasing`, `checks`, `fixing` or `merging`), and the `fixes` it has used of its `fix_budget`. A stack lists its PRs, bottom to top, in `stack`, each with its title, author, diff and checks; `hold.layer` is the one that holds it. Without a `repo`, those of the workspace's repos you can read: that needs a MergeLoop sign-in.",
         opt("repo", Ty::Str, "Only this repo's queues, as `owner/name`."))),
     route!(GET "/api/w/{id}/events", api::events, tool!("list_events", Reads,
         "A repo's queue events, newest first, up to 200: what the queue did, and what its agent spent.",

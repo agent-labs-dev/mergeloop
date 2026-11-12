@@ -1129,7 +1129,10 @@ mod tests {
                 .record_exit(&key, number + 10, "merged", "abc", &summary)
                 .await
                 .unwrap();
-            store.start_review(1, &key.repo, number, "h").await.unwrap();
+            store
+                .start_review(1, &key.repo, number, "h", None)
+                .await
+                .unwrap();
         }
         let read = |path: &'static str| {
             let (router, cookie) = (router.clone(), cookie.clone());
@@ -1259,7 +1262,7 @@ mod tests {
         let (status, body) = json(&router, "GET", path, &cookie, None).await;
         assert_eq!((status, body), (StatusCode::OK, serde_json::Value::Null));
 
-        let r = store.start_review(1, &repo, 7, "head").await.unwrap();
+        let r = store.start_review(1, &repo, 7, "head", None).await.unwrap();
         let claim = store
             .claim_review(std::time::Duration::from_secs(60))
             .await

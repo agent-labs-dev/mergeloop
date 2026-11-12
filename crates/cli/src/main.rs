@@ -8,10 +8,12 @@
 //! stays a thin client. The only state it keeps is the session `login` makes.
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use mergeloop_cli::client::{Client, Server};
+use mergeloop_cli::daemon::{self, Daemon};
 use mergeloop_cli::land::{PrRef, land, resolve};
 use mergeloop_cli::{login, session};
 use serde_json::{Value, json};
@@ -24,6 +26,7 @@ Usage:
   mergeloop call TOOL [JSON|-]   Run one of MergeLoop's MCP tools, with JSON arguments
   mergeloop login                Sign in to MergeLoop in the browser, and keep the session
   mergeloop logout               End the session, and forget it
+  mergeloop daemon [--config F]  Build the build lane's tasks, until stopped: see `daemon --help`
 
 PR is 123, owner/name#123, or a PR's URL. Without one, the current branch's PR.
 Do what a need's `brief` says, then run its `then`, until mergeloop exits 10.
@@ -41,6 +44,21 @@ Files:
 Environment:
   MERGELOOP_TOKEN   A GitHub token, sent instead of the session.
   MERGELOOP_URL     The MergeLoop server. Default https://mergeloop.ai.";
+
+const DAEMON_USAGE: &str = "\
+Build the build lane's tasks, until stopped.
+
+Usage:
+  mergeloop daemon [--config FILE]
+
+Signed in with `mergeloop login`, it serves every workspace you belong to that has the
+build lane on. While it has a free slot it claims a task, and builds it in its own clone
+and a fresh worktree: a local agent CLI, on your own login, builds the issue; the repo's
+verify commands must pass (the agent gets one more run to fix them); the daemon commits
+as the App's bot with you as co-author, pushes the branch with a token the server mints,
+and has the server open the PR. When the agent gives up, or verify still fails, or
+anything else ends a build, it is released as stuck with the reason. Ctrl-C gives back
+what it holds, and cleans up. A build's worktree and branch go however it ends.";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -66,6 +84,10 @@ enum Cmd {
     },
     Login,
     Logout,
+    Daemon {
+        config: Option<PathBuf>,
+    },
+    DaemonHelp,
     Help,
     Version,
 }
@@ -94,6 +116,21 @@ async fn run(args: &[String]) -> Result<u8> {
             }
             Ok(0)
         }
+        Cmd::DaemonHelp => {
+            println!("{DAEMON_USAGE}\n\n{}", daemon::config::SETTINGS);
+            Ok(0)
+        }
+        Cmd::Daemon { config } => {
+            let home = home()?;
+            let path = config.unwrap_or_else(|| daemon::config::default_path(&home));
+            let config = daemon::config::Config::load(&path, &home)?;
+            let client = Client::signed_in(&server, &session::path()?)?;
+            let stop = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+            Daemon::new(config, client).run(stop).await?;
+            Ok(0)
+        }
         Cmd::Call { tool, args } => {
             let args = call_args(args.as_deref())?;
             let client = Client::for_command(server, session::path)?;
@@ -107,6 +144,13 @@ async fn run(args: &[String]) -> Result<u8> {
             land(&client, &repo, number, after).await
         }
     }
+}
+
+fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .context("no HOME, where the daemon's config and folder are")
 }
 
 /// A call's arguments: none, the given JSON, or JSON on stdin for `-`.
@@ -142,6 +186,7 @@ fn parse(args: &[String]) -> Result<Cmd> {
                     args: rest,
                 });
             }
+            "daemon" if first => return parse_daemon(args),
             "login" | "logout" if first => {
                 if let Some(extra) = args.next() {
                     bail!("{arg} takes no arguments, not {extra}\n\n{USAGE}");
@@ -159,6 +204,20 @@ fn parse(args: &[String]) -> Result<Cmd> {
         }
     }
     Ok(Cmd::Land { pr, after })
+}
+
+fn parse_daemon<'a>(mut args: impl Iterator<Item = &'a str>) -> Result<Cmd> {
+    let mut config = None;
+    while let Some(arg) = args.next() {
+        match arg {
+            "-h" | "--help" | "help" => return Ok(Cmd::DaemonHelp),
+            "--config" => {
+                config = Some(PathBuf::from(args.next().context("--config needs a file")?))
+            }
+            _ => bail!("daemon takes --config FILE, not {arg}\n\n{DAEMON_USAGE}"),
+        }
+    }
+    Ok(Cmd::Daemon { config })
 }
 
 #[cfg(test)]
@@ -203,5 +262,17 @@ mod tests {
         assert!(parse(&args("call")).is_err());
         assert!(parse(&args("login now")).is_err());
         assert!(parse(&args("5 login")).is_err());
+        assert_eq!(
+            parse(&args("daemon")).unwrap(),
+            Cmd::Daemon { config: None }
+        );
+        assert_eq!(
+            parse(&args("daemon --config /c.toml")).unwrap(),
+            Cmd::Daemon {
+                config: Some("/c.toml".into())
+            }
+        );
+        assert_eq!(parse(&args("daemon --help")).unwrap(), Cmd::DaemonHelp);
+        assert!(parse(&args("daemon --slots 2")).is_err());
     }
 }

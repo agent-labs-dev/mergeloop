@@ -318,6 +318,35 @@ It talks to `https://mergeloop.ai`, or `MERGELOOP_URL`, and acts as the first of
 
 `mergeloop login` signs you in to MergeLoop in the browser, through the same OAuth an MCP client uses, and keeps the session in `~/.mergeloop/session.json`, which only you can read. With it, `mergeloop call` reaches the tools marked **Sign-in** below, and acts as you rather than as a GitHub token. A session belongs to the server it was made on: sign in again for another `MERGELOOP_URL`. A session the server no longer takes, after 30 days unused or once GitHub stops taking your token, is an error that says to run `mergeloop login` again. `mergeloop logout` ends the session on the server and forgets it.
 
+#### `mergeloop daemon`: the build lane
+
+Signed in with `mergeloop login`, `mergeloop daemon` builds the build lane's tasks (issues labeled with the repo's label, in workspaces with the lane on) of every workspace you belong to, until Ctrl-C. While it has a free slot it claims a task and builds it in its own clone of the repo and a fresh worktree: an agent CLI on this machine, signed in with your own login (never a workspace key), builds the issue; the repo's `verify` commands must pass, and the agent gets one more run to fix them if they fail; the daemon commits the change as the App's bot with you as `Co-authored-by`, pushes `mergeloop/build-<issue>` with a token the server mints for that one repo, and has the server open the PR. When the agent gives up, verify still fails, or anything else ends a build, the build is released as stuck with the reason, which goes on the issue. Ctrl-C gives back what the daemon holds. Landing the PRs it opens is not part of the daemon yet.
+
+`mergeloop daemon --help` lists its settings. They live in `~/.mergeloop/daemon.toml` (or `--config FILE`); without the file, the defaults hold:
+
+```toml
+slots = 1                          # builds at once
+workspace = "~/.mergeloop/daemon"  # the daemon's own folder
+access = "workspace"               # or "full"
+
+[builder]
+agent = "claude"                   # or "codex": the flags it gets, and how its output reads
+command = "claude"                 # default: the agent's name; a wrapper that takes its flags works, such as "mclaude"
+# model = "..."                    # default: the CLI's own
+# effort = "..."
+args = []                          # more arguments for every run
+timeout_minutes = 60
+```
+
+The workspace folder holds `repos/<owner>/<name>.git` (a clone per repo), `builds/<build>/` (a worktree per build, on its local branch), `transcripts/<build>/` (the agent's output, kept 7 days) and `tmp/`. The daemon never touches your own checkouts. A build's worktree and branch are removed when the build ends, however it ends, and on start the daemon removes whatever a crash left of builds it does not hold, and gives back the builds without a PR that your login still holds.
+
+With `access = "workspace"`, the agent has full access, without prompts, inside the workspace folder, and cannot write outside it; the repo's verify commands, which the agent may have changed, run under the same rule (`sandbox-exec` on macOS, `bwrap` on Linux). The daemon passes each CLI its own confinement:
+
+- Claude Code: `--permission-mode acceptEdits --add-dir <workspace>` and `--settings` that turn on its sandbox (refusing to start without one, with no retry outside it, network open) and `permissions.blockWritesOutsideWorkingDirectories`. Its shell can also write to its own temp folder, `/tmp/claude-<uid>`: it does not run without it. On Linux its sandbox needs `bubblewrap` and `socat`.
+- Codex: `--sandbox workspace-write --add-dir <workspace>`, with network on and `/tmp` and `$TMPDIR` excluded. Codex keeps `.git` read-only there, so the agent leaves its change uncommitted and the daemon commits it.
+
+Tools that write outside the folder, such as a package manager's cache in your home folder, fail under `workspace`: add the folder through `args` (`--add-dir`, for either CLI), or set `access = "full"`, which lifts the confinement (`--permission-mode bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`).
+
 A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell which of its workspaces such a token belongs to. The tools marked **Sign-in** work across a workspace, so they need the sign-in, and show only the workspace's repos you can read. Each tool takes the repo as `repo`, `owner/name`, or the workspace as `workspace`, its installation ID. `get_session` lists those IDs for a sign-in; with a GitHub token it answers `status: "signed_out"`, with no workspaces, so a token's calls name a `repo`.
 
 <!-- tools: the order of `ROUTES` in crates/web/src/routes.rs -->

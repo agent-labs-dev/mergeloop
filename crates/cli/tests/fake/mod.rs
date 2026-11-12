@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Query, State};
@@ -22,10 +22,36 @@ pub const GITHUB_TOKEN: &str = "ghp_fake";
 /// Who a session signs in as.
 pub const LOGIN: &str = "ana";
 
+/// The build lane, as far as the daemon reaches it.
+#[derive(Default)]
+pub struct Lane {
+    /// The tasks `claim_build` gives, in order.
+    pub tasks: VecDeque<Value>,
+    /// What `list_builds` lists as held by the caller.
+    pub held: Vec<Value>,
+    /// Each `release_build`: the build, and why it is stuck.
+    pub released: Vec<(u64, Option<String>)>,
+    /// Each `open_build_pr`: the build, the title, the body.
+    pub opened: Vec<(u64, String, String)>,
+    /// Refusals to answer once each, in place of the tool's answer: the tool, the refusal's
+    /// kind as `_meta.refusal` names it, its status, and its text.
+    pub refusals: Vec<(String, String, u16, String)>,
+}
+
+impl Lane {
+    /// How many builds the server heard end: PRs opened and builds released.
+    pub fn ended(&self) -> usize {
+        self.opened.len() + self.released.len()
+    }
+}
+
 #[derive(Default)]
 pub struct Seen {
     /// Each `/mcp` call: its bearer and tool.
     pub calls: Vec<(String, String)>,
+    /// Each `/mcp` call's arguments.
+    pub args: Vec<Value>,
+    pub lane: Lane,
     /// Sessions the server takes.
     pub sessions: HashSet<String>,
     /// Each one-time code: its PKCE challenge.
@@ -68,6 +94,42 @@ impl Server {
 
     pub fn takes(&self, session: &str) -> bool {
         self.seen.lock().unwrap().sessions.contains(session)
+    }
+
+    /// The tools called, in order, but `get_session` and `list_builds`.
+    pub fn lane_tools(&self) -> Vec<String> {
+        self.tools()
+            .into_iter()
+            .filter(|t| t != "get_session" && t != "list_builds")
+            .collect()
+    }
+
+    /// The arguments of each call to `tool`.
+    pub fn args_of(&self, tool: &str) -> Vec<Value> {
+        let seen = self.seen.lock().unwrap();
+        seen.calls
+            .iter()
+            .zip(&seen.args)
+            .filter(|((_, t), _)| t == tool)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    /// Adds a task for `claim_build` to give.
+    pub fn add_task(&self, task: Value) {
+        self.seen.lock().unwrap().lane.tasks.push_back(task);
+    }
+
+    /// Refuses the next call to `tool`, as the server's lane does.
+    pub fn refuse(&self, tool: &str, kind: &str, status: u16, text: &str) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.lane
+            .refusals
+            .push((tool.into(), kind.into(), status, text.into()));
+    }
+
+    pub fn lane<T>(&self, f: impl FnOnce(&Lane) -> T) -> T {
+        f(&self.seen.lock().unwrap().lane)
     }
 
     /// A session the server takes, as if signed in before.
@@ -133,14 +195,43 @@ async fn mcp(State(seen): Shared, headers: HeaderMap, Json(message): Json<Value>
         .unwrap_or_default()
         .to_owned();
     let mut seen = seen.lock().unwrap();
+    let args = &message["params"]["arguments"];
     seen.calls.push((bearer.clone(), tool.clone()));
+    seen.args.push(args.clone());
     let signed_in = seen.sessions.contains(&bearer);
     if !signed_in && bearer != GITHUB_TOKEN {
         return (StatusCode::UNAUTHORIZED, "Sign in, or pass a GitHub token").into_response();
     }
-    let args = &message["params"]["arguments"];
+    if let Some(i) = seen.lane.refusals.iter().position(|r| r.0 == tool) {
+        let (_, kind, status, text) = seen.lane.refusals.remove(i);
+        let result = json!({
+            "content": [{ "type": "text", "text": text }], "isError": true,
+            "_meta": { "status": status, "refusal": kind },
+        });
+        return Json(json!({ "jsonrpc": "2.0", "id": message["id"], "result": result }))
+            .into_response();
+    }
     let text = match tool.as_str() {
-        "get_session" if signed_in => json!({ "status": "signed_in", "user": { "login": LOGIN } }),
+        "get_session" if signed_in => json!({
+            "status": "signed_in", "user": { "login": LOGIN },
+            "workspaces": [{ "installation_id": 1, "account": "o" }],
+        }),
+        "claim_build" => seen.lane.tasks.pop_front().unwrap_or(Value::Null),
+        "list_builds" => Value::from(seen.lane.held.clone()),
+        "heartbeat_build" => json!({ "id": args["build"], "status": "claimed" }),
+        "mint_push_token" => json!({ "token": "ghs_fake", "expires_at": "2026-11-12T13:00:00Z" }),
+        "open_build_pr" => {
+            let build = args["build"].as_u64().unwrap_or_default();
+            let said = |k: &str| args[k].as_str().unwrap_or_default().to_owned();
+            seen.lane.opened.push((build, said("title"), said("body")));
+            json!({ "id": build, "status": "landing", "pr": 100 + build })
+        }
+        "release_build" => {
+            let build = args["build"].as_u64().unwrap_or_default();
+            let stuck = args["stuck"].as_str().map(str::to_owned);
+            seen.lane.released.push((build, stuck));
+            json!({ "id": build, "status": "ready" })
+        }
         // A PR not queued yet, then threads to work once it is.
         "next_need" if args["after"] == "q1" => json!({
             "needs": "threads", "id": "t1", "repo": args["repo"], "number": args["number"],

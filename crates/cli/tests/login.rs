@@ -35,8 +35,8 @@ async fn login_keeps_a_session_that_later_calls_send() {
     assert_eq!(who, fake::LOGIN);
 
     let client = Client::signed_in(&server, &sessions(home.path())).unwrap();
-    let answer = client.json("list_builds", json!({})).await.unwrap();
-    assert_eq!(answer, json!({ "tool": "list_builds", "as": "session" }));
+    let answer = client.json("list_repos", json!({})).await.unwrap();
+    assert_eq!(answer, json!({ "tool": "list_repos", "as": "session" }));
     assert_eq!(fake.bearers().last().unwrap(), "session-1");
 }
 
@@ -111,7 +111,7 @@ async fn a_session_the_server_rejects_says_to_log_in_once() {
     let before = fake.bearers().len();
 
     let client = Client::signed_in(&server, &path).unwrap();
-    let err = client.json("list_builds", json!({})).await.unwrap_err();
+    let err = client.json("list_repos", json!({})).await.unwrap_err();
 
     let said = format!("{err:#}");
     assert!(said.contains("run `mergeloop login`"), "{said}");

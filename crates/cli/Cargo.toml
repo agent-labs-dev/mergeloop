@@ -17,10 +17,14 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 getrandom = "0.4.3"
+mergepatrol-git = { version = "0.1.0", path = "../git" }
+mergepatrol-resolver = { version = "0.1.0", path = "../resolver" }
 reqwest = { version = "0.13.5", features = ["form", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "time"] }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+toml = "1.2.1"
 
 [dev-dependencies]
 axum = "0.8.9"

@@ -4,9 +4,11 @@
 //! - `session`: the sessions `mergeloop login` keeps, one per server, private to the user.
 //! - `login`: `mergeloop login` and `logout`, through the server's OAuth for MCP clients.
 //! - `land`: `mergeloop [PR]`, which waits for what a PR needs.
+//! - `daemon`: `mergeloop daemon`, which builds the build lane's tasks.
 //! - `gh`: the GitHub CLI, for the current PR and a token.
 
 pub mod client;
+pub mod daemon;
 pub mod gh;
 pub mod land;
 pub mod login;

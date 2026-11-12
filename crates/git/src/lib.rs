@@ -141,6 +141,23 @@ impl Git {
         Ok(())
     }
 
+    /// Pushes `rev` to `branch` at `url`, in place of whatever the branch was: for a branch only
+    /// its pusher writes. The token goes in as `fetch`'s does.
+    pub async fn push_branch(
+        &self,
+        repo: &Path,
+        token: &str,
+        url: &str,
+        rev: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let refspec = format!("+{rev}:refs/heads/{branch}");
+        let mut cmd = self.git(repo, &["push", "-q", "--no-verify", url, &refspec]);
+        authorize(&mut cmd, token);
+        output(cmd, "git push").await?;
+        Ok(())
+    }
+
     /// Writes the commits `exclude..rev` to `bundle`, under `refs/heads/result`.
     pub async fn create_bundle(
         &self,
@@ -881,5 +898,32 @@ mod tests {
         std::fs::write(dir.join("test.txt"), "weakened\n").unwrap();
         assert!(!Git.holds(dir, &patch).await.unwrap());
         assert!(Git.patch_of(dir, &head, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_branch_replaces_what_the_branch_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        sh(
+            tmp.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        sh(&work, &["init", "-q"]);
+        let first = commit(&work, "a", "1");
+        let url = remote.to_str().unwrap();
+        Git.push_branch(&work, "", url, &first, "mergeloop/build-7")
+            .await
+            .unwrap();
+        sh(&work, &["checkout", "-q", "--orphan", "other"]);
+        let unrelated = commit(&work, "b", "2");
+        Git.push_branch(&work, "", url, &unrelated, "mergeloop/build-7")
+            .await
+            .unwrap();
+        assert_eq!(
+            sh(&remote, &["rev-parse", "refs/heads/mergeloop/build-7"]),
+            unrelated
+        );
     }
 }

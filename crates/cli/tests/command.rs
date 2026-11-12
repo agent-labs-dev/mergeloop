@@ -82,7 +82,7 @@ async fn signed_in_a_call_sends_the_session() {
     let home = tempfile::tempdir().unwrap();
     sign_in(&fake, home.path(), "sess");
 
-    let out = mergeloop(&fake, home.path(), None, &["call", "list_builds"]).await;
+    let out = mergeloop(&fake, home.path(), None, &["call", "list_repos"]).await;
 
     assert!(out.status.success(), "{out:?}");
     assert!(stdout(&out).contains(r#""as":"session""#), "{out:?}");
@@ -114,7 +114,7 @@ async fn a_rejected_session_says_to_log_in_and_exits_non_zero() {
     sign_in(&fake, home.path(), "sess");
     fake.seen.lock().unwrap().sessions.clear();
 
-    let out = mergeloop(&fake, home.path(), None, &["call", "list_builds"]).await;
+    let out = mergeloop(&fake, home.path(), None, &["call", "list_repos"]).await;
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{out:?}");

@@ -117,17 +117,23 @@ impl Client {
         &self.server
     }
 
-    /// A tool's answer, parsed: its error is the command's.
+    /// A tool's answer, parsed. Its error is a `Refused`, which says what kind it is.
     pub async fn json(&self, tool: &str, args: Value) -> Result<Value> {
-        let (text, is_error) = self.tool(tool, args).await?;
-        if is_error {
-            bail!("{tool}: {text}");
+        let answer = self.answer(tool, args).await?;
+        if let Some(refused) = answer.refused {
+            return Err(refused.into());
         }
+        let text = answer.text;
         serde_json::from_str(&text).with_context(|| format!("{tool} answered no JSON: {text}"))
     }
 
     /// A tool's text, and whether it is an error, retrying what failed on the way.
     pub async fn tool(&self, tool: &str, args: Value) -> Result<(String, bool)> {
+        let answer = self.answer(tool, args).await?;
+        Ok((answer.text, answer.refused.is_some()))
+    }
+
+    async fn answer(&self, tool: &str, args: Value) -> Result<Answer> {
         let mut failed = 0;
         loop {
             match self.call(tool, &args).await {
@@ -169,19 +175,23 @@ impl Client {
     }
 
     /// What a 401 means: the credential is no good, and only the user can make a new one.
-    fn refused(&self) -> anyhow::Error {
+    fn refused(&self, tool: &str) -> anyhow::Error {
         let url = self.server.url();
         match &*self.credential {
-            Credential::Session(_) => {
-                anyhow!("{url} no longer takes your sign-in: run `mergeloop login`")
+            Credential::Session(_) => Refused {
+                tool: tool.to_owned(),
+                status: Some(401),
+                kind: None,
+                text: format!("{url} no longer takes your sign-in: run `mergeloop login`"),
             }
+            .into(),
             Credential::GitHub(_) => anyhow!(
                 "{url} does not take the GitHub token: check MERGELOOP_TOKEN or `gh auth status`"
             ),
         }
     }
 
-    async fn call(&self, tool: &str, args: &Value) -> Result<(String, bool), Retry> {
+    async fn call(&self, tool: &str, args: &Value) -> Result<Answer, Retry> {
         let url = self.server.url();
         let message = json!({
             "jsonrpc": "2.0",
@@ -199,7 +209,7 @@ impl Client {
             .map_err(|e| Retry::Yes(anyhow::Error::new(e).context(format!("reach {url}"))))?;
         let status = res.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(Retry::No(self.refused()));
+            return Err(Retry::No(self.refused(tool)));
         }
         let body = res.text().await.map_err(|e| Retry::Yes(e.into()))?;
         if status.is_server_error() {
@@ -214,9 +224,89 @@ impl Client {
             return Err(Retry::No(anyhow!("{}", error["message"])));
         }
         let result = &answer["result"];
-        let text = result["content"][0]["text"].as_str().unwrap_or_default();
-        Ok((text.to_owned(), result["isError"] == true))
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let refused = (result["isError"] == true).then(|| Refused {
+            tool: tool.to_owned(),
+            status: result["_meta"]["status"].as_u64(),
+            kind: result["_meta"]["refusal"].as_str().and_then(Refusal::parse),
+            text: text.clone(),
+        });
+        Ok(Answer { text, refused })
     }
+}
+
+/// A tool's answer: its text, and why it refused, when it did.
+struct Answer {
+    text: String,
+    refused: Option<Refused>,
+}
+
+/// A tool refused: what the server said, and what kind of refusal it is, as `_meta` names it.
+/// Its `Display` is `<tool>: <text>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub tool: String,
+    /// The route's HTTP status, when the server says it.
+    pub status: Option<u64>,
+    pub kind: Option<Refusal>,
+    pub text: String,
+}
+
+impl Refused {
+    /// The sign-in is no good: only the developer can make a new one.
+    pub fn needs_sign_in(&self) -> bool {
+        self.status == Some(401)
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.tool, self.text)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The refusals of the build lane that ask something different of the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The workspace's lane is off.
+    LaneOff,
+    /// The caller no longer holds the build: stop, and call nothing more on it.
+    Lost,
+    /// The build's issue is no task any more: give it back.
+    Cancelled,
+    /// The build went unheard too long: heartbeat it, then ask again.
+    Unheard,
+    /// GitHub says the caller may not push: give it back.
+    MayNotPush,
+}
+
+impl Refusal {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "lane_off" => Refusal::LaneOff,
+            "lost" => Refusal::Lost,
+            "cancelled" => Refusal::Cancelled,
+            "unheard" => Refusal::Unheard,
+            "may_not_push" => Refusal::MayNotPush,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether `e` says the sign-in is no good.
+pub fn needs_sign_in(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>()
+        .is_some_and(Refused::needs_sign_in)
+}
+
+/// The kind of refusal `e` is, if it is one.
+pub fn refusal(e: &anyhow::Error) -> Option<Refusal> {
+    e.downcast_ref::<Refused>().and_then(|r| r.kind)
 }
 
 /// Whether a failed call is worth making again.

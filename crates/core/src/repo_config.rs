@@ -1,4 +1,4 @@
-//! `.mergepatrol/mergepatrol.yml`: a repo's queue settings, committed on its default branch so a
+//! `.mergeloop/mergeloop.yml`: a repo's queue settings, committed on its default branch so a
 //! PR cannot change them for itself. A setting the file leaves out follows the workspace, so an
 //! empty file is a repo that inherits everything.
 
@@ -6,7 +6,67 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Provider, ReviewOverrides, SpendTask};
 
-pub const REPO_CONFIG_PATH: &str = ".mergepatrol/mergepatrol.yml";
+pub const REPO_CONFIG_PATH: &str = ".mergeloop/mergeloop.yml";
+/// The trigger label a repo has unless its file or its workspace names another.
+pub const DEFAULT_LABEL: &str = "mergeloop";
+
+/// Where a repo's config file is. Repos set up before MergeLoop was renamed from Mergepatrol keep
+/// theirs at the old path, which MergeLoop reads while the new one is missing, and keep the old
+/// default label with it, so their labeled PRs stay queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigPath {
+    Current,
+    Legacy,
+}
+
+impl ConfigPath {
+    /// In the order MergeLoop looks: the first that is there is the repo's.
+    pub const ALL: [Self; 2] = [Self::Current, Self::Legacy];
+
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Current => REPO_CONFIG_PATH,
+            Self::Legacy => ".mergepatrol/mergepatrol.yml",
+        }
+    }
+
+    /// The path this is, of [`ConfigPath::path`]'s.
+    pub fn of(path: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|at| at.path() == path)
+    }
+
+    /// What a file here inherits from `defaults`.
+    pub fn inherit(self, defaults: &RepoSettings) -> RepoSettings {
+        let mut d = defaults.clone();
+        if self == Self::Legacy && d.label == DEFAULT_LABEL {
+            d.label = "mergepatrol".into();
+        }
+        d
+    }
+}
+
+/// A repo's config file as read from its default branch: where it is, and its text, `None` for
+/// none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigText {
+    pub at: ConfigPath,
+    pub text: Option<String>,
+}
+
+impl ConfigText {
+    /// No file, so the repo would get one at the current path.
+    pub fn none() -> Self {
+        Self {
+            at: ConfigPath::Current,
+            text: None,
+        }
+    }
+
+    /// The repo's settings, as [`RepoSettings::from_file_at`] reads them.
+    pub fn settings(&self, defaults: &RepoSettings) -> Result<RepoSettings, String> {
+        RepoSettings::from_file_at(self.at, self.text.as_deref(), defaults)
+    }
+}
 
 /// The agent's `--effort` values.
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -33,10 +93,6 @@ pub struct RepoSettings {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSettings {
-    /// Where conflicts are resolved and failed checks fixed: by MergeLoop's agent, or by the
-    /// agent of the PR's author.
-    #[serde(default)]
-    pub runs: Runs,
     /// Whose model the agent runs, with the workspace's key for it.
     #[serde(default)]
     pub provider: Provider,
@@ -45,18 +101,6 @@ pub struct AgentSettings {
     /// A model for one task over the default: each task without one runs the default.
     #[serde(default, skip_serializing_if = "ModelOverrides::is_empty")]
     pub overrides: ModelOverrides,
-}
-
-/// Who resolves a PR's conflicts and fixes its failed checks while it gets ready.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Runs {
-    /// MergeLoop's agent, in its sandbox, with the workspace's model key.
-    #[default]
-    Hosted,
-    /// The agent of the PR's author, on their machine: the PR keeps its place, held, until
-    /// they push. `mergeloop` tells it what the PR needs.
-    Local,
 }
 
 /// A model for each task the agent runs, over the default. A task without one runs the default.
@@ -119,7 +163,7 @@ pub struct FixCiSettings {
     pub attempts: u32,
 }
 
-/// On, with three fixes for a PR, whether for its checks or its review: most need one, and the
+/// On, with three fixes of a PR's checks: most need one, and the
 /// rest cover a first that went halfway.
 impl Default for FixCiSettings {
     fn default() -> Self {
@@ -229,7 +273,6 @@ struct RepoConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfig {
-    runs: Option<Runs>,
     provider: Option<Provider>,
     model: Option<String>,
     effort: Option<String>,
@@ -304,8 +347,6 @@ struct Written<'a> {
 #[derive(Serialize)]
 struct WrittenAgent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    runs: Option<Runs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<Provider>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<&'a str>,
@@ -317,8 +358,7 @@ struct WrittenAgent<'a> {
 
 impl WrittenAgent<'_> {
     fn is_empty(&self) -> bool {
-        self.runs.is_none()
-            && self.provider.is_none()
+        self.provider.is_none()
             && self.model.is_none()
             && self.effort.is_none()
             && self.overrides.is_empty()
@@ -379,22 +419,31 @@ impl RepoSettings {
     /// The settings of a repo whose default branch has `file`, or the defaults without one. An
     /// empty file is the defaults too.
     pub fn from_file(file: Option<&str>, defaults: &RepoSettings) -> Result<Self, String> {
+        Self::from_file_at(ConfigPath::Current, file, defaults)
+    }
+
+    /// The settings of a repo whose file at `at` is `file`, over what a file there inherits.
+    pub fn from_file_at(
+        at: ConfigPath,
+        file: Option<&str>,
+        defaults: &RepoSettings,
+    ) -> Result<Self, String> {
+        let path = at.path();
+        let defaults = &at.inherit(defaults);
         let Some(yaml) = file else {
             return Ok(defaults.clone());
         };
         let config: Option<RepoConfig> =
-            serde_yaml::from_str(yaml).map_err(|e| format!("{REPO_CONFIG_PATH}: {e}"))?;
+            serde_yaml::from_str(yaml).map_err(|e| format!("{path}: {e}"))?;
         let config = config.unwrap_or_default();
         if let Some(version) = config.version.filter(|v| *v != 1) {
-            return Err(format!(
-                "{REPO_CONFIG_PATH}: version {version} is not supported"
-            ));
+            return Err(format!("{path}: version {version} is not supported"));
         }
         // The default model is the default provider's: another provider needs its own.
         let provider = config.agent.provider.unwrap_or(defaults.agent.provider);
         if provider != defaults.agent.provider && config.agent.model.is_none() {
             return Err(format!(
-                "{REPO_CONFIG_PATH}: agent.model: set the {} model to use",
+                "{path}: agent.model: set the {} model to use",
                 provider.name()
             ));
         }
@@ -406,7 +455,7 @@ impl RepoSettings {
         // the repo's default.
         let task = |name: &str, t: Option<TaskModelConfig>, inherited: &Option<TaskModel>| {
             t.map_or(Ok(inherited.clone()), |t| t.resolve(name, provider))
-                .map_err(|e| format!("{REPO_CONFIG_PATH}: {e}"))
+                .map_err(|e| format!("{path}: {e}"))
         };
         let overrides = config.agent.overrides;
         let inherited = &defaults.agent.overrides;
@@ -419,7 +468,6 @@ impl RepoSettings {
             label: config.label.unwrap_or_else(|| defaults.label.clone()),
             batch_size: config.batch_size.unwrap_or(defaults.batch_size),
             agent: AgentSettings {
-                runs: config.agent.runs.unwrap_or(defaults.agent.runs),
                 provider,
                 model,
                 effort: config
@@ -436,9 +484,7 @@ impl RepoSettings {
             branches: config.branches.unwrap_or_else(|| defaults.branches.clone()),
             review: config.review.unwrap_or_else(|| defaults.review.clone()),
         };
-        settings
-            .check()
-            .map_err(|e| format!("{REPO_CONFIG_PATH}: {e}"))?;
+        settings.check().map_err(|e| format!("{path}: {e}"))?;
         Ok(settings)
     }
 
@@ -519,7 +565,6 @@ impl RepoSettings {
             label: (self.label != defaults.label).then_some(&self.label),
             batch_size: (self.batch_size != defaults.batch_size).then_some(self.batch_size),
             agent: WrittenAgent {
-                runs: (s.runs != d.runs).then_some(s.runs),
                 provider: model.then_some(s.provider),
                 model: model.then_some(&s.model),
                 effort: (s.effort != d.effort).then_some(&s.effort),
@@ -581,10 +626,9 @@ mod tests {
 
     fn defaults() -> RepoSettings {
         RepoSettings {
-            label: "mergepatrol".into(),
+            label: DEFAULT_LABEL.into(),
             batch_size: 8,
             agent: AgentSettings {
-                runs: Default::default(),
                 provider: Provider::Anthropic,
                 model: "claude-opus-5-5".into(),
                 effort: "medium".into(),
@@ -694,19 +738,6 @@ agent:
     }
 
     #[test]
-    fn the_authors_agent_runs_where_the_file_says_so_and_writes_back() {
-        assert_eq!(defaults().agent.runs, Runs::Hosted);
-        let file = "version: 1\nagent:\n  runs: local\n";
-        let s = RepoSettings::from_file(Some(file), &defaults()).unwrap();
-        assert_eq!(s.agent.runs, Runs::Local);
-        let written = s.to_yaml(&defaults());
-        assert!(written.contains("agent:\n  runs: local\n"), "{written}");
-        assert_eq!(RepoSettings::from_file(Some(&written), &defaults()), Ok(s));
-        let bad = RepoSettings::from_file(Some("agent:\n  runs: laptop\n"), &defaults());
-        assert!(bad.is_err());
-    }
-
-    #[test]
     fn no_file_is_the_defaults() {
         assert_eq!(RepoSettings::from_file(None, &defaults()), Ok(defaults()));
     }
@@ -721,7 +752,7 @@ agent:
         assert_eq!(s.batch_size, 2);
         assert_eq!(s.agent.effort, "high");
         assert_eq!(s.agent.model, "claude-opus-5-5");
-        assert_eq!(s.label, "mergepatrol");
+        assert_eq!(s.label, DEFAULT_LABEL);
         assert_eq!(s.verify, ["cargo check"]);
         assert_eq!(s.fix_ci, defaults().fix_ci);
     }
@@ -762,6 +793,7 @@ agent:
             enabled: Some(true),
             bars: [(crate::Kind::Security, crate::Bar::Always)].into(),
             require_resolved: Some(false),
+            depth: Some(crate::Depth::Deep),
         };
         assert_eq!(
             RepoSettings::from_file(Some(&s.to_yaml(&defaults())), &defaults()),
@@ -794,7 +826,6 @@ agent:
             label: "queue".into(),
             batch_size: 3,
             agent: AgentSettings {
-                runs: Default::default(),
                 provider: Provider::OpenAi,
                 model: "gpt-6.1-sol".into(),
                 effort: "high".into(),
@@ -911,16 +942,35 @@ agent:
     #[test]
     fn a_file_from_before_the_rename_is_not_written_as_mergeloop_writes_it_now() {
         let old = "# Mergepatrol reads this file from the default branch. The dashboard opens a PR to change it.\nversion: 1\nlabel: mergepatrol\nbatch_size: 8\nresolver:\n  model: claude-opus-5-5\n  effort: medium\nverify: []\n";
-        let settings = RepoSettings::from_file(Some(old), &defaults()).unwrap();
-        assert!(!settings.written_in(old, &defaults()));
+        let at = ConfigPath::Legacy;
+        let d = at.inherit(&defaults());
+        let settings = RepoSettings::from_file_at(at, Some(old), &defaults()).unwrap();
+        assert!(!settings.written_in(old, &d));
         // Rewriting it keeps what it means, and there is nothing left to do after.
-        let new = settings.to_yaml(&defaults());
+        let new = settings.to_yaml(&d);
         assert_eq!(
-            RepoSettings::from_file(Some(&new), &defaults()).unwrap(),
+            RepoSettings::from_file_at(at, Some(&new), &defaults()).unwrap(),
             settings
         );
-        assert!(settings.written_in(&new, &defaults()));
+        assert!(settings.written_in(&new, &d));
         assert!(!new.contains("label"), "{new}");
+    }
+
+    #[test]
+    fn a_file_at_the_old_path_keeps_the_old_default_label() {
+        let empty = Some("version: 1\n");
+        let label = |at, d: &RepoSettings| RepoSettings::from_file_at(at, empty, d).unwrap().label;
+        assert_eq!(label(ConfigPath::Current, &defaults()), "mergeloop");
+        assert_eq!(label(ConfigPath::Legacy, &defaults()), "mergepatrol");
+        // A label the workspace names is every repo's.
+        let mut named = defaults();
+        named.label = "ship".into();
+        assert_eq!(label(ConfigPath::Legacy, &named), "ship");
+        let err = RepoSettings::from_file_at(ConfigPath::Legacy, Some("version: 2\n"), &named);
+        assert!(
+            err.unwrap_err()
+                .starts_with(".mergepatrol/mergepatrol.yml: ")
+        );
     }
 
     #[test]

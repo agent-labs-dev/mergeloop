@@ -11,19 +11,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use mergepatrol_core::{
-    Answered, CheckFailure, CodeLine, Evidence, FIXED_BY, Finding, Lean, LineKind, RESOLVED_BY,
-    SentBack, Spend, SpendTask,
+    AGENT_TRAILERS, Answered, CheckFailure, CodeLine, Depth, FIXED_BY, Finding, Lean, LineKind,
+    Panel, RESOLVED_BY, SentBack, Spend, SpendTask, UPDATED_BY, Verdict, Vote, merge_reviews,
+    most_first,
 };
 use mergepatrol_executor::protocol::{
     ANSWER_FILE, BUNDLE_FILE, JobEvent, JobOutcome, JobResult, JobSpec, RESULT_FILE, REVIEW_FILE,
-    ResolverSpec, ReviewOutput, Task,
+    ResolverSpec, ReviewOutput, Task, Update,
 };
 use mergepatrol_executor::proxy::Api;
 use mergepatrol_executor::remote;
 use mergepatrol_git::{Git, RebaseStep};
 use mergepatrol_resolver::{
     ClaudeResolver, CodexResolver, FixRequest, Outcome, QuestionRequest, Resolution,
-    ResolveRequest, Resolver, ReviewRequest, Verify, new_title,
+    ResolveRequest, Resolver, ReviewRequest, Scope, Stopped, Verify, VerifyRequest, claim,
+    commit_subject, new_title, vote,
 };
 use tokio::io::AsyncReadExt;
 
@@ -194,8 +196,11 @@ async fn run(spec: &JobSpec, dir: &Path, out: &Path, events: &mut Vec<JobEvent>)
     // The bundle holds the commits on top of what the orchestrator already has.
     let (exclude, done) = match &spec.task {
         Task::Rebase => {
-            rebase(spec, &git, resolver, &checks, dir, out, events).await?;
-            if git.rev_parse(dir, "HEAD").await? == spec.trunk_sha {
+            update(spec, &git, resolver, &checks, dir, out, events).await?;
+            let tree = |rev: &str| format!("{rev}^{{tree}}");
+            if git.rev_parse(dir, &tree("HEAD")).await?
+                == git.rev_parse(dir, &tree(&spec.trunk_sha)).await?
+            {
                 bail!(
                     "nothing is left to merge: its changes are already on {}",
                     spec.trunk
@@ -211,22 +216,7 @@ async fn run(spec: &JobSpec, dir: &Path, out: &Path, events: &mut Vec<JobEvent>)
                 &git,
                 resolver,
                 &checks,
-                (failures, &[], &what),
-                dir,
-                out,
-                events,
-            )
-            .await?;
-            (&spec.head_sha, "fixed")
-        }
-        Task::FixReview { findings } => {
-            let what = "the review's findings";
-            fix(
-                spec,
-                &git,
-                resolver,
-                &checks,
-                (&[], findings, what),
+                (failures, &what),
                 dir,
                 out,
                 events,
@@ -239,9 +229,15 @@ async fn run(spec: &JobSpec, dir: &Path, out: &Path, events: &mut Vec<JobEvent>)
             answered,
             sent_back,
             since,
+            reviewed,
+            depth,
         } => {
-            let earlier = (answered.as_slice(), sent_back.as_slice(), since.as_deref());
-            return review(spec, &git, resolver, &checks, earlier, dir, out, events).await;
+            let earlier = (answered.as_slice(), sent_back.as_slice(), *depth);
+            let since = (since.as_deref(), reviewed.as_deref());
+            return review(
+                spec, &git, resolver, &checks, earlier, since, dir, out, events,
+            )
+            .await;
         }
         Task::Question {
             finding,
@@ -286,11 +282,15 @@ fn resolver(spec: &ResolverSpec) -> Box<dyn Resolver> {
             effort: spec.effort.clone(),
             timeout,
             max_turns: spec.max_turns,
+            on_plan: spec.api.as_ref().is_some_and(|a| a.on_plan),
         }),
     }
 }
 
-async fn rebase(
+/// Brings the PR up to date with `trunk_sha`, as `spec.update` asks: replays its commits, or
+/// merges the base in. A branch that keeps up by merging already resolves what a replay of its
+/// commits would conflict in again, commit by commit.
+async fn update(
     spec: &JobSpec,
     git: &Git,
     resolver: &dyn Resolver,
@@ -299,73 +299,110 @@ async fn rebase(
     out: &Path,
     events: &mut Vec<JobEvent>,
 ) -> Result<()> {
+    let (trunk, head) = (&spec.trunk_sha, &spec.head_sha);
+    let merge = match spec.update {
+        Update::Rebase => false,
+        Update::Merge => true,
+        Update::Either => git.has_merges(dir, trunk, head).await?,
+    };
+    if merge {
+        return merge_in(spec, git, resolver, checks, dir, out, events).await;
+    }
+    let step = git.rebase(dir, trunk, spec.upstream.as_deref()).await?;
+    if matches!(step, RebaseStep::Conflict { .. })
+        && spec.update == Update::Either
+        && git.merges_cleanly(dir, trunk, head).await?
+    {
+        git.rebase_abort(dir).await?;
+        event(
+            events,
+            "merging-base",
+            "the rebase conflicts and a merge does not: merging",
+        );
+        return merge_in(spec, git, resolver, checks, dir, out, events).await;
+    }
+    rebase(spec, git, resolver, checks, dir, out, events, step).await
+}
+
+/// Merges `trunk_sha` into the PR head, with the agent on its conflicts, once.
+async fn merge_in(
+    spec: &JobSpec,
+    git: &Git,
+    resolver: &dyn Resolver,
+    checks: &Verify,
+    dir: &Path,
+    out: &Path,
+    events: &mut Vec<JobEvent>,
+) -> Result<()> {
+    let base = spec.base_ref.as_deref().unwrap_or(&spec.trunk);
+    let branch = spec.head_ref.strip_prefix("refs/heads/");
+    let message = match branch {
+        Some(branch) => format!("Merge {base} into {branch}\n\n{UPDATED_BY}"),
+        None => format!("Merge {base}\n\n{UPDATED_BY}"),
+    };
+    let files = git.merge(dir, &spec.trunk_sha, &message).await?;
+    if files.is_empty() {
+        event(events, "base-merged", &spec.trunk_sha);
+        return Ok(());
+    }
+    let transcript = out
+        .join("transcripts")
+        .join(format!("merge-{}.jsonl", &spec.trunk_sha[..12]));
+    resolve(
+        spec,
+        git,
+        resolver,
+        checks,
+        dir,
+        &files,
+        Stopped::Merge,
+        &transcript,
+        events,
+    )
+    .await?;
+    git.commit_merge(
+        dir,
+        &message,
+        &format!("{RESOLVED_BY}, {}", resolver.name()),
+    )
+    .await?;
+    verify(spec, dir, events, "the resolution").await
+}
+
+/// Replays the PR's commits from `step`, where `git.rebase` left off, with the agent on each
+/// commit that conflicts.
+#[allow(clippy::too_many_arguments)]
+async fn rebase(
+    spec: &JobSpec,
+    git: &Git,
+    resolver: &dyn Resolver,
+    checks: &Verify,
+    dir: &Path,
+    out: &Path,
+    events: &mut Vec<JobEvent>,
+    mut step: RebaseStep,
+) -> Result<()> {
     let mut resolved_any = false;
-    let mut step = git
-        .rebase(dir, &spec.trunk_sha, spec.upstream.as_deref())
-        .await?;
     while let RebaseStep::Conflict { commit, files } = step {
-        event(events, "conflict", files.join(", "));
-        if spec.leave_conflicts {
-            bail!("{LEFT_CONFLICT} in {}", files.join(", "));
-        }
-        if spec.resolver.api.is_none() {
-            let files = files.join(", ");
-            let credential = spec.resolver.provider.credential();
-            match &spec.resolver.settings_url {
-                Some(url) => bail!(
-                    "it conflicts in {files}, and the workspace has no {credential} for an agent to resolve that: add one in the dashboard's settings, {url}"
-                ),
-                None => bail!(
-                    "it conflicts in {files}, and the job has no {credential} for an agent to resolve that"
-                ),
-            }
-        }
         let commit_message = git.commit_message(dir, &commit).await?;
-        let stopped_at = git.rev_parse(dir, "HEAD").await?;
         let transcript = out
             .join("transcripts")
             .join(format!("{}.jsonl", &commit[..12]));
-        let run = resolver
-            .resolve(ResolveRequest {
-                workdir: dir,
-                conflicted_files: &files,
-                pr_title: &spec.pr_title,
-                pr_body: &spec.pr_body,
-                commit_message: &commit_message,
-                trunk: &spec.trunk,
-                verify: checks,
-                transcript: &transcript,
-            })
-            .await
-            .map_err(|e| anyhow!("the resolver failed: {e:#}"))?;
-        let done = run.outcome == Outcome::Resolved;
-        spent(
+        let stopped = Stopped::Replay {
+            commit_message: &commit_message,
+        };
+        resolve(
+            spec,
+            git,
+            resolver,
+            checks,
+            dir,
+            &files,
+            stopped,
+            &transcript,
             events,
-            &spec.resolver,
-            SpendTask::Rebase,
-            done,
-            files.join(", "),
-            &run,
-        );
-        match run.outcome {
-            Outcome::Resolved => {}
-            Outcome::GaveUp(reason) => bail!("the resolver gave up: {reason}"),
-            Outcome::Failed(why) => bail!("the resolver failed: {why}"),
-        }
-        if git.rev_parse(dir, "HEAD").await? != stopped_at {
-            bail!("the agent moved HEAD");
-        }
-        for f in &files {
-            let content = tokio::fs::read_to_string(dir.join(f))
-                .await
-                .unwrap_or_default();
-            if content
-                .lines()
-                .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> "))
-            {
-                bail!("conflict markers are left in {f}");
-            }
-        }
+        )
+        .await?;
         resolved_any = true;
         step = git
             .continue_resolution(dir, &format!("{RESOLVED_BY}, {}", resolver.name()))
@@ -374,6 +411,81 @@ async fn rebase(
 
     if resolved_any {
         verify(spec, dir, events, "the resolution").await?;
+    }
+    Ok(())
+}
+
+/// Has the agent resolve the conflict in `files`, where a rebase or merge `stopped`, and
+/// checks what it left: HEAD where it was, and no conflict markers.
+#[allow(clippy::too_many_arguments)]
+async fn resolve(
+    spec: &JobSpec,
+    git: &Git,
+    resolver: &dyn Resolver,
+    checks: &Verify,
+    dir: &Path,
+    files: &[String],
+    stopped: Stopped<'_>,
+    transcript: &Path,
+    events: &mut Vec<JobEvent>,
+) -> Result<()> {
+    event(events, "conflict", files.join(", "));
+    if spec.leave_conflicts {
+        bail!("{LEFT_CONFLICT} in {}", files.join(", "));
+    }
+    if spec.resolver.api.is_none() {
+        let files = files.join(", ");
+        let credential = spec.resolver.provider.credential();
+        match &spec.resolver.settings_url {
+            Some(url) => bail!(
+                "it conflicts in {files}, and the workspace has no {credential} for an agent to resolve that: add one in the dashboard's settings, {url}"
+            ),
+            None => bail!(
+                "it conflicts in {files}, and the job has no {credential} for an agent to resolve that"
+            ),
+        }
+    }
+    let stopped_at = git.rev_parse(dir, "HEAD").await?;
+    let run = resolver
+        .resolve(ResolveRequest {
+            workdir: dir,
+            conflicted_files: files,
+            pr_title: &spec.pr_title,
+            pr_body: &spec.pr_body,
+            stopped,
+            trunk: &spec.trunk,
+            verify: checks,
+            transcript,
+        })
+        .await
+        .map_err(|e| anyhow!("the resolver failed: {e:#}"))?;
+    let done = run.outcome == Outcome::Resolved;
+    spent(
+        events,
+        &spec.resolver,
+        SpendTask::Rebase,
+        done,
+        files.join(", "),
+        &run,
+    );
+    match run.outcome {
+        Outcome::Resolved => {}
+        Outcome::GaveUp(reason) => bail!("the resolver gave up: {reason}"),
+        Outcome::Failed(why) => bail!("the resolver failed: {why}"),
+    }
+    if git.rev_parse(dir, "HEAD").await? != stopped_at {
+        bail!("the agent moved HEAD");
+    }
+    for f in files {
+        let content = tokio::fs::read_to_string(dir.join(f))
+            .await
+            .unwrap_or_default();
+        if content
+            .lines()
+            .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> "))
+        {
+            bail!("conflict markers are left in {f}");
+        }
     }
     Ok(())
 }
@@ -396,7 +508,7 @@ async fn fix(
     git: &Git,
     resolver: &dyn Resolver,
     checks: &Verify,
-    (failures, findings, what): (&[CheckFailure], &[Finding], &str),
+    (failures, what): (&[CheckFailure], &str),
     dir: &Path,
     out: &Path,
     events: &mut Vec<JobEvent>,
@@ -404,12 +516,10 @@ async fn fix(
     let transcript = out
         .join("transcripts")
         .join(format!("fix-{}.jsonl", &spec.head_sha[..12]));
-    apply_evidence(git, dir, findings).await?;
     let run = resolver
         .fix(FixRequest {
             workdir: dir,
             failures,
-            findings,
             pr_title: &spec.pr_title,
             pr_body: &spec.pr_body,
             trunk: &spec.trunk,
@@ -419,15 +529,15 @@ async fn fix(
         .await
         .map_err(|e| anyhow!("the agent failed: {e:#}"))?;
     let title = match run.outcome {
-        Outcome::Resolved if !failures.is_empty() => new_title(&run.text),
+        Outcome::Resolved => new_title(&run.text),
         _ => None,
     };
     // A fix is done once it is committed: until then, any failure leaves it unfixed.
     let fixed = match &title {
         Some(title) => Err(anyhow!("{RETITLED}{title}")),
         None => {
-            let ran = (&run.outcome, findings, what);
-            commit_fix(spec, git, resolver, ran, dir, events).await
+            let subject = commit_subject(&run.text).unwrap_or_else(|| format!("Fix {what}"));
+            commit_fix(spec, git, resolver, (&run.outcome, &subject), dir, events).await
         }
     };
     spent(
@@ -441,12 +551,12 @@ async fn fix(
     fixed
 }
 
-/// Checks the agent's fix, and commits it: with the review's tests for `findings`, which now pass.
+/// Checks the agent's fix, and commits it with `subject`.
 async fn commit_fix(
     spec: &JobSpec,
     git: &Git,
     resolver: &dyn Resolver,
-    (outcome, findings, what): (&Outcome, &[Finding], &str),
+    (outcome, subject): (&Outcome, &str),
     dir: &Path,
     events: &mut Vec<JobEvent>,
 ) -> Result<()> {
@@ -461,13 +571,11 @@ async fn commit_fix(
     if !git.is_dirty(dir).await? {
         bail!("the agent changed nothing");
     }
+    // The fix's new files are those there before MergeLoop's own checks run, which may leave some.
+    let new = git.untracked_files(dir).await?;
     verify(spec, dir, events, "the fix").await?;
-    evidence_passes(git, dir, findings, events).await?;
-    git.commit_all(
-        dir,
-        &format!("Fix {what}\n\n{FIXED_BY}, {}", resolver.name()),
-    )
-    .await
+    let message = format!("{subject}\n\n{FIXED_BY}, {}", resolver.name());
+    git.commit(dir, &new, &message).await
 }
 
 /// How many lines of context a finding's code shows around what it is about.
@@ -482,73 +590,208 @@ async fn review(
     git: &Git,
     resolver: &dyn Resolver,
     checks: &Verify,
-    (answered, sent_back, since): (&[Answered], &[SentBack], Option<&str>),
+    (answered, sent_back, depth): (&[Answered], &[SentBack], Depth),
+    (since, reviewed): (Option<&str>, Option<&str>),
     dir: &Path,
     out: &Path,
     events: &mut Vec<JobEvent>,
 ) -> Result<()> {
     let base = git.merge_base(dir, &spec.trunk_sha, &spec.head_sha).await?;
-    let queue_commits = match since {
-        Some(since) => {
-            // A rebase replays the PR, and leaves the head it went on from behind.
-            let on_it = git.is_ancestor(dir, since, &spec.head_sha).await;
-            let from = if on_it.unwrap_or(false) { since } else { &base };
-            let trailers = [FIXED_BY, RESOLVED_BY];
-            git.commits_with(dir, from, &spec.head_sha, &trailers)
-                .await?
-        }
-        None => Vec::new(),
+    let queue_commits = queue_commits(git, dir, &spec.head_sha, &base, since).await?;
+    let reviewed = since_reviewed(git, dir, spec, &base, reviewed).await?;
+    event(events, "reviewing", reviewing(&base, &spec.head_sha, depth));
+    let bench = Bench {
+        git,
+        dir,
+        head: &spec.head_sha,
     };
-    event(
-        events,
-        "reviewing",
-        format!("{}..{}", &base[..12], &spec.head_sha[..12]),
-    );
-    let transcript = out
-        .join("transcripts")
-        .join(format!("review-{}.jsonl", &spec.head_sha[..12]));
-    let run = resolver
-        .review(ReviewRequest {
-            workdir: dir,
-            base: &base,
-            pr_title: &spec.pr_title,
-            pr_body: &spec.pr_body,
-            trunk: &spec.trunk,
-            answered,
-            sent_back,
-            queue_commits: &queue_commits,
-            verify: checks,
-            transcript: &transcript,
-        })
-        .await
-        .map_err(|e| anyhow!("the agent failed: {e:#}"))?;
-    let parsed = match &run.outcome {
-        Outcome::Failed(why) => Err(anyhow!("the agent failed: {why}")),
-        Outcome::GaveUp(why) => Err(anyhow!("the agent gave up: {why}")),
-        Outcome::Resolved => parse_review(&run.text),
+    let review_in = |workdir: PathBuf, name: String| {
+        let transcript = out
+            .join("transcripts")
+            .join(format!("{name}-{}.jsonl", &spec.head_sha[..12]));
+        let (base, scope) = (base.as_str(), Scope::of(&queue_commits, reviewed));
+        async move {
+            let req = ReviewRequest {
+                workdir: &workdir,
+                base,
+                pr_title: &spec.pr_title,
+                pr_body: &spec.pr_body,
+                trunk: &spec.trunk,
+                below: spec.base_ref.as_deref(),
+                answered,
+                sent_back,
+                scope,
+                depth,
+                verify: checks,
+                transcript: &transcript,
+            };
+            reviewed_by(git, resolver, req, &spec.head_sha).await
+        }
     };
-    spent(
-        events,
-        &spec.resolver,
-        SpendTask::Review,
-        parsed.is_ok(),
-        String::new(),
-        &run,
-    );
-    let mut output = parsed?;
-    for (i, f) in output.findings.iter_mut().enumerate() {
-        f.id = format!("f{}", i + 1);
-        f.confidence = f.confidence.clamp(0, 100);
-        if let Some(file) = f.file.clone() {
-            f.code = diff_lines(git, dir, &base, &spec.head_sha, &file, f.line).await?;
-        }
-        for r in &mut f.related {
-            r.code = file_lines(git, dir, &spec.head_sha, &r.file, r.line).await?;
-        }
-    }
-    check_evidence(&spec.head_sha, git, dir, &mut output.findings, events).await?;
+    let ran = bench.reviewers(depth.reviewers(), review_in).await?;
+    let mut output = merged(&spec.resolver, ran, events)?;
+    let panel = (spec, resolver, base.as_str());
+    check_findings(panel, &bench, out, depth, &mut output.findings, events).await?;
     tokio::fs::write(out.join(REVIEW_FILE), serde_json::to_vec_pretty(&output)?).await?;
     Ok(())
+}
+
+/// Backs what the agent found with what MergeLoop saw itself: the code at each place, each
+/// change's evidence run on the head, and a panel's votes on a change without any, of a kind
+/// `depth` votes on.
+async fn check_findings(
+    panel: (&JobSpec, &dyn Resolver, &str),
+    bench: &Bench<'_>,
+    out: &Path,
+    depth: Depth,
+    findings: &mut [Finding],
+    events: &mut Vec<JobEvent>,
+) -> Result<()> {
+    let Bench { git, dir, head } = *bench;
+    with_code(git, dir, panel.2, head, findings).await?;
+    check_evidence(head, git, dir, findings, events).await?;
+    verify_findings(panel, bench, out, depth, findings, events).await
+}
+
+/// What the review reads, and how hard it looks: `abc..def at deep: 3 reviewers`.
+fn reviewing(base: &str, head: &str, depth: Depth) -> String {
+    let looks = match depth.reviewers() {
+        1 => "1 reviewer".to_owned(),
+        n => format!("{n} reviewers"),
+    };
+    format!(
+        "{}..{} at {}: {looks}",
+        &base[..12],
+        &head[..12],
+        depth.as_str()
+    )
+}
+
+/// The reviewers' findings, merged, with what each run spent: an error only when none found any.
+fn merged(
+    resolver: &ResolverSpec,
+    ran: Vec<(Option<Resolution>, Result<ReviewOutput>)>,
+    events: &mut Vec<JobEvent>,
+) -> Result<ReviewOutput> {
+    let mut reviews = Vec::new();
+    let mut failed = None;
+    for (run, found) in ran {
+        if let Some(run) = &run {
+            spent(
+                events,
+                resolver,
+                SpendTask::Review,
+                found.is_ok(),
+                String::new(),
+                run,
+            );
+        }
+        match found {
+            Ok(output) => reviews.push(output),
+            Err(e) => {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    let Some(first) = reviews.first() else {
+        return Err(failed.unwrap_or_else(|| anyhow!("no reviewer ran")));
+    };
+    let summary = first.summary.clone();
+    let findings = merge_reviews(reviews.into_iter().map(|r| r.findings).collect());
+    let mut findings = most_first(findings, FINDINGS_MAX);
+    for (i, f) in findings.iter_mut().enumerate() {
+        f.id = format!("f{}", i + 1);
+    }
+    Ok(ReviewOutput { summary, findings })
+}
+
+/// One reviewer's run, and what it found, with what it wrote for each change's evidence taken
+/// from its checkout. `None` for a run that never ended in an answer.
+async fn reviewed_by(
+    git: &Git,
+    resolver: &dyn Resolver,
+    req: ReviewRequest<'_>,
+    head: &str,
+) -> (Option<Resolution>, Result<ReviewOutput>) {
+    let workdir = req.workdir.to_owned();
+    let run = match resolver.review(req).await {
+        Ok(run) => run,
+        Err(e) => return (None, Err(anyhow!("the agent failed: {e:#}"))),
+    };
+    let found = match parse_review(&run.outcome, &run.text) {
+        Ok(mut output) => take_patches(head, git, &workdir, &mut output.findings)
+            .await
+            .map(|()| output),
+        Err(e) => Err(e),
+    };
+    (Some(run), found)
+}
+
+/// Gives each finding, each other place it is, and what it relates to their code at `head`.
+async fn with_code(
+    git: &Git,
+    dir: &Path,
+    base: &str,
+    head: &str,
+    findings: &mut [Finding],
+) -> Result<()> {
+    for f in findings {
+        if let Some(file) = f.file.clone() {
+            f.code = diff_lines(git, dir, base, head, &file, f.line).await?;
+        }
+        for p in &mut f.also_at {
+            p.code = diff_lines(git, dir, base, head, &p.file, p.line).await?;
+        }
+        for r in &mut f.related {
+            r.code = file_lines(git, dir, head, &r.file, r.line).await?;
+        }
+    }
+    Ok(())
+}
+
+/// What the queue's agent committed since the approved head `since`: since the PR's `base` when
+/// a rebase replayed the PR and left that head behind.
+async fn queue_commits(
+    git: &Git,
+    dir: &Path,
+    head: &str,
+    base: &str,
+    since: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(since) = since else {
+        return Ok(Vec::new());
+    };
+    let from = on_head(git, dir, head, Some(since)).await?.unwrap_or(base);
+    git.commits_with(dir, from, head, &AGENT_TRAILERS).await
+}
+
+/// `at`, the head findings went back on, while all that lies between it and the PR's head is the
+/// author's: a rebase leaves it behind, and a merge of the trunk moves the PR's `base`.
+async fn since_reviewed<'a>(
+    git: &Git,
+    dir: &Path,
+    spec: &JobSpec,
+    base: &str,
+    at: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    let Some(at) = on_head(git, dir, &spec.head_sha, at).await? else {
+        return Ok(None);
+    };
+    let same_base = git.merge_base(dir, &spec.trunk_sha, at).await? == base;
+    Ok(same_base.then_some(at))
+}
+
+/// `at`, while `head` descends from it: a rebase replays the PR, and leaves it behind.
+async fn on_head<'a>(
+    git: &Git,
+    dir: &Path,
+    head: &str,
+    at: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    let Some(at) = at else {
+        return Ok(None);
+    };
+    Ok(git.is_ancestor(dir, at, head).await?.then_some(at))
 }
 
 /// Has the agent answer a human's question about a finding, and writes the answer.
@@ -597,8 +840,16 @@ async fn answer(
     Ok(())
 }
 
-/// The review in the agent's answer: its JSON, alone or in a code block.
-fn parse_review(text: &str) -> Result<ReviewOutput> {
+/// The most findings a review keeps, so its summary fits GitHub.
+pub(crate) const FINDINGS_MAX: usize = 25;
+
+/// The review in the agent's answer, once it reviewed: its JSON, alone or in a code block.
+fn parse_review(outcome: &Outcome, text: &str) -> Result<ReviewOutput> {
+    match outcome {
+        Outcome::Failed(why) => bail!("the agent failed: {why}"),
+        Outcome::GaveUp(why) => bail!("the agent gave up: {why}"),
+        Outcome::Resolved => {}
+    }
     let json = match (text.find('{'), text.rfind('}')) {
         (Some(start), Some(end)) if start < end => &text[start..=end],
         _ => bail!("the agent's review is not JSON"),
@@ -606,7 +857,11 @@ fn parse_review(text: &str) -> Result<ReviewOutput> {
     let mut output: ReviewOutput =
         serde_json::from_str(json).context("the agent's review does not parse")?;
     output.findings.retain(|f| !f.title.trim().is_empty());
-    output.findings.truncate(25);
+    output.findings = most_first(std::mem::take(&mut output.findings), FINDINGS_MAX);
+    for (i, f) in output.findings.iter_mut().enumerate() {
+        f.id = format!("f{}", i + 1);
+        f.confidence = f.confidence.min(100);
+    }
     Ok(output)
 }
 
@@ -754,9 +1009,36 @@ fn spent(
     event(events, spend.kind(), spend.message());
 }
 
-/// Runs each finding's evidence on the head alone, with only the files it names, and keeps what
-/// that showed: the agent's word that a command fails counts for nothing. Only a change's evidence
-/// runs, as only a change can go back to the author. The tree is left at the head.
+/// Takes onto each change's evidence what the agent wrote for it in `tree`, the checkout it
+/// reviewed in, and drops what the agent said the command did: its word counts for nothing.
+async fn take_patches(head: &str, git: &Git, tree: &Path, findings: &mut [Finding]) -> Result<()> {
+    for f in findings.iter_mut() {
+        let runs = f.lean == Lean::Change;
+        let Some(e) = f.evidence.as_mut() else {
+            continue;
+        };
+        (e.patch, e.output, e.failed) = (String::new(), String::new(), false);
+        if !runs || e.command.trim().is_empty() {
+            continue;
+        }
+        match unsafe_file(&e.files) {
+            Some(file) => e.output = format!("MergeLoop does not run evidence that writes {file}."),
+            None => e.patch = git.patch_of(tree, head, &e.files).await?,
+        }
+    }
+    Ok(())
+}
+
+/// Whether MergeLoop runs a finding's evidence: only a change's, as only a change can go back to
+/// the author, and none that writes a file it may not.
+fn runs_evidence(f: &Finding) -> bool {
+    f.evidence.as_ref().is_some_and(|e| {
+        f.lean == Lean::Change && !e.command.trim().is_empty() && unsafe_file(&e.files).is_none()
+    })
+}
+
+/// Runs each change's evidence on the head alone, with only the files `take_patches` took for it,
+/// and keeps what that showed. The tree is left at the head.
 async fn check_evidence(
     head: &str,
     git: &Git,
@@ -764,44 +1046,149 @@ async fn check_evidence(
     findings: &mut [Finding],
     events: &mut Vec<JobEvent>,
 ) -> Result<()> {
-    // What the agent wrote for each, taken before the tree goes back to the head.
-    let mut patches = Vec::new();
     for f in findings.iter_mut() {
-        let Some(e) = f.evidence.as_mut() else {
-            patches.push(None);
+        if !runs_evidence(f) {
             continue;
-        };
-        (e.patch, e.output, e.failed) = (String::new(), String::new(), false);
-        let runs = f.lean == Lean::Change && !e.command.trim().is_empty();
-        let patch = match (runs, unsafe_file(&e.files)) {
-            (false, _) => None,
-            (true, Some(file)) => {
-                e.output = format!("MergeLoop does not run evidence that writes {file}.");
-                None
-            }
-            (true, None) => Some(git.patch_of(dir, head, &e.files).await?),
-        };
-        patches.push(patch);
-    }
-    for (f, patch) in findings.iter_mut().zip(patches) {
-        let (Some(e), Some(patch)) = (f.evidence.as_mut(), patch) else {
+        }
+        let id = f.id.clone();
+        let Some(e) = f.evidence.as_mut() else {
             continue;
         };
         git.reset_to(dir, head).await?;
-        if !patch.is_empty()
-            && let Err(err) = git.apply(dir, &patch).await
+        if !e.patch.is_empty()
+            && let Err(err) = git.apply(dir, &e.patch).await
         {
-            e.output = format!("{err:#}");
+            (e.output, e.patch) = (format!("{err:#}"), String::new());
             continue;
         }
-        event(events, "evidence", format!("{}: {}", f.id, e.command));
+        event(events, "evidence", format!("{id}: {}", e.command));
         let ran = run_command(dir, &e.command).await?;
         // A command that never ends may be stuck on the machine, not on the PR. One the shell
         // could not find or start never ran: the checkout lacks a tool, the PR is not to blame.
         e.failed = !ran.passed && !ran.timed_out && !ran.not_run;
-        (e.output, e.patch) = (ran.tail, patch);
+        e.output = ran.tail;
     }
     git.reset_to(dir, head).await
+}
+
+/// Where a panel's agents sit: each in a worktree of `head` of its own, off the job's checkout.
+struct Bench<'a> {
+    git: &'a Git,
+    dir: &'a Path,
+    head: &'a str,
+}
+
+impl Bench<'_> {
+    /// Runs one agent per seat, all at once, each fresh, in its own worktree, which goes once all
+    /// are done: no seat sees another's work, nor what an earlier agent left in the checkout.
+    async fn seat<T, F, Fut>(&self, seats: u8, run: F) -> Result<Vec<T>>
+    where
+        F: Fn(u8, PathBuf) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let mut trees = Vec::new();
+        for seat in 1..=seats {
+            let tree = self.dir.with_extension(format!("seat{seat}"));
+            self.git.add_worktree(self.dir, &tree, self.head).await?;
+            trees.push((seat, tree));
+        }
+        let runs = trees.iter().map(|(seat, tree)| run(*seat, tree.clone()));
+        let ran = futures_util::future::join_all(runs).await;
+        for (_, tree) in &trees {
+            self.git.remove_worktree(self.dir, tree).await?;
+        }
+        Ok(ran)
+    }
+
+    /// Runs `n` reviewers: one in the job's own checkout, or each fresh in a seat of its own.
+    async fn reviewers<T, F, Fut>(&self, n: u8, run: F) -> Result<Vec<T>>
+    where
+        F: Fn(PathBuf, String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        match n {
+            1 => Ok(vec![run(self.dir.to_owned(), "review".into()).await]),
+            n => {
+                let seat = |seat, tree| run(tree, format!("review-{seat}"));
+                self.seat(n, seat).await
+            }
+        }
+    }
+}
+
+/// Has a panel of fresh agents check each finding that only the reviewer's word shows, and keeps
+/// their votes: what the reviewer wrote of votes counts for nothing.
+async fn verify_findings(
+    (spec, resolver, base): (&JobSpec, &dyn Resolver, &str),
+    bench: &Bench<'_>,
+    out: &Path,
+    depth: Depth,
+    findings: &mut [Finding],
+    events: &mut Vec<JobEvent>,
+) -> Result<()> {
+    let panel = Panel::FINDING;
+    for f in findings.iter_mut() {
+        f.verified = None;
+        if !f.wants_votes(depth) {
+            continue;
+        }
+        let claim = claim(f);
+        let id = f.id.as_str();
+        let runs = bench
+            .seat(panel.seats, |seat, workdir| {
+                let transcript = out
+                    .join("transcripts")
+                    .join(format!("verify-{id}-{seat}-{}.jsonl", &spec.head_sha[..12]));
+                let claim = claim.as_str();
+                async move {
+                    let req = VerifyRequest {
+                        workdir: &workdir,
+                        base,
+                        pr_title: &spec.pr_title,
+                        claim,
+                        transcript: &transcript,
+                    };
+                    resolver.verify(req).await
+                }
+            })
+            .await?;
+        let votes = runs.into_iter().map(|run| match run {
+            Err(e) => abstain(format!("the agent failed: {e:#}")),
+            Ok(run) => {
+                let vote = cast(&run);
+                let done = vote.verdict != Verdict::Abstained;
+                spent(
+                    events,
+                    &spec.resolver,
+                    SpendTask::Review,
+                    done,
+                    String::new(),
+                    &run,
+                );
+                vote
+            }
+        });
+        let verified = panel.verdict(votes.collect());
+        let held = format!("{}: {} of {} hold", f.id, verified.holds(), panel.seats);
+        event(events, "verified", held);
+        f.verified = Some(verified);
+    }
+    Ok(())
+}
+
+/// A verifier's vote, from how its run ended: one that broke or gave up abstains.
+fn cast(run: &Resolution) -> Vote {
+    match &run.outcome {
+        Outcome::Resolved => vote(&run.text),
+        Outcome::GaveUp(why) | Outcome::Failed(why) => abstain(why.clone()),
+    }
+}
+
+fn abstain(why: String) -> Vote {
+    Vote {
+        verdict: Verdict::Abstained,
+        why,
+    }
 }
 
 /// A file evidence may not write: one outside the repo, or one a fix may not change, which the
@@ -815,59 +1202,10 @@ fn unsafe_file(files: &[String]) -> Option<&str> {
                 || p.components()
                     .any(|c| !matches!(c, std::path::Component::Normal(_)))
                 || p.starts_with(".github")
+                || p.starts_with(".mergeloop")
                 || p.starts_with(".mergepatrol")
         })
         .map(String::as_str)
-}
-
-/// The fix starts from the review's tests for what it fixes, in place, as the review ran them.
-async fn apply_evidence(git: &Git, dir: &Path, findings: &[Finding]) -> Result<()> {
-    for e in shown(findings) {
-        if !e.patch.is_empty() {
-            git.apply(dir, &e.patch)
-                .await
-                .with_context(|| format!("the review's test for `{}` does not apply", e.command))?;
-        }
-    }
-    Ok(())
-}
-
-/// After the fix, each command that showed a finding passes, and the review's tests are as they
-/// were: checked once every command ran, as a command may write files too.
-async fn evidence_passes(
-    git: &Git,
-    dir: &Path,
-    findings: &[Finding],
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    for e in shown(findings) {
-        event(events, "evidence", e.command.as_str());
-        let ran = run_command(dir, &e.command).await?;
-        if !ran.passed {
-            bail!(
-                "`{}` still fails after the fix:\n```\n{}\n```",
-                e.command,
-                ran.tail
-            );
-        }
-    }
-    for e in shown(findings) {
-        if !e.patch.is_empty() && !git.holds(dir, &e.patch).await? {
-            bail!(
-                "the fix changed the review's test in {}",
-                e.files.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-/// The evidence MergeLoop saw fail, of the findings that have it.
-fn shown(findings: &[Finding]) -> impl Iterator<Item = &Evidence> {
-    findings
-        .iter()
-        .filter_map(|f| f.evidence.as_ref())
-        .filter(|e| e.failed)
 }
 
 /// How a command ran: whether it passed, and the end of what it printed.
@@ -994,12 +1332,50 @@ mod tests {
     #[test]
     fn a_review_reads_from_the_agents_json_in_or_out_of_a_code_block() {
         let text = "Here it is:\n```json\n{\"summary\": \"s\", \"findings\": [{\"kind\": \"security\", \"title\": \"t\", \"file\": \"a.rs\", \"line\": 3, \"confidence\": 70, \"lean\": \"fine\", \"finding\": \"f\"}, {\"kind\": \"other\", \"title\": \" \", \"confidence\": 90, \"lean\": \"fine\", \"finding\": \"\"}]}\n```";
-        let r = parse_review(text).unwrap();
+        let r = parse_review(&Outcome::Resolved, text).unwrap();
         assert_eq!(r.summary, "s");
         assert_eq!(r.findings.len(), 1, "a finding without a title is dropped");
+        assert_eq!(r.findings[0].id, "f1");
+        let sure = text.replace("\"confidence\": 70", "\"confidence\": 150");
+        let r = parse_review(&Outcome::Resolved, &sure).unwrap();
+        assert_eq!(r.findings[0].confidence, 100, "a percent is at most 100");
         assert_eq!(r.findings[0].kind, mergepatrol_core::Kind::Security);
         assert_eq!(r.findings[0].line, Some(3));
-        assert!(parse_review("I could not review it.").is_err());
+        assert!(parse_review(&Outcome::Resolved, "I could not review it.").is_err());
+        let gave_up = Outcome::GaveUp("no access".into());
+        let why = parse_review(&gave_up, text).unwrap_err().to_string();
+        assert_eq!(why, "the agent gave up: no access");
+    }
+
+    #[tokio::test]
+    async fn the_queues_commits_since_an_approval_its_rebase_left_behind_count_from_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = |cmd: &str| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{cmd}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        sh(
+            "git init -q && git config user.email t@t && git config user.name t \
+            && git commit -q --allow-empty -m base \
+            && git commit -q --allow-empty -m pr \
+            && git commit -q --allow-empty -m 'fix: lint' -m 'Fixed-by: mergeloop'",
+        );
+        let (base, head) = (sh("git rev-parse HEAD~2"), sh("git rev-parse HEAD"));
+        let commits = |since| queue_commits(&Git, dir.path(), &head, &base, since);
+        assert!(commits(None).await.unwrap().is_empty());
+        // Approved at the PR's commit: only the queue's fix since.
+        let pr = sh("git rev-parse HEAD~1");
+        assert_eq!(commits(Some(&pr)).await.unwrap().len(), 1);
+        // A head the rebase left behind, not in this history: every fix since the base.
+        let gone = "0123456789abcdef0123456789abcdef01234567";
+        let all = commits(Some(gone)).await.unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].ends_with("fix: lint"));
     }
 
     #[test]
@@ -1020,6 +1396,357 @@ mod tests {
                 (LineKind::Added, Some(12), "more"),
                 (LineKind::Context, Some(13), "keep2"),
             ]
+        );
+    }
+
+    /// A verifier that says what it saw, and votes as its seat is told to.
+    struct Panelist {
+        votes: [&'static str; 3],
+        seen: std::sync::Mutex<Vec<(PathBuf, String, bool, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Resolver for Panelist {
+        fn name(&self) -> String {
+            "panelist".into()
+        }
+        async fn resolve(&self, _: ResolveRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn fix(&self, _: FixRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn review(&self, _: ReviewRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn question(&self, _: QuestionRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn verify(&self, req: VerifyRequest<'_>) -> Result<Resolution> {
+            let head = req.workdir.join("a.txt").exists();
+            let left = req.workdir.join("left.txt").exists();
+            let dir = req.workdir.to_owned();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((dir.clone(), req.claim.to_owned(), head, left));
+            let seat: usize = dir
+                .to_string_lossy()
+                .rsplit("seat")
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let (outcome, text) = match self.votes[seat - 1] {
+                "broke" => (Outcome::Failed("over its turns".into()), String::new()),
+                v => (Outcome::Resolved, format!("I read it.\n{v}")),
+            };
+            Ok(Resolution {
+                turns: 2,
+                cost_usd: Some(0.5),
+                outcome,
+                text,
+            })
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn fresh_agents_each_check_a_security_change_on_its_own_and_their_votes_decide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        git(&dir, &["add", "."]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        );
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        // What the reviewer left in the checkout.
+        std::fs::write(dir.join("left.txt"), "the reviewer's notes").unwrap();
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "repo": "o/r", "clone_url": "", "token": "", "head_ref": "refs/heads/x",
+            "head_sha": head, "trunk": "main", "trunk_sha": head, "pr_title": "t",
+            "pr_body": "", "verify": [],
+            "resolver": { "model": "m", "effort": "e", "timeout_secs": 1, "max_turns": 1, "api": null },
+        }))
+        .unwrap();
+        let review: ReviewOutput = serde_json::from_value(serde_json::json!({
+            "summary": "s",
+            "findings": [
+                { "id": "f1", "kind": "security", "title": "The token leaks", "confidence": 90,
+                  "lean": "change", "finding": "It is logged.", "unsure": "the log level",
+                  "verified": { "by": "merge_loop", "needed": 1, "votes": [{ "verdict": "holds" }] } },
+                { "id": "f2", "kind": "other", "title": "Off by one", "confidence": 90,
+                  "lean": "change", "finding": "It skips the last.",
+                  "verified": { "by": "merge_loop", "needed": 1, "votes": [{ "verdict": "holds" }] } },
+            ],
+        }))
+        .unwrap();
+        let mut findings = review.findings;
+        let panelist = Panelist {
+            votes: [
+                mergepatrol_resolver::HOLDS,
+                mergepatrol_resolver::DOES_NOT_HOLD,
+                "broke",
+            ],
+            seen: Default::default(),
+        };
+        let bench = Bench {
+            git: &Git,
+            dir: &dir,
+            head: &head,
+        };
+        let mut events = Vec::new();
+        let out = tmp.path().join("out");
+        verify_findings(
+            (&spec, &panelist, "base"),
+            &bench,
+            &out,
+            Depth::Standard,
+            &mut findings,
+            &mut events,
+        )
+        .await
+        .unwrap();
+
+        let seen = panelist.seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 3, "only the security change is checked");
+        let mut trees: Vec<&PathBuf> = seen.iter().map(|s| &s.0).collect();
+        trees.dedup();
+        assert_eq!(trees.len(), 3, "each in a checkout of its own");
+        for (tree, claim, head, left) in &seen {
+            assert!(*head && !*left, "a clean checkout of the head: {tree:?}");
+            assert!(claim.contains("It is logged.") && !claim.contains("log level"));
+            assert!(!tree.exists(), "its checkout goes once it is done");
+        }
+        // The reviewer's own votes count for nothing; the panel's decide.
+        let v = findings[0].verified.as_ref().unwrap();
+        assert_eq!(v.needed, 2);
+        let mut cast: Vec<Verdict> = v.votes.iter().map(|v| v.verdict).collect();
+        cast.sort_by_key(|v| *v as u8);
+        assert_eq!(
+            cast,
+            [Verdict::Holds, Verdict::DoesNotHold, Verdict::Abstained]
+        );
+        assert!(!v.upheld());
+        assert_eq!(findings[1].verified, None);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "verified" && e.message == "f1: 1 of 3 hold")
+        );
+        let reviewed = events.iter().filter(|e| e.kind == "reviewed").count();
+        assert_eq!(reviewed, 2, "what each run that voted spent: {events:?}");
+    }
+
+    #[test]
+    fn only_a_changes_command_runs_and_none_that_writes_a_file_it_may_not() {
+        let with = |lean, command: &str, file: &str| Finding {
+            lean,
+            evidence: Some(mergepatrol_core::Evidence {
+                command: command.into(),
+                files: vec![file.into()],
+                ..mergepatrol_core::Evidence::default()
+            }),
+            ..serde_json::from_value(serde_json::json!({
+                "kind": "other", "title": "t", "confidence": 90, "lean": "change", "finding": "f"
+            }))
+            .unwrap()
+        };
+        assert!(runs_evidence(&with(Lean::Change, "sh t.sh", "t.sh")));
+        assert!(!runs_evidence(&with(Lean::Change, " ", "t.sh")));
+        assert!(!runs_evidence(&with(Lean::Fine, "sh t.sh", "t.sh")));
+        assert!(!runs_evidence(&with(
+            Lean::Change,
+            "sh t.sh",
+            ".github/t.sh"
+        )));
+    }
+
+    /// Reviewers that each find something of their own, by their seat, and a panel that agrees.
+    struct Reviewers {
+        seen: std::sync::Mutex<Vec<(PathBuf, Depth)>>,
+        votes: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Resolver for Reviewers {
+        fn name(&self) -> String {
+            "reviewers".into()
+        }
+        async fn resolve(&self, _: ResolveRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn fix(&self, _: FixRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn review(&self, req: ReviewRequest<'_>) -> Result<Resolution> {
+            let dir = req.workdir.to_owned();
+            self.seen.lock().unwrap().push((dir.clone(), req.depth));
+            let change = |title: &str, line: u32, evidence: serde_json::Value| {
+                serde_json::json!({
+                    "kind": "other", "title": title, "file": "a.txt", "line": line,
+                    "confidence": 90, "lean": "change", "finding": "f", "suggestion": "s",
+                    "evidence": evidence,
+                })
+            };
+            let seat = dir
+                .to_string_lossy()
+                .rsplit("seat")
+                .next()
+                .unwrap()
+                .to_owned();
+            let findings = match seat.as_str() {
+                "1" => {
+                    // Its test, in its own checkout.
+                    std::fs::write(dir.join("check.sh"), "exit 1\n").unwrap();
+                    let shown =
+                        serde_json::json!({ "command": "sh check.sh", "files": ["check.sh"] });
+                    vec![change("Off by one", 1, shown)]
+                }
+                "2" => vec![
+                    change("Skips the last", 2, serde_json::Value::Null),
+                    change("Null deref", 40, serde_json::Value::Null),
+                ],
+                _ => {
+                    return Ok(Resolution {
+                        turns: 1,
+                        cost_usd: Some(1.0),
+                        outcome: Outcome::Failed("over its turns".into()),
+                        text: String::new(),
+                    });
+                }
+            };
+            let text =
+                serde_json::json!({ "summary": format!("seat {seat}"), "findings": findings });
+            Ok(Resolution {
+                turns: 3,
+                cost_usd: Some(1.0),
+                outcome: Outcome::Resolved,
+                text: text.to_string(),
+            })
+        }
+        async fn question(&self, _: QuestionRequest<'_>) -> Result<Resolution> {
+            unreachable!()
+        }
+        async fn verify(&self, _: VerifyRequest<'_>) -> Result<Resolution> {
+            *self.votes.lock().unwrap() += 1;
+            Ok(Resolution {
+                turns: 2,
+                cost_usd: Some(0.5),
+                outcome: Outcome::Resolved,
+                text: format!("It is reached.\n{}", mergepatrol_resolver::HOLDS),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deep_review_merges_fresh_reviewers_findings_and_a_panel_votes_on_the_unshown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "a",
+            ],
+        );
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "repo": "o/r", "clone_url": "", "token": "", "head_ref": "refs/heads/x",
+            "head_sha": head, "trunk": "main", "trunk_sha": head, "pr_title": "t",
+            "pr_body": "", "verify": [],
+            "resolver": { "model": "m", "effort": "e", "timeout_secs": 1, "max_turns": 1, "api": null },
+        }))
+        .unwrap();
+        let reviewers = Reviewers {
+            seen: Default::default(),
+            votes: Default::default(),
+        };
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let mut events = Vec::new();
+        review(
+            &spec,
+            &Git,
+            &reviewers,
+            &Verify::None,
+            (&[], &[], Depth::Deep),
+            (None, None),
+            &dir,
+            &out,
+            &mut events,
+        )
+        .await
+        .unwrap();
+
+        let seen = reviewers.seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 3, "three reviewers");
+        let mut trees: Vec<&PathBuf> = seen.iter().map(|s| &s.0).collect();
+        trees.dedup();
+        assert_eq!(trees.len(), 3, "each in a checkout of its own");
+        assert!(seen.iter().all(|(t, d)| *d == Depth::Deep && !t.exists()));
+        let output: ReviewOutput =
+            serde_json::from_slice(&std::fs::read(out.join(REVIEW_FILE)).unwrap()).unwrap();
+        let titles: Vec<&str> = output.findings.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(titles, ["Off by one", "Null deref"], "one per issue");
+        assert_eq!(output.summary, "seat 1");
+        // The evidence one reviewer wrote in its own checkout ran, and showed the change.
+        let off = &output.findings[0];
+        assert_eq!(off.id, "f1");
+        assert!(off.evidence.as_ref().unwrap().failed, "{off:?}");
+        assert!(off.verified.is_none());
+        // A change of any kind that nothing ran shows goes to the panel.
+        let null = &output.findings[1];
+        assert_eq!(null.id, "f2");
+        assert!(null.verified.as_ref().unwrap().upheld());
+        assert_eq!(reviewers.votes.into_inner().unwrap(), 3);
+        // Each run's spend: two reviewers that reviewed, one that did not, three votes.
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind.ends_with("reviewed"))
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "reviewed").count(),
+            5,
+            "{events:?}"
+        );
+        assert_eq!(kinds.iter().filter(|k| **k == "unreviewed").count(), 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "reviewing" && e.message.ends_with("deep: 3 reviewers")),
+            "{events:?}"
         );
     }
 

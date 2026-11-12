@@ -4,16 +4,17 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use mergepatrol_core::{
-    FIXED_BY, Hold, LabelSpec, Labels, Person, PrNumber, PrSummary, RepoName, Review,
-};
+use mergepatrol_core::{Hold, LabelSpec, Labels, Person, PrNumber, PrSummary, RepoName, Review};
 
 use crate::Installation;
 use crate::app::AsUser;
 use crate::codeowners::{self, CodeOwners};
+use crate::setup::Verdict;
 
 /// Marks the one comment per PR that MergeLoop keeps up to date.
-const STICKY_MARKER: &str = "<!-- mergepatrol:status -->";
+const STICKY_MARKER: &str = "<!-- mergeloop:status -->";
+/// The mark of the comment MergeLoop kept as Mergepatrol, which it edits on and on.
+const LEGACY_STICKY_MARKER: &str = "<!-- mergepatrol:status -->";
 
 #[derive(Debug, Clone)]
 pub struct RepoSnapshot {
@@ -145,9 +146,13 @@ impl From<Actor> for Person {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReviewNode {
     state: String,
     author: Option<Actor>,
+    /// Whoever read the PR wrote it: read as the App, MergeLoop's own review.
+    #[serde(default)]
+    viewer_did_author: bool,
 }
 
 impl PullRequest {
@@ -203,14 +208,29 @@ impl PullRequest {
             .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
     }
 
-    /// Why GitHub would not merge this PR yet, if it would not.
+    /// Whether, read as the App, MergeLoop's own review asks for changes.
+    pub fn changes_requested_by_viewer(&self) -> bool {
+        self.details
+            .latest_opinionated_reviews
+            .iter()
+            .any(|r| r.state == "CHANGES_REQUESTED" && r.viewer_did_author)
+    }
+
+    /// Why GitHub would not merge this PR yet, if it would not. Changes only MergeLoop's own
+    /// review asks for are its review gate's to hold for, which dismisses them once it passes.
     pub fn hold_reason(&self) -> Option<Hold> {
         if self.is_draft {
             return Some(Hold::Draft);
         }
+        let only_ours = self.changes_requested_by_viewer()
+            && self
+                .details
+                .latest_opinionated_reviews
+                .iter()
+                .all(|r| r.state != "CHANGES_REQUESTED" || r.viewer_did_author);
         match self.review_decision() {
             Some("REVIEW_REQUIRED") => Some(Hold::ReviewRequired),
-            Some("CHANGES_REQUESTED") => Some(Hold::ChangesRequested),
+            Some("CHANGES_REQUESTED") if !only_ours => Some(Hold::ChangesRequested),
             _ => None,
         }
     }
@@ -251,6 +271,7 @@ impl PullRequest {
             checks: d.commits["nodes"][0]["commit"]["statusCheckRollup"]["state"]
                 .as_str()
                 .map(str::to_owned),
+            stack: Vec::new(),
         }
     }
 }
@@ -339,7 +360,7 @@ fn rejection(body: &Value) -> String {
 /// A PR's review threads, each with its first comment and its last.
 const THREADS: &str = "query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    reviewThreads(first: 100) { nodes { id isResolved
+    reviewThreads(first: 100) { nodes { id isResolved resolvedBy { login }
       first: comments(first: 1) { nodes { databaseId body author { login } } }
       last: comments(last: 1) { nodes { databaseId body author { login } } } } } } }
 }";
@@ -357,6 +378,8 @@ pub struct ReviewThread {
     /// Its GraphQL id, to resolve it by.
     pub id: String,
     pub resolved: bool,
+    /// Who resolved it, while it is resolved.
+    pub resolved_by: Option<String>,
     /// The comment that starts it, to reply to.
     pub comment_id: u64,
     pub body: String,
@@ -370,7 +393,7 @@ macro_rules! summary_fields {
         "number state title body isDraft isCrossRepository reviewDecision baseRefName headRefName headRefOid labels(first: 100) { nodes { name } } stack { number baseRefName }
   maintainerCanModify headRepository { nameWithOwner owner { __typename } }
   url createdAt additions deletions changedFiles author { __typename login avatarUrl }
-  latestOpinionatedReviews(first: 20) { nodes { state author { login avatarUrl } } }
+  latestOpinionatedReviews(first: 20) { nodes { state viewerDidAuthor author { login avatarUrl } } }
   reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login avatarUrl } } } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
     };
@@ -430,187 +453,6 @@ impl AsUser {
         Ok(serde_json::from_value(
             data["repository"]["pullRequests"]["nodes"].clone(),
         )?)
-    }
-}
-
-/// What the inbox reads of a PR: the dashboard's summary, and what it finds the PR by.
-const INBOX_FIELDS: &str = concat!(
-    summary_fields!(),
-    " updatedAt closedAt mergedAt repository { nameWithOwner defaultBranchRef { name } }
-  reviewThreads(first: 100) { nodes { isResolved } }
-  teamRequests: reviewRequests(first: 20) { nodes { requestedReviewer { ... on Team { slug } } } }
-  activity: timelineItems(last: 50, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW]) {
-    nodes { ... on IssueComment { createdAt author { login } } ... on PullRequestReview { createdAt author { login } } }
-  }"
-);
-
-/// The PRs the inbox reads in one query.
-const INBOX_PAGE: usize = 25;
-
-/// A PR as the inbox keeps it.
-#[derive(Debug, Clone)]
-pub struct InboxPull {
-    pub repo: RepoName,
-    pub pr: PullRequest,
-    /// `open`, `merged` or `closed`.
-    pub state: String,
-    pub updated_at: String,
-    /// When it merged or closed.
-    pub closed_at: Option<String>,
-    /// The teams asked to review, by slug.
-    pub requested_teams: Vec<String>,
-    /// Who commented or reviewed, and when, oldest first.
-    pub activity: Vec<(String, String)>,
-}
-
-impl InboxPull {
-    /// A PR node of [`Installation::inbox_pulls`] or [`Installation::open_inbox_pulls`].
-    pub fn from_node(node: &Value) -> Result<Self> {
-        let repo = node["repository"]["nameWithOwner"]
-            .as_str()
-            .and_then(RepoName::parse)
-            .context("a PR without its repo")?;
-        let str_at = |v: &Value| v.as_str().map(str::to_owned);
-        let nodes = |v: &Value| v["nodes"].as_array().cloned().unwrap_or_default();
-        Ok(InboxPull {
-            repo,
-            pr: serde_json::from_value(node.clone())?,
-            state: node["state"].as_str().unwrap_or("OPEN").to_lowercase(),
-            updated_at: str_at(&node["updatedAt"]).unwrap_or_default(),
-            closed_at: str_at(&node["mergedAt"]).or_else(|| str_at(&node["closedAt"])),
-            requested_teams: nodes(&node["teamRequests"])
-                .iter()
-                .filter_map(|r| str_at(&r["requestedReviewer"]["slug"]))
-                .collect(),
-            activity: nodes(&node["activity"])
-                .iter()
-                .filter_map(|a| Some((str_at(&a["author"]["login"])?, str_at(&a["createdAt"])?)))
-                .collect(),
-        })
-    }
-}
-
-impl Installation {
-    /// These PRs of the repo, as the inbox keeps them. `None` for one that is gone.
-    pub async fn inbox_pulls(
-        &self,
-        repo: &RepoName,
-        numbers: &[PrNumber],
-    ) -> Result<Vec<(PrNumber, Option<Value>)>> {
-        let mut out = Vec::new();
-        for chunk in numbers.chunks(INBOX_PAGE) {
-            let pulls: Vec<String> = chunk
-                .iter()
-                .map(|n| format!("p{n}: pullRequest(number: {n}) {{ {INBOX_FIELDS} }}"))
-                .collect();
-            let query = format!(
-                "query($owner: String!, $name: String!) {{
-                  repository(owner: $owner, name: $name) {{ {} }}
-                }}",
-                pulls.join("\n")
-            );
-            let data = self
-                .graphql_missing_ok(
-                    "inbox pulls",
-                    &query,
-                    json!({ "owner": repo.owner, "name": repo.name }),
-                )
-                .await?;
-            for &n in chunk {
-                let node = &data["repository"][format!("p{n}")];
-                out.push((n, (!node.is_null()).then(|| node.clone())));
-            }
-        }
-        Ok(out)
-    }
-
-    /// Every open PR of the repo, as the inbox keeps them.
-    pub async fn open_inbox_pulls(&self, repo: &RepoName) -> Result<Vec<Value>> {
-        let query = format!(
-            "query($owner: String!, $name: String!, $page: Int!, $after: String) {{
-              repository(owner: $owner, name: $name) {{
-                pullRequests(states: OPEN, first: $page, after: $after) {{
-                  nodes {{ {INBOX_FIELDS} }}
-                  pageInfo {{ hasNextPage endCursor }}
-                }}
-              }}
-            }}"
-        );
-        let mut pulls = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let data: Value = self
-                .graphql(
-                    "open inbox pulls",
-                    &query,
-                    json!({ "owner": repo.owner, "name": repo.name, "page": INBOX_PAGE, "after": after }),
-                )
-                .await?;
-            let page = &data["repository"]["pullRequests"];
-            pulls.extend(page["nodes"].as_array().cloned().unwrap_or_default());
-            if page["pageInfo"]["hasNextPage"] != true {
-                return Ok(pulls);
-            }
-            after = page["pageInfo"]["endCursor"].clone();
-        }
-    }
-
-    /// Each team of the organization, by slug, with its members' logins, child teams' too.
-    /// It takes the App's `members: read`: GitHub refuses without it.
-    pub async fn org_teams(&self, org: &str) -> Result<Vec<(String, Vec<String>)>> {
-        const TEAMS: &str = "query($org: String!, $after: String) {
-          organization(login: $org) {
-            teams(first: 50, after: $after) {
-              nodes { slug members(first: 100, membership: ALL) { nodes { login } pageInfo { hasNextPage endCursor } } }
-              pageInfo { hasNextPage endCursor }
-            }
-          }
-        }";
-        const MEMBERS: &str = "query($org: String!, $slug: String!, $after: String) {
-          organization(login: $org) {
-            team(slug: $slug) { members(first: 100, after: $after, membership: ALL) { nodes { login } pageInfo { hasNextPage endCursor } } }
-          }
-        }";
-        let logins = |members: &Value| -> Vec<String> {
-            members["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|m| m["login"].as_str().map(str::to_owned))
-                .collect()
-        };
-        let mut teams = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let data: Value = self
-                .graphql("org teams", TEAMS, json!({ "org": org, "after": after }))
-                .await?;
-            let page = &data["organization"]["teams"];
-            for team in page["nodes"].as_array().into_iter().flatten() {
-                let Some(slug) = team["slug"].as_str() else {
-                    continue;
-                };
-                let mut members = logins(&team["members"]);
-                let mut info = team["members"]["pageInfo"].clone();
-                while info["hasNextPage"] == true {
-                    let more: Value = self
-                        .graphql(
-                            "team members",
-                            MEMBERS,
-                            json!({ "org": org, "slug": slug, "after": info["endCursor"] }),
-                        )
-                        .await?;
-                    let page = &more["organization"]["team"]["members"];
-                    members.extend(logins(page));
-                    info = page["pageInfo"].clone();
-                }
-                teams.push((slug.to_owned(), members));
-            }
-            if page["pageInfo"]["hasNextPage"] != true {
-                return Ok(teams);
-            }
-            after = page["pageInfo"]["endCursor"].clone();
-        }
     }
 }
 
@@ -878,6 +720,20 @@ impl Installation {
         Ok(r["behind_by"].as_u64().context("behind_by")? > 0)
     }
 
+    /// What `head` changes since it left `base`, as an id that a restack keeps: two heads
+    /// with the same id change the same lines the same way. `None` when GitHub does not show
+    /// the whole diff.
+    pub async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        let r: Value = self
+            .rest(
+                Method::GET,
+                &format!("/repos/{repo}/compare/{base}...{head}"),
+                None,
+            )
+            .await?;
+        Ok(diff_id_of(&r))
+    }
+
     /// Whether workflow runs on `sha` wait for a maintainer to approve them, as GitHub has a
     /// fork PR's from an outside contributor.
     pub async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool> {
@@ -997,11 +853,22 @@ impl Installation {
         tree: &str,
         parent: &str,
     ) -> Result<String> {
+        self.create_commit_of(repo, message, tree, &[parent]).await
+    }
+
+    /// `create_commit` with each of `parents`, the first parent first: a merge commit.
+    pub async fn create_commit_of(
+        &self,
+        repo: &RepoName,
+        message: &str,
+        tree: &str,
+        parents: &[&str],
+    ) -> Result<String> {
         let r: Value = self
             .rest(
                 Method::POST,
                 &format!("/repos/{repo}/git/commits"),
-                Some(json!({ "message": message, "tree": tree, "parents": [parent] })),
+                Some(json!({ "message": message, "tree": tree, "parents": parents })),
             )
             .await?;
         Ok(r["sha"].as_str().context("commit sha")?.to_owned())
@@ -1015,26 +882,22 @@ impl Installation {
         before: &str,
         after: &str,
     ) -> Result<()> {
-        self.force_update_branches(repo_id, &[(branch, before, after)])
-            .await
+        let force = BranchMove {
+            branch,
+            before,
+            after,
+            force: true,
+        };
+        self.update_branches(repo_id, &[force]).await
     }
 
-    /// Moves each `(branch, before, after)`, all or none: `updateRefs` is atomic. It fails if a
-    /// branch is not at its `before`, also one whose `after` is the same.
-    pub async fn force_update_branches(
-        &self,
-        repo_id: &str,
-        moves: &[(&str, &str, &str)],
-    ) -> Result<()> {
+    /// Makes each move, all or none: `updateRefs` is atomic. It fails if a branch is not at its
+    /// `before`, also one whose `after` is the same.
+    pub async fn update_branches(&self, repo_id: &str, moves: &[BranchMove<'_>]) -> Result<()> {
         let query = "mutation($repo: ID!, $updates: [RefUpdate!]!) {
             updateRefs(input: { repositoryId: $repo, refUpdates: $updates }) { clientMutationId }
         }";
-        let updates: Vec<Value> = moves
-            .iter()
-            .map(|(branch, before, after)| {
-                json!({ "name": format!("refs/heads/{branch}"), "beforeOid": before, "afterOid": after, "force": true })
-            })
-            .collect();
+        let updates: Vec<Value> = moves.iter().map(BranchMove::ref_update).collect();
         let _: Value = self
             .graphql(
                 "update refs",
@@ -1195,42 +1058,31 @@ impl Installation {
         Ok(r["tree"]["sha"].as_str().context("commit tree")?.to_owned())
     }
 
-    /// The fix agent's commit `sha` as `git diff` prints it. `None` for any other commit, one
-    /// without the `FIXED_BY` trailer, or for no commit at all.
-    pub async fn fix_patch(&self, repo: &RepoName, sha: &str) -> Result<Option<String>> {
-        let res = self
-            .request(
-                Method::GET,
-                &format!("/repos/{repo}/git/commits/{sha}"),
-                None,
-            )
-            .await?;
-        if matches!(
-            res.status,
-            StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY
-        ) {
-            return Ok(None);
-        }
-        if !res.status.is_success() {
-            anyhow::bail!("get commit {sha}: {} {}", res.status, res.body);
-        }
-        let message = res.body["message"].as_str().context("commit message")?;
-        if !message.lines().any(|l| l.starts_with(FIXED_BY)) {
-            return Ok(None);
-        }
-        let path = format!("/repos/{repo}/commits/{sha}");
-        let (status, diff) = self.get_text(&path, "application/vnd.github.diff").await?;
-        if !status.is_success() {
-            anyhow::bail!("get the diff of {sha}: {status} {diff}");
-        }
-        Ok(Some(diff))
-    }
-
     /// Merges the PR through the asynchronous merge API, the only one GitHub offers for a stacked
     /// PR: for one, it merges every layer up to `number`, or none. Waits for the result. A merge
     /// already pending for the PR, from before a restart, is waited for rather than requested
     /// again.
     pub async fn merge(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        sha: &str,
+        method: &str,
+    ) -> Result<MergeOutcome> {
+        let outcome = self.request_merge(repo, number, sha, method).await;
+        if let Ok(MergeOutcome::Merged { .. }) = outcome {
+            return outcome;
+        }
+        // A merge can go through though GitHub says otherwise: a reply lost in a 502, a retry that
+        // found it merged already, or a merge GitHub reported failed after it applied.
+        match self.merged_as(repo, number, sha).await? {
+            Some(sha) => Ok(MergeOutcome::Merged { sha }),
+            None => outcome,
+        }
+    }
+
+    /// What GitHub answers the merge, once it has finished.
+    async fn request_merge(
         &self,
         repo: &RepoName,
         number: PrNumber,
@@ -1243,14 +1095,7 @@ impl Installation {
                 &format!("/repos/{repo}/pulls/{number}/merge-async"),
                 Some(json!({ "sha": sha, "merge_method": method, "merge_action": "direct_merge" })),
             )
-            .await;
-        // A merge can go through though its reply says otherwise: lost in a 502, or a retry that
-        // found it merged already.
-        let answered = matches!(&res, Ok(r) if matches!(r.status, StatusCode::OK | StatusCode::ACCEPTED | StatusCode::CONFLICT));
-        if !answered && let Some(sha) = self.merged_as(repo, number, sha).await? {
-            return Ok(MergeOutcome::Merged { sha });
-        }
-        let res = res?;
+            .await?;
         let mut result = match res.status {
             StatusCode::OK | StatusCode::ACCEPTED | StatusCode::CONFLICT => res.body,
             StatusCode::BAD_REQUEST
@@ -1389,14 +1234,15 @@ impl Installation {
         Ok(())
     }
 
-    /// Reviews the PR at `head` as the App, with `comments` on their lines. A comment with no
-    /// line is on its whole file. When GitHub turns a line down, as one outside the diff, the
-    /// comments go in the body instead.
+    /// Posts a review of `head` with `verdict`: its body, and a thread for each comment. A
+    /// request for changes GitHub turns down, on a PR the App opened, goes as a comment. A
+    /// comment GitHub turns down, on a line outside the diff, goes in the body.
     pub async fn review_lines(
         &self,
         repo: &RepoName,
         number: PrNumber,
         head: &str,
+        verdict: Verdict,
         body: &str,
         comments: &[ThreadComment],
     ) -> Result<()> {
@@ -1410,30 +1256,89 @@ impl Installation {
                 None => json!({ "path": c.path, "subject_type": "file", "body": c.body }),
             })
             .collect();
-        let review = |lines: &[Value], body: &str| json!({ "commit_id": head, "event": "COMMENT", "body": body, "comments": lines });
-        let res = self
-            .request(Method::POST, &path, Some(review(&lines, body)))
-            .await?;
-        if res.status.is_success() {
-            return Ok(());
-        }
-        if res.status != StatusCode::UNPROCESSABLE_ENTITY || comments.is_empty() {
-            anyhow::bail!("POST {path}: {} {}", res.status, res.body);
-        }
+        let event = |v: Verdict| match v {
+            Verdict::Approve => "APPROVE",
+            Verdict::RequestChanges => "REQUEST_CHANGES",
+            Verdict::Comment => "COMMENT",
+        };
         let all = with_comments(body, comments);
-        let _: Value = self
-            .rest(Method::POST, &path, Some(review(&[], &all)))
-            .await?;
-        Ok(())
+        let mut tries = vec![(verdict, json!(lines), body)];
+        if !comments.is_empty() {
+            tries.push((verdict, json!([]), all.as_str()));
+        }
+        if verdict != Verdict::Comment {
+            tries.push((Verdict::Comment, json!(lines), body));
+            if !comments.is_empty() {
+                tries.push((Verdict::Comment, json!([]), all.as_str()));
+            }
+        }
+        let mut last = None;
+        for (v, lines, body) in tries {
+            let review =
+                json!({ "commit_id": head, "event": event(v), "body": body, "comments": lines });
+            let res = self.request(Method::POST, &path, Some(review)).await?;
+            if res.status.is_success() {
+                return Ok(());
+            }
+            if res.status != StatusCode::UNPROCESSABLE_ENTITY {
+                anyhow::bail!("POST {path}: {} {}", res.status, res.body);
+            }
+            last = Some(format!("POST {path}: {} {}", res.status, res.body));
+        }
+        anyhow::bail!("{}", last.unwrap_or_default())
     }
 
-    /// The PR's review threads that start with a comment holding `mark`, up to 100: MergeLoop's
-    /// own, as its reviews post them.
+    /// Dismisses each request for changes on the PR whose body holds one of `marks`: MergeLoop's
+    /// own, once what it sent back no longer holds. How many it dismissed.
+    pub async fn dismiss_reviews_marked(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        marks: &[&str],
+        message: &str,
+    ) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct Review {
+            id: u64,
+            state: String,
+            #[serde(default)]
+            body: String,
+        }
+        let mut dismissed = 0;
+        for page in 1.. {
+            let reviews: Vec<Review> = self
+                .rest(
+                    Method::GET,
+                    &format!("/repos/{repo}/pulls/{number}/reviews?per_page=100&page={page}"),
+                    None,
+                )
+                .await?;
+            for r in reviews.iter().filter(|r| {
+                r.state == "CHANGES_REQUESTED" && marks.iter().any(|m| r.body.contains(m))
+            }) {
+                let _: Value = self
+                    .rest(
+                        Method::PUT,
+                        &format!("/repos/{repo}/pulls/{number}/reviews/{}/dismissals", r.id),
+                        Some(json!({ "message": message, "event": "DISMISS" })),
+                    )
+                    .await?;
+                dismissed += 1;
+            }
+            if reviews.len() < 100 {
+                break;
+            }
+        }
+        Ok(dismissed)
+    }
+
+    /// The PR's review threads that start with a comment holding one of `marks`, up to 100:
+    /// MergeLoop's own, as its reviews post them.
     pub async fn threads_marked(
         &self,
         repo: &RepoName,
         number: PrNumber,
-        mark: &str,
+        marks: &[&str],
     ) -> Result<Vec<ReviewThread>> {
         #[derive(Deserialize)]
         struct Data {
@@ -1458,6 +1363,7 @@ impl Installation {
         struct Thread {
             id: String,
             is_resolved: bool,
+            resolved_by: Option<Author>,
             first: Nodes<Comment>,
             last: Nodes<Comment>,
         }
@@ -1489,7 +1395,7 @@ impl Installation {
             .into_iter()
             .filter_map(|t| {
                 let first = t.first.nodes.into_iter().next()?;
-                if !first.body.contains(mark) {
+                if !marks.iter().any(|m| first.body.contains(m)) {
                     return None;
                 }
                 let last = t.last.nodes.into_iter().next();
@@ -1499,6 +1405,7 @@ impl Installation {
                 Some(ReviewThread {
                     id: t.id,
                     resolved: t.is_resolved,
+                    resolved_by: t.resolved_by.map(|a| a.login),
                     comment_id: first.database_id,
                     body: first.body,
                     reply,
@@ -1619,9 +1526,9 @@ impl Installation {
                 .iter()
                 .find(|c| {
                     c["user"]["type"] == "Bot"
-                        && c["body"]
-                            .as_str()
-                            .is_some_and(|b| b.starts_with(STICKY_MARKER))
+                        && c["body"].as_str().is_some_and(|b| {
+                            b.starts_with(STICKY_MARKER) || b.starts_with(LEGACY_STICKY_MARKER)
+                        })
                 })
                 .and_then(|c| c["id"].as_u64());
             if mine.is_some() || comments.len() < 100 {
@@ -1650,6 +1557,46 @@ impl Installation {
         }
         Ok(())
     }
+}
+
+/// The most files GitHub's compare lists: a diff with this many may have more.
+const COMPARE_FILES: usize = 300;
+
+/// The id of a compare's diff, from each file's name and patch. A hunk's line numbers are left
+/// out, as the layers below a stack layer move its lines without changing them. `None` when a
+/// file is too large for a patch, or the compare may list only some files.
+fn diff_id_of(compare: &Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let files = compare["files"].as_array()?;
+    if files.len() >= COMPARE_FILES {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    for f in files {
+        let patch = f["patch"].as_str();
+        // A text file too large to show has lines changed and no patch. A binary file, or a
+        // rename alone, has none: its content at the head stands for it.
+        if patch.is_none() && f["changes"].as_u64() != Some(0) {
+            return None;
+        }
+        let blob = if patch.is_none() { "sha" } else { "" };
+        for field in ["filename", "previous_filename", "status", blob] {
+            hash.update(f[field].as_str().unwrap_or("").as_bytes());
+            hash.update([0]);
+        }
+        for line in patch.unwrap_or("").lines() {
+            // `@@ -12,7 +12,9 @@ fn name` hashes as `@@ fn name`.
+            if let Some((_, after)) = line.strip_prefix("@@ ").and_then(|l| l.split_once(" @@")) {
+                hash.update(b"@@");
+                hash.update(after.as_bytes());
+            } else {
+                hash.update(line.as_bytes());
+            }
+            hash.update(b"\n");
+        }
+        hash.update([0]);
+    }
+    Some(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The most characters GitHub takes in a comment or a review's body.
@@ -1690,6 +1637,27 @@ fn fit_comment(text: &str) -> std::borrow::Cow<'_, str> {
         .take(COMMENT_CHARS - CUT.chars().count())
         .collect();
     format!("{keep}{CUT}").into()
+}
+
+/// A branch's move from `before` to `after`.
+pub struct BranchMove<'a> {
+    pub branch: &'a str,
+    pub before: &'a str,
+    pub after: &'a str,
+    /// `after` need not descend from `before`: a force-push, which a branch may forbid. A merge
+    /// of the base into the branch goes without.
+    pub force: bool,
+}
+
+impl BranchMove<'_> {
+    fn ref_update(&self) -> Value {
+        json!({
+            "name": format!("refs/heads/{}", self.branch),
+            "beforeOid": self.before,
+            "afterOid": self.after,
+            "force": self.force,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1792,46 +1760,6 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn an_inbox_pull_has_its_repo_state_teams_and_activity() {
-        let mut node: Value = serde_json::from_str(&pr_node(7)).unwrap();
-        node["state"] = json!("MERGED");
-        node["updatedAt"] = json!("u");
-        node["closedAt"] = json!("c");
-        node["mergedAt"] = json!("m");
-        node["repository"] = json!({ "nameWithOwner": "o/r" });
-        node["teamRequests"] = json!({ "nodes": [{ "requestedReviewer": { "slug": "core" } }, { "requestedReviewer": {} }] });
-        node["activity"] = json!({ "nodes": [
-            { "createdAt": "1", "author": { "login": "ann" } },
-            { "createdAt": "2", "author": null },
-        ] });
-        let p = InboxPull::from_node(&node).unwrap();
-        assert_eq!(p.repo.to_string(), "o/r");
-        assert_eq!(p.pr.number, 7);
-        assert_eq!(
-            (p.state.as_str(), p.closed_at.as_deref()),
-            ("merged", Some("m"))
-        );
-        assert_eq!(p.requested_teams, ["core"]);
-        assert_eq!(p.activity, [("ann".to_owned(), "1".to_owned())]);
-        assert!(InboxPull::from_node(&json!({})).is_err());
-    }
-
-    #[tokio::test]
-    async fn the_inbox_reads_pull_requests_in_one_query_and_a_missing_one_is_none() {
-        let (gh, requests) = fake::serve(vec![(
-            200,
-            "",
-            r#"{"data":{"repository":{"p1":{"number":1},"p2":null}},"errors":[{"type":"NOT_FOUND"}]}"#,
-        )])
-        .await;
-        let repo = RepoName::parse("o/r").unwrap();
-        let pulls = gh.inbox_pulls(&repo, &[1, 2]).await.unwrap();
-        assert_eq!(pulls[0].1.as_ref().unwrap()["number"], 1);
-        assert_eq!(pulls[1], (2, None));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-    }
-
     fn snapshot_page(numbers: std::ops::Range<u64>, next: Option<&str>) -> &'static str {
         let nodes: Vec<String> = numbers.map(pr_node).collect();
         let page_info = match next {
@@ -1869,8 +1797,9 @@ mod tests {
         let others: Vec<String> = (0..100)
             .map(|i| format!(r#"{{"id":{i},"user":{{"type":"User"}},"body":"lgtm"}}"#))
             .collect();
-        let mine =
-            format!(r#"[{{"id":4242,"user":{{"type":"Bot"}},"body":"{STICKY_MARKER}\nold"}}]"#);
+        let mine = format!(
+            r#"[{{"id":4242,"user":{{"type":"Bot"}},"body":"{LEGACY_STICKY_MARKER}\nold"}}]"#
+        );
         let (gh, requests) = fake::serve(vec![
             (200, "", leak(format!("[{}]", others.join(",")))),
             (200, "", leak(mine)),
@@ -1912,7 +1841,11 @@ mod tests {
     }
 
     async fn merge_answered(pr: &'static str) -> (MergeOutcome, Vec<String>) {
-        let (gh, requests) = fake::serve(vec![(405, "", NOT_MERGEABLE), (200, "", pr)]).await;
+        merge_replied((405, "", NOT_MERGEABLE), pr).await
+    }
+
+    async fn merge_replied(reply: fake::Scripted, pr: &'static str) -> (MergeOutcome, Vec<String>) {
+        let (gh, requests) = fake::serve(vec![reply, (200, "", pr)]).await;
         let repo = RepoName::parse("o/r").unwrap();
         let outcome = gh.merge(&repo, 7, "abc", "squash").await.unwrap();
         let requests = requests.lock().unwrap().clone();
@@ -1942,6 +1875,36 @@ mod tests {
         let (outcome, _) = merge_answered(pr).await;
         assert!(
             matches!(&outcome, MergeOutcome::Rejected(m) if m.contains("not mergeable")),
+            "{outcome:?}"
+        );
+    }
+
+    /// agent-labs-dev/nebula#11706: GitHub merged the PR, yet answered the merge with this.
+    const COULD_NOT_COMPLETE: &str = r#"{"status":"failed","details":{"message":"This merge could not be completed. Please try again."}}"#;
+
+    #[tokio::test]
+    async fn a_merge_github_reports_failed_counts_once_the_pr_shows_merged() {
+        let pr = r#"{"merged":true,"head":{"sha":"abc"},"merge_commit_sha":"m1"}"#;
+        let (outcome, requests) = merge_replied((202, "", COULD_NOT_COMPLETE), pr).await;
+        assert!(
+            matches!(&outcome, MergeOutcome::Merged { sha } if sha == "m1"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            requests,
+            [
+                "PUT /repos/o/r/pulls/7/merge-async HTTP/1.1",
+                "GET /repos/o/r/pulls/7 HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_github_reports_failed_stays_rejected_while_the_pr_is_open() {
+        let pr = r#"{"merged":false,"head":{"sha":"abc"},"merge_commit_sha":null}"#;
+        let (outcome, _) = merge_replied((202, "", COULD_NOT_COMPLETE), pr).await;
+        assert!(
+            matches!(&outcome, MergeOutcome::Rejected(m) if m == "This merge could not be completed. Please try again"),
             "{outcome:?}"
         );
     }
@@ -2004,6 +1967,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changes_only_mergeloop_asks_for_are_not_githubs_hold() {
+        let asked = |reviews: &str| {
+            leak(
+                UNREVIEWED
+                    .replace(
+                        r#""codeowners0":{"text":"/.github/ @joaquim-verges @jnsdls\n"}"#,
+                        r#""codeowners0":null"#,
+                    )
+                    .replace(
+                        r#""reviewDecision":null"#,
+                        r#""reviewDecision":"CHANGES_REQUESTED""#,
+                    )
+                    .replace(r#""latestOpinionatedReviews":{"nodes":[]}"#, reviews),
+            )
+        };
+        let ours = r#"{"state":"CHANGES_REQUESTED","viewerDidAuthor":true,"author":null}"#;
+        let theirs = r#"{"state":"CHANGES_REQUESTED","viewerDidAuthor":false,"author":null}"#;
+        let repo = RepoName::parse("o/r").unwrap();
+        for (nodes, by_us, hold) in [
+            (format!("[{ours}]"), true, None),
+            (
+                format!("[{ours},{theirs}]"),
+                true,
+                Some(Hold::ChangesRequested),
+            ),
+            (format!("[{theirs}]"), false, Some(Hold::ChangesRequested)),
+        ] {
+            let reviews = format!(r#""latestOpinionatedReviews":{{"nodes":{nodes}}}"#);
+            let (gh, _) = fake::serve(vec![(200, "", asked(&reviews))]).await;
+            let pr = gh.pull_request(&repo, 11186).await.unwrap();
+            assert_eq!(pr.changes_requested_by_viewer(), by_us, "{nodes}");
+            assert_eq!(pr.hold_reason(), hold, "{nodes}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_mergeloops_own_requests_for_changes_are_dismissed() {
+        let reviews = r#"[
+            {"id":1,"state":"CHANGES_REQUESTED","body":"**MergeLoop's review** <!-- mark -->"},
+            {"id":2,"state":"CHANGES_REQUESTED","body":"a human's"},
+            {"id":3,"state":"COMMENTED","body":"<!-- mark -->"}
+        ]"#;
+        let (gh, requests) = fake::serve(vec![(200, "", reviews), (200, "", "{}")]).await;
+        let repo = RepoName::parse("o/r").unwrap();
+        let dismissed = gh.dismiss_reviews_marked(&repo, 7, &["<!-- mark -->"], "cleared");
+        assert_eq!(dismissed.await.unwrap(), 1);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                "GET /repos/o/r/pulls/7/reviews?per_page=100&page=1 HTTP/1.1",
+                "PUT /repos/o/r/pulls/7/reviews/1/dismissals HTTP/1.1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_github_turns_down_goes_in_the_body_of_a_request_for_changes() {
+        let (gh, requests) = fake::serve_whole(vec![(422, "", "{}"), (200, "", "{}")]).await;
+        let repo = RepoName::parse("o/r").unwrap();
+        let line = ThreadComment {
+            path: "a.rs".into(),
+            line: Some(9),
+            body: "the finding".into(),
+        };
+        let lines = [line];
+        let posted = gh.review_lines(&repo, 7, "abc", Verdict::RequestChanges, "body", &lines);
+        posted.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let last = &requests[1];
+        assert!(last.contains(r#""event":"REQUEST_CHANGES""#), "{last}");
+        assert!(
+            last.contains(r#""comments":[]"#) && last.contains("the finding"),
+            "{last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_for_changes_github_turns_down_goes_as_a_comment() {
+        let (gh, requests) = fake::serve_whole(vec![(422, "", "{}"), (200, "", "{}")]).await;
+        let repo = RepoName::parse("o/r").unwrap();
+        gh.review_lines(&repo, 7, "abc", Verdict::RequestChanges, "body", &[])
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[0].contains(r#""event":"REQUEST_CHANGES""#),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains(r#""event":"COMMENT""#),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
     async fn the_default_branch_code_owners_do_not_hold_a_pr_into_another_branch() {
         let into_release =
             UNREVIEWED.replace(r#""baseRefName":"main""#, r#""baseRefName":"release""#);
@@ -2018,11 +2079,11 @@ mod tests {
         let pr: PullRequest = serde_json::from_value(json!({
             "number": 7, "state": "OPEN", "title": "Fix it", "body": "", "isDraft": false,
             "isCrossRepository": false, "reviewDecision": "APPROVED", "baseRefName": "main",
-            "headRefName": "fix", "headRefOid": "abc", "labels": { "nodes": [{ "name": "mergepatrol" }] },
+            "headRefName": "fix", "headRefOid": "abc", "labels": { "nodes": [{ "name": "mergeloop" }] },
             "files": { "nodes": [{ "path": "src/a.rs" }] },
             "url": "https://github.com/o/r/pull/7", "createdAt": "2026-10-01T00:00:00Z",
             "additions": 3, "deletions": 1, "changedFiles": 2,
-            "author": { "__typename": "Bot", "login": "merge-patrol", "avatarUrl": "m" },
+            "author": { "__typename": "Bot", "login": "mergeloop", "avatarUrl": "m" },
             "latestOpinionatedReviews": { "nodes": [
                 { "state": "APPROVED", "author": { "login": "ann", "avatarUrl": "a" } },
                 { "state": "CHANGES_REQUESTED", "author": null },
@@ -2034,7 +2095,7 @@ mod tests {
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "PENDING" } } }] },
             "fixCommits": { "nodes": [
                 { "commit": { "message": "the author's" } },
-                { "commit": { "message": "Fix ci\n\nFixed-by: mergepatrol, a" } },
+                { "commit": { "message": "Fix ci\n\nFixed-by: mergeloop, a" } },
             ] },
         }))
         .unwrap();
@@ -2064,31 +2125,65 @@ mod tests {
         assert_eq!(s.fixes, 1);
     }
 
-    const FIX_COMMIT: &str = r#"{"message":"Fix test\n\nFixed-by: mergepatrol, claude (claude-opus-5-5)\nCo-authored-by: mergepatrol <m@x>"}"#;
-    const FIX_DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n";
+    fn compare(files: Value) -> Value {
+        json!({ "behind_by": 0, "files": files })
+    }
 
-    #[tokio::test]
-    async fn a_fix_commit_comes_back_as_its_diff() {
-        let (gh, requests) = fake::serve(vec![(200, "", FIX_COMMIT), (200, "", FIX_DIFF)]).await;
-        let repo = RepoName::parse("o/r").unwrap();
-        let patch = gh.fix_patch(&repo, "abc").await.unwrap().unwrap();
-        assert_eq!(patch, FIX_DIFF);
-        assert_eq!(
-            *requests.lock().unwrap(),
-            [
-                "GET /repos/o/r/git/commits/abc HTTP/1.1",
-                "GET /repos/o/r/commits/abc HTTP/1.1",
-            ]
+    fn file(name: &str, patch: &str) -> Value {
+        json!({ "filename": name, "status": "modified", "changes": 2, "patch": patch })
+    }
+
+    #[test]
+    fn a_restack_that_moves_a_layers_lines_keeps_its_diff_id() {
+        let at_12 = compare(json!([file("a.rs", "@@ -12,2 +12,2 @@ fn f\n-old\n+new")]));
+        let at_40 = compare(json!([file("a.rs", "@@ -40,2 +40,2 @@ fn f\n-old\n+new")]));
+        assert!(diff_id_of(&at_12).is_some());
+        assert_eq!(diff_id_of(&at_12), diff_id_of(&at_40));
+
+        let other = compare(json!([file(
+            "a.rs",
+            "@@ -12,2 +12,2 @@ fn f\n-old\n+newer"
+        )]));
+        assert_ne!(diff_id_of(&at_12), diff_id_of(&other), "a changed line");
+        let elsewhere = compare(json!([file("b.rs", "@@ -12,2 +12,2 @@ fn f\n-old\n+new")]));
+        assert_ne!(diff_id_of(&at_12), diff_id_of(&elsewhere), "another file");
+
+        // The context places the edit: the same lines put elsewhere in the file are another
+        // change, so a change in the context is reviewed again, as it may be one.
+        let here = compare(json!([file(
+            "a.rs",
+            "@@ -12,3 +12,3 @@\n read();\n-old\n+new"
+        )]));
+        let there = compare(json!([file(
+            "a.rs",
+            "@@ -40,3 +40,3 @@\n delete();\n-old\n+new"
+        )]));
+        assert_ne!(
+            diff_id_of(&here),
+            diff_id_of(&there),
+            "the same lines elsewhere"
         );
     }
 
-    #[tokio::test]
-    async fn only_the_fix_agents_commits_have_a_fix_patch() {
-        let theirs = r#"{"message":"feat: x"}"#;
-        let missing = r#"{"message":"No commit found for SHA: abc"}"#;
-        let (gh, _) = fake::serve(vec![(200, "", theirs), (422, "", missing)]).await;
-        let repo = RepoName::parse("o/r").unwrap();
-        assert!(gh.fix_patch(&repo, "abc").await.unwrap().is_none());
-        assert!(gh.fix_patch(&repo, "abc").await.unwrap().is_none());
+    #[test]
+    fn a_diff_github_does_not_show_whole_has_no_id() {
+        let binary =
+            |sha| json!({ "filename": "a.png", "status": "modified", "changes": 0, "sha": sha });
+        let renamed = &json!({ "filename": "b.rs", "previous_filename": "a.rs",
+            "status": "renamed", "changes": 0, "sha": "s" });
+        let id = diff_id_of(&compare(json!([binary("1"), renamed])));
+        assert!(id.is_some());
+        assert_ne!(
+            id,
+            diff_id_of(&compare(json!([binary("2"), renamed]))),
+            "another image"
+        );
+
+        let large = json!({ "filename": "big.rs", "status": "modified", "changes": 9000 });
+        assert_eq!(diff_id_of(&compare(json!([large]))), None);
+        let many: Vec<Value> = (0..COMPARE_FILES)
+            .map(|i| file(&format!("{i}.rs"), "+x"))
+            .collect();
+        assert_eq!(diff_id_of(&compare(Value::Array(many))), None);
     }
 }

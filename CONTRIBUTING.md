@@ -24,6 +24,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 A dashboard feature is a route in `crates/web/src/routes.rs`, with the MCP tool that calls it, so agents can do what the dashboard does. `AGENTS.md` says how.
 
+Agent runs are priced from `PRICES` in `crates/core/src/price.rs`. A test fails while a model in the settings has no price, so adding a model means adding its price, from the vendor's pricing page. When Anthropic or OpenAI changes a price, update the table and the date it was checked, and add a changelog entry.
+
 The tests marked `#[ignore]` need Docker images, or a real Anthropic API key. Each one says how to run it.
 
 ## Pull requests

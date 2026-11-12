@@ -6,6 +6,7 @@ mod closing;
 mod hold;
 mod job;
 mod lane;
+mod price;
 mod repo_config;
 mod review;
 mod spend;
@@ -17,16 +18,19 @@ pub use hold::Hold;
 pub use job::{CHECKS_MISSING_FOR, CHECKS_TIMEOUT, EjectReason, Event, Job, Phase, Transition};
 pub use lane::{
     BatchStep, Bisect, BuiltBatch, Candidate, Entry, EntryState, Lane, LaneChange, LayerHead,
-    PendingMerge, Person, PrSummary, Review, Stage,
+    LayerSummary, PendingMerge, Person, PrSummary, Review, Stage,
 };
+pub use price::{Price, Usage};
 pub use repo_config::{
-    AgentSettings, EFFORTS, FixCiSettings, LabelSpec, Labels, ModelOverrides, REPO_CONFIG_PATH,
-    RepoSettings, Runs, TaskModel, WorkspaceDefaults,
+    AgentSettings, ConfigPath, ConfigText, DEFAULT_LABEL, EFFORTS, FixCiSettings, LabelSpec,
+    Labels, ModelOverrides, REPO_CONFIG_PATH, RepoSettings, TaskModel, WorkspaceDefaults,
 };
 pub use review::{
-    Answer, Answered, Bar, CodeLine, Evidence, Finding, Judged, Kind, Lean, LineKind, Question,
-    Related, ReviewOverrides, ReviewSettings, ReviewStatus, Route, SentBack, review_status,
-    review_url,
+    Answer, Answered, Bar, CodeLine, Depth, Evidence, FINDING_MARKS, Finding, Judged, Kind, Lean,
+    LineKind, Outcome, Panel, Place, Question, REPLY_MARKS, Related, ReviewOverrides,
+    ReviewSettings, ReviewStatus, Route, SentBack, Settled, TITLE_CHARS, Verdict, Verification,
+    Vote, carry_back, clip, dismiss_sent_back, finding_title, merge_reviews, most_first,
+    newly_settled, review_status, settle_answers, settled_by, thread_title,
 };
 pub use spend::{Spend, SpendTask};
 pub use steps::{Step, StepTimes, current_step, step_times};
@@ -36,23 +40,41 @@ use serde::{Deserialize, Serialize};
 pub type PrNumber = u64;
 
 /// The trailer on every commit the fix agent makes, before the agent's name.
-pub const FIXED_BY: &str = "Fixed-by: mergepatrol";
+pub const FIXED_BY: &str = "Fixed-by: mergeloop";
 /// The trailer of a commit whose conflict the agent resolved in a rebase.
-pub const RESOLVED_BY: &str = "Resolved-by: mergepatrol";
+pub const RESOLVED_BY: &str = "Resolved-by: mergeloop";
+/// The trailer of the merge commit that brought a PR up to date with its base.
+pub const UPDATED_BY: &str = "Updated-by: mergeloop";
+/// Every trailer of the agent's commits, with those it wrote as Mergepatrol, which a PR's older
+/// commits still carry.
+pub const AGENT_TRAILERS: [&str; 4] = [
+    FIXED_BY,
+    RESOLVED_BY,
+    "Fixed-by: mergepatrol",
+    "Resolved-by: mergepatrol",
+];
+
+/// Whether `message` is of a commit the fix agent made.
+pub fn fixed_by_agent(message: &str) -> bool {
+    message
+        .lines()
+        .any(|l| l.starts_with(FIXED_BY) || l.starts_with("Fixed-by: mergepatrol"))
+}
 /// The empty commit that runs a PR's checks again.
 pub const RECHECK_MESSAGE: &str =
     "Run the checks again\n\nThe agent found nothing to fix in the code.";
 
 /// How many of a PR's fix budget its commits have used, from `messages`, newest first: the
 /// agent's fixes on top of the PR. The author's next commit ends the count, so new code earns new
-/// fixes, and the commits themselves survive a restart or a rebase.
+/// fixes, and the commits themselves survive a restart, a rebase, or a merge of the base.
 pub fn fixes_used<'a>(messages: impl IntoIterator<Item = &'a str>) -> u32 {
     let mut used = 0;
     for message in messages {
-        if message.lines().any(|l| l.starts_with(FIXED_BY)) {
+        if fixed_by_agent(message) {
             used += 1;
         // A rebase's rewrite adds trailers after it.
-        } else if !message.starts_with(RECHECK_MESSAGE) {
+        } else if !message.starts_with(RECHECK_MESSAGE) && !message.lines().any(|l| l == UPDATED_BY)
+        {
             break;
         }
     }
@@ -191,12 +213,18 @@ mod tests {
 
     #[test]
     fn the_budget_counts_the_agents_fixes_on_top_of_the_authors_last_commit() {
-        let fix = "Fix ci\n\nFixed-by: mergepatrol, claude";
-        assert_eq!(fixes_used([fix, RECHECK_MESSAGE, fix, "the author's"]), 2);
+        let fix = "Fix ci\n\nFixed-by: mergeloop, claude";
+        let legacy = "Fix ci\n\nFixed-by: mergepatrol, claude";
+        assert_eq!(
+            fixes_used([fix, RECHECK_MESSAGE, legacy, "the author's"]),
+            2
+        );
         assert_eq!(fixes_used(["the author's", fix, fix]), 0);
         let rewritten = format!("{RECHECK_MESSAGE}\n\nCo-authored-by: a <a@example.com>");
         assert_eq!(fixes_used([rewritten.as_str(), fix]), 1);
         assert_eq!(fixes_used([]), 0);
+        let merged = format!("Merge main into pr\n\n{UPDATED_BY}");
+        assert_eq!(fixes_used([merged.as_str(), fix, "the author's"]), 1);
     }
 
     #[test]

@@ -33,16 +33,26 @@ Cloudflare redirects the old domain's pages, once the deployment is live. In the
 3. Rules > Redirect Rules: add a rule with this expression:
 
    ```
-   (http.host eq "mergepatrol.ai" and not starts_with(http.request.uri.path, "/api")
+   (http.host eq "mergepatrol.ai" and http.request.method in {"GET" "HEAD"}
+    and not starts_with(http.request.uri.path, "/api")
     and not starts_with(http.request.uri.path, "/mcp")
-    and not starts_with(http.request.uri.path, "/webhooks"))
+    and not starts_with(http.request.uri.path, "/webhooks")
+    and not starts_with(http.request.uri.path, "/.well-known"))
    ```
+
+   Only reads redirect. A client follows a 301 or 302 with a GET, and a 307 or 308 drops the
+   Authorization header at another host, so the old origin keeps answering every other method:
+   the menu bar app's `POST /auth/tray/token`, an MCP client's `POST /oauth/token` and
+   `/oauth/register`, and `POST /auth/logout`. Sign-in pages (`/auth/login`, `/oauth/authorize`)
+   do redirect: their cookies must be set on `mergeloop.ai`, where GitHub's callback lands. MCP
+   clients need not follow a redirect for the OAuth metadata under `/.well-known`, which names
+   `mergeloop.ai` either way.
 
    Its URL redirect is Dynamic, to `concat("https://mergeloop.ai", http.request.uri.path)`,
    status 302, with **Preserve query string** on. Make it 301 once the new domain has settled.
 
 The proxy also sends GitHub's webhooks through Cloudflare, so Bot Fight Mode must stay off in
-this zone. Pointing the App's webhook URL at `https://mergeloop.ai/webhooks` removes that
+this zone. Pointing the App's webhook URL at `https://mergeloop.ai/webhooks/github` removes that
 dependency.
 
 After the rule is on, verify a deep link with a query, sign-in, installation return, and a
@@ -53,10 +63,12 @@ curl -I 'https://mergepatrol.ai/docs/configuration?source=old-link'
 curl -I 'http://mergepatrol.ai/docs/configuration?source=old-link'
 curl -I https://mergeloop.ai/
 curl -i https://mergepatrol.ai/api/session
+curl -i -X POST https://mergepatrol.ai/oauth/token
 ```
 
 The first two return 302 with Location
-`https://mergeloop.ai/docs/configuration?source=old-link`; the latter two return 200.
+`https://mergeloop.ai/docs/configuration?source=old-link`; the next two return 200, and the
+last is the app's own 4xx, not a redirect.
 The new origin's `/auth/login` must send `redirect_uri=https://mergeloop.ai/auth/callback`
 to GitHub, and sign-in must complete in a browser. People sign in again on the new origin:
 the browser cannot carry a host-only session cookie between these domains.
@@ -70,10 +82,12 @@ deploy's workload identity matches the repo's ID, not its name. Releases name th
 container images after the repo, so the next one publishes `ghcr.io/agent-labs-dev/mergeloop`
 and `-job`; the `mergepatrol` images keep their tags but get no new ones.
 
-Compatibility names intentionally retained in code: Rust packages and binaries, the
-Artifact Registry images and GCP resources, `MERGEPATROL_*` settings, `mergepatrol`
-queue labels, `.mergepatrol/mergepatrol.yml`, API fields, Git refs, comment markers, the
-`mergepatrol` skill name and installed paths, the menu bar app's bundle ID and Keychain
-service, and the rolling `Mergepatrol.zip` download URL. Its bundle is now `MergeLoop.app`.
-Existing social-card URLs serve the new artwork. Past changelog screenshots remain records
-of the UI at the time. None of these identifiers should be renamed as a string replacement.
+What users see says `mergeloop`: new repos get `.mergeloop/mergeloop.yml` and the `mergeloop`
+labels, and MergeLoop's branches, commit trailers, comment markers, agent skill and API fields
+use the new name. MergeLoop still reads what it wrote as Mergepatrol: a config file at
+`.mergepatrol/mergepatrol.yml`, which keeps `mergepatrol` as its default label, `Fixed-by:` and
+`Resolved-by: mergepatrol` trailers, and its old comment markers. Updating a repo's skill moves
+it from `skills/mergepatrol`. Internal names stay: Rust packages and binaries, the Artifact
+Registry images and GCP resources, `MERGEPATROL_*` settings, Git refs under the queue's cache, the
+menu bar app's bundle ID and Keychain service. Existing social-card URLs moved to
+`/og/mergeloop-og-*`. Past changelog screenshots remain records of the UI at the time.

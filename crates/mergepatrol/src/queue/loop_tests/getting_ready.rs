@@ -9,16 +9,21 @@ use std::pin::Pin;
 use std::process::{Command, Stdio};
 
 use base64::Engine;
-use mergepatrol_core::FIXED_BY;
-use mergepatrol_executor::protocol::JobResult;
+use mergepatrol_core::{FIXED_BY, Outcome, Settled, UPDATED_BY};
+use mergepatrol_executor::TimedOut;
+use mergepatrol_executor::protocol::{JobResult, Update};
 use mergepatrol_git::cache_path;
 use serde_json::{Value, json};
 use tokio::sync::Barrier;
 
 use super::*;
 use crate::job::LEFT_CONFLICT;
-use crate::review::{conclude, fix_sent_back, hold_for_fix};
+use crate::review::conclude;
 use mergepatrol_executor::protocol::ReviewOutput;
+
+mod outcomes_after_intervening_review;
+mod outcomes_regression;
+mod timeout_token_regression;
 
 /// How long a scenario may take to end. It ends far sooner, or it is stuck.
 const SETTLES_WITHIN: Duration = Duration::from_secs(60);
@@ -72,7 +77,11 @@ struct Agent {
     during: Mutex<VecDeque<During>>,
     /// Why the agent cannot do any job, if it cannot.
     fails: Mutex<Option<String>>,
+    /// How many of the next jobs run out of time.
+    times_out: Mutex<u32>,
     tasks: Mutex<Vec<Task>>,
+    /// How each rebase job was asked to update its branch.
+    updates: Mutex<Vec<Update>>,
 }
 
 impl Agent {
@@ -83,6 +92,11 @@ impl Agent {
         if !matches!(spec.task, Task::Rebase) {
             commit(dir, "fix.txt", "fixed\n", &format!("Fix it\n\n{FIXED_BY}"));
             return Ok(Vec::new());
+        }
+        let range = format!("{}..HEAD", spec.trunk_sha);
+        let has_merges = !git(dir, &["rev-list", "--merges", &range]).is_empty();
+        if spec.update == Update::Merge || (spec.update == Update::Either && has_merges) {
+            return self.merge(spec, dir);
         }
         let upstream = match &spec.upstream {
             Some(upstream) => upstream.clone(),
@@ -116,15 +130,54 @@ impl Agent {
             message: conflicts,
         }])
     }
+
+    /// Merges the base into the branch, as the job does, resolving its conflict once.
+    fn merge(&self, spec: &JobSpec, dir: &Path) -> std::result::Result<Vec<JobEvent>, String> {
+        let message = format!("Merge main\n\n{UPDATED_BY}");
+        let merged = Command::new("git")
+            .args(["-c", "user.name=Ada", "-c", "user.email=ada@example.com"])
+            .args(["merge", "-q", "--no-ff", "-m", &message, &spec.trunk_sha])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        if merged.status.success() {
+            return Ok(Vec::new());
+        }
+        let conflicts = git(dir, &["diff", "--name-only", "--diff-filter=U"]);
+        if spec.leave_conflicts {
+            return Err(format!("{LEFT_CONFLICT} in {conflicts}"));
+        }
+        for file in conflicts.lines() {
+            std::fs::write(dir.join(file), "resolved\n").unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "--no-edit"]);
+        Ok(vec![JobEvent {
+            kind: "resolved".into(),
+            message: conflicts,
+        }])
+    }
 }
 
 #[async_trait]
 impl Executor for Agent {
     async fn run(&self, _: &str, spec: &JobSpec, out: &Path) -> Result<JobResult> {
         self.tasks.lock().unwrap().push(spec.task.clone());
+        if spec.task == Task::Rebase {
+            self.updates.lock().unwrap().push(spec.update);
+        }
         let during = self.during.lock().unwrap().pop_front();
         if let Some(during) = during {
             during.await;
+        }
+        let timed_out = {
+            let mut left = self.times_out.lock().unwrap();
+            let timed_out = *left > 0;
+            *left = left.saturating_sub(1);
+            timed_out
+        };
+        if timed_out {
+            return Err(TimedOut(Duration::from_secs(2400)).into());
         }
         let failed = |reason, events| JobResult {
             outcome: JobOutcome::Failed { reason },
@@ -204,6 +257,20 @@ fn update_refs(gh: &Fake, origin: &Path, updates: &[Value]) -> Value {
     }) {
         return json!({ "errors": [{ "message": "a ref moved" }] });
     }
+    let forward = |u: &Value| {
+        let (before, after) = (str_of(u, "beforeOid"), str_of(u, "afterOid"));
+        let ancestor = ["merge-base", "--is-ancestor", &before, &after];
+        Command::new("git")
+            .args(ancestor)
+            .current_dir(origin)
+            .status()
+            .unwrap()
+            .success()
+    };
+    let forbids_force = gh.with(|s| s.forbids_force);
+    if forbids_force && updates.iter().any(|u| u["force"] == true || !forward(u)) {
+        return json!({ "errors": [{ "message": "force-pushes are blocked" }] });
+    }
     let mut s = gh.state.lock().unwrap();
     for u in updates {
         let (name, after) = (str_of(u, "name"), str_of(u, "afterOid"));
@@ -252,10 +319,6 @@ fn graphql(gh: &Fake, origin: &Path, body: &Value) -> Value {
     }
     if query.contains("pullRequests(") {
         return json!({ "data": { "repository": repository_node(&s.trunk) } });
-    }
-    // The workflows a review of the author's agent reads its checks from: none.
-    if query.contains("$workflows") {
-        return json!({ "data": { "repository": { "object": null } } });
     }
     // A file of the default branch, as a review that asks a human reads CODEOWNERS: none.
     if query.contains("file(path: $path)") {
@@ -363,17 +426,49 @@ fn answer(gh: &Fake, origin: &Path, method: &str, path: &str, body: &str) -> (u1
     }
     if let Some(number) = rest
         .strip_prefix("pulls/")
-        .and_then(|r| r.strip_suffix("/reviews"))
+        .and_then(|r| r.split('?').next().unwrap().strip_suffix("/reviews"))
     {
+        let number: PrNumber = number.parse().unwrap();
+        if method == "GET" {
+            let reviews: Vec<Value> = gh.with(|s| {
+                s.reviews
+                    .iter()
+                    .zip(&s.review_states)
+                    .enumerate()
+                    .filter(|(_, ((n, _, _), _))| *n == number)
+                    .map(|(i, ((_, body, _), state))| {
+                        json!({ "id": i + 1, "state": state, "body": body })
+                    })
+                    .collect()
+            });
+            return (200, Value::Array(reviews).to_string());
+        }
         let comments = body["comments"].as_array().cloned().unwrap_or_default();
         let text = body["body"].as_str().unwrap_or_default().to_owned();
+        let state = match body["event"].as_str().unwrap() {
+            "REQUEST_CHANGES" => "CHANGES_REQUESTED",
+            "APPROVE" => "APPROVED",
+            _ => "COMMENTED",
+        };
         gh.with_mut(|s| {
-            s.reviews
-                .push((number.parse().unwrap(), text, comments.len()));
+            s.reviews.push((number, text, comments.len()));
+            s.review_states.push(state.to_owned());
             for c in &comments {
                 let first = c["body"].as_str().unwrap().to_owned();
                 s.threads.push((first, Vec::new(), false));
             }
+        });
+        return (200, "{}".into());
+    }
+    if let Some((number, id)) = rest
+        .strip_prefix("pulls/")
+        .and_then(|r| r.strip_suffix("/dismissals"))
+        .and_then(|r| r.split_once("/reviews/"))
+    {
+        let (number, id): (PrNumber, usize) = (number.parse().unwrap(), id.parse().unwrap());
+        gh.with_mut(|s| {
+            s.review_states[id - 1] = "DISMISSED".into();
+            s.dismissed.push(number);
         });
         return (200, "{}".into());
     }
@@ -385,6 +480,16 @@ fn answer(gh: &Fake, origin: &Path, method: &str, path: &str, body: &str) -> (u1
         let text = body["body"].as_str().unwrap().to_owned();
         gh.with_mut(|s| s.threads[i].1.push(text));
         return (201, "{}".into());
+    }
+    if let Some(run) = rest
+        .strip_prefix("actions/runs/")
+        .and_then(|r| r.strip_suffix("/rerun-failed-jobs"))
+    {
+        assert_eq!(method, "POST");
+        return match gh.with_mut(|s| s.rerun(run.parse().unwrap())) {
+            Ok(()) => (201, "{}".into()),
+            Err(e) => (422, json!({ "message": e.to_string() }).to_string()),
+        };
     }
     match (method, rest) {
         ("POST", "git/blobs") => {
@@ -398,12 +503,13 @@ fn answer(gh: &Fake, origin: &Path, method: &str, path: &str, body: &str) -> (u1
         }
         ("POST", "git/trees") => (201, sha_of(create_tree(origin, &body))),
         ("POST", "git/commits") => {
-            let (tree, parent) = (
-                body["tree"].as_str().unwrap(),
-                body["parents"][0].as_str().unwrap(),
-            );
+            let tree = body["tree"].as_str().unwrap();
+            let mut args = vec!["commit-tree", tree];
+            for parent in body["parents"].as_array().unwrap() {
+                args.extend(["-p", parent.as_str().unwrap()]);
+            }
+            args.extend(["-F", "-"]);
             let message = body["message"].as_str().unwrap().as_bytes();
-            let args = ["commit-tree", tree, "-p", parent, "-F", "-"];
             (201, sha_of(git_with(origin, &args, &[], Some(message))))
         }
         ("POST", "git/refs") => {
@@ -475,13 +581,37 @@ impl World {
             origin: origin.clone(),
             during: Default::default(),
             fails: Default::default(),
+            times_out: Default::default(),
             tasks: Default::default(),
+            updates: Default::default(),
         });
         let store = Arc::new(Mem::default());
         let mut ctx = ctx(store.clone());
+        // The workspace has a key for the agent, unless a test forgets it. Its review is off,
+        // as a key would turn it on, until a test turns it on.
+        *store.review_settings.lock().unwrap() = Some(ReviewSettings {
+            enabled: false,
+            ..ReviewSettings::default()
+        });
+        let key = mergepatrol_store::api_key_secret(Default::default());
+        ctx.vault
+            .set(Scope::Installation(1), key, "sk-test")
+            .await
+            .unwrap();
         ctx.config.data_dir = tmp.path().join("data");
         ctx.executor = agent.clone();
         ctx.jobs = Semaphore::new(2);
+        // The App the review's comments mention, with no webhooks: the URL is http.
+        ctx.hosted_app = Some(AppCredentials {
+            id: 1,
+            slug: "mp".into(),
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            webhook_secret: None,
+            pem: String::new(),
+            owner: "o".into(),
+            html_url: "https://github.com/apps/mp".into(),
+        });
         // The cache's `origin` is GitHub's URL, whatever the test: it is sent here.
         let cache = cache_path(&ctx.config.data_dir, "o", "r");
         std::fs::create_dir_all(&cache).unwrap();
@@ -526,11 +656,18 @@ impl World {
     }
 
     async fn tick(&self) {
+        self.try_tick().await.unwrap();
+    }
+
+    /// A tick, which fails on a job's error outside the PR, for the next to run it again.
+    async fn try_tick(&self) -> Result<()> {
         let sandbox = JobSandbox {
             ctx: &self.ctx,
             gh: &self.installation,
         };
-        tick(&self.ctx, &*self.gh, &sandbox, &repo()).await.unwrap();
+        tick(&self.ctx, &*self.gh, &sandbox, &repo())
+            .await
+            .map(drop)
     }
 
     /// Ticks until `done`.
@@ -583,6 +720,16 @@ impl World {
         self.kinds(number).iter().any(|k| k == kind)
     }
 
+    /// The workspace's model API key is gone: no agent can run.
+    async fn forget_model_key(&self) {
+        let key = mergepatrol_store::api_key_secret(Default::default());
+        self.ctx
+            .vault
+            .delete(Scope::Installation(1), key)
+            .await
+            .unwrap();
+    }
+
     fn tasks(&self) -> Vec<Task> {
         self.agent.tasks.lock().unwrap().clone()
     }
@@ -609,37 +756,6 @@ impl World {
         self.agent.during.lock().unwrap().push_back(Box::pin(f));
     }
 
-    /// The review of PR 1 finished and sent a finding back to its author: its id.
-    async fn sent_back(&self) -> i64 {
-        let head = self.pr(1).head_ref_oid;
-        let r = self.store.start_review(1, &repo(), 1, &head).await;
-        let r = r.unwrap();
-        self.store.with_finding(1, |f| f.sent_back = true);
-        self.store.finish_review(1, ReviewStatus::Changes);
-        r.id
-    }
-
-    /// What the review worker does with a review that sent findings back.
-    async fn fix_review(&self, review: i64) {
-        let (key, pr) = (self.key(), self.pr(1));
-        let held = hold_for_fix(&self.ctx, &self.installation, &key, &pr);
-        let Some(held) = held.await.unwrap() else {
-            return;
-        };
-        let settings = &self.ctx.config.repo_defaults;
-        fix_sent_back(
-            &self.ctx,
-            &self.installation,
-            &key,
-            &pr,
-            settings,
-            review,
-            held,
-        )
-        .await
-        .unwrap();
-    }
-
     /// The review of PR 1's head ends with a finding the agent is `confidence` sure of: sent
     /// back to the author when it is sure enough. The review's id.
     async fn conclude(&self, confidence: u8) -> i64 {
@@ -650,39 +766,18 @@ impl World {
     /// `conclude`, in a repo with these settings.
     async fn conclude_with(&self, confidence: u8, settings: &RepoSettings) -> i64 {
         let head = self.pr(1).head_ref_oid;
-        let r = self.store.start_review(1, &repo(), 1, &head).await.unwrap();
-        self.conclude_review(r, confidence, settings).await
+        let r = self
+            .store
+            .start_review(1, &repo(), 1, &head, None)
+            .await
+            .unwrap();
+        self.conclude_review(&r, finding(confidence), settings)
+            .await;
+        r.id
     }
 
-    /// `conclude_with`, for a review already started: of a head PR 1 may have left since.
-    async fn conclude_review(
-        &self,
-        r: mergepatrol_store::ReviewRecord,
-        confidence: u8,
-        settings: &RepoSettings,
-    ) -> i64 {
-        let finding = Finding {
-            id: "f1".into(),
-            kind: Kind::Other,
-            title: "Cap the retry".into(),
-            file: Some("feature.txt".into()),
-            line: Some(1),
-            confidence,
-            lean: Lean::Change,
-            finding: "It spins.".into(),
-            unsure: String::new(),
-            checked: Vec::new(),
-            would_clear: String::new(),
-            suggestion: String::new(),
-            evidence: Some(mergepatrol_core::Evidence {
-                command: "cargo test".into(),
-                failed: true,
-                ..Default::default()
-            }),
-            needs_human: false,
-            code: Vec::new(),
-            related: Vec::new(),
-        };
+    /// The review `r` ends with `finding`.
+    async fn conclude_review(&self, r: &ReviewRecord, finding: Finding, settings: &RepoSettings) {
         let output = ReviewOutput {
             summary: "s".into(),
             findings: vec![finding],
@@ -694,14 +789,34 @@ impl World {
             &self.installation,
             &key,
             &pr,
-            &r,
+            r,
             settings,
             &bars,
             Ok(output),
         )
         .await
         .unwrap();
-        r.id
+    }
+
+    /// The PR's checks fail, and the agent's fix of them starts off the lane: the drain that
+    /// runs it.
+    async fn fix_checks(&self) -> Spawned {
+        self.gh.with_mut(|s| checks_fail(s, 1));
+        let drain = self.drain().await;
+        self.tick().await;
+        drain
+    }
+
+    /// The agent's job on PR 1 is over.
+    async fn job_done(&self) {
+        let key = self.key();
+        self.until(|w| !w.tasks().is_empty()).await;
+        self.until(|w| w.ctx.prep.claim(&key, 1).is_some()).await;
+    }
+
+    /// The state of each review posted, as GitHub has it.
+    fn review_states(&self) -> Vec<String> {
+        self.gh.with(|s| s.review_states.clone())
     }
 
     /// The reviews posted on PR 1, as how many threads each starts.
@@ -710,15 +825,40 @@ impl World {
             .with(|s| s.reviews.iter().map(|(_, _, n)| *n).collect())
     }
 
-    fn fixing(&self, review: i64) -> bool {
-        self.store.fixing.lock().unwrap().contains(&review)
-    }
-
     fn review_on(&self) {
         *self.store.review_settings.lock().unwrap() = Some(ReviewSettings {
             enabled: true,
             ..ReviewSettings::default()
         });
+    }
+}
+
+/// A finding the agent is `confidence` sure of, which a failing command shows.
+fn finding(confidence: u8) -> Finding {
+    Finding {
+        id: "f1".into(),
+        kind: Kind::Other,
+        title: "Cap the retry".into(),
+        file: Some("feature.txt".into()),
+        line: Some(1),
+        confidence,
+        lean: Lean::Change,
+        finding: "It spins.".into(),
+        unsure: String::new(),
+        checked: Vec::new(),
+        would_clear: String::new(),
+        suggestion: String::new(),
+        evidence: Some(mergepatrol_core::Evidence {
+            command: "cargo test".into(),
+            failed: true,
+            ..Default::default()
+        }),
+        needs_human: false,
+        verified: None,
+        settled: None,
+        code: Vec::new(),
+        related: Vec::new(),
+        also_at: Vec::new(),
     }
 }
 
@@ -759,6 +899,206 @@ async fn a_conflict_github_shows_is_rebased_before_the_lane_sees_it() {
     assert_eq!(world.tasks(), [Task::Rebase], "the lane needs no agent");
 }
 
+/// PR 1 keeps up with `main` by merging, as #237's author does: its merge resolved a conflict
+/// in `shared.txt`. Then `main` moved on, and GitHub says the PR conflicts, so it is brought up
+/// to date. Its branch refuses a force-push.
+async fn merged_in_pr() -> World {
+    World::new(
+        |o| {
+            commit(o, "shared.txt", "base\n", "start");
+            git(o, &["checkout", "-q", "-b", "pr-1"]);
+            commit(o, "shared.txt", "from the pr\n", "the PR's change");
+            git(o, &["checkout", "-q", "main"]);
+            commit(o, "shared.txt", "from main\n", "the trunk's change");
+            git(o, &["checkout", "-q", "pr-1"]);
+            let merged = Command::new("git")
+                .args(["-c", "user.name=Ada", "-c", "user.email=ada@example.com"])
+                .args(["merge", "-q", "main"])
+                .current_dir(o)
+                .output()
+                .unwrap();
+            assert!(!merged.status.success(), "the merge conflicts");
+            git(o, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+            commit(o, "shared.txt", "both\n", "Merge main into pr-1");
+            assert_eq!(
+                git(o, &["rev-list", "--parents", "-n1", "HEAD"])
+                    .split(' ')
+                    .count(),
+                3
+            );
+            git(o, &["checkout", "-q", "main"]);
+            commit(o, "other.txt", "from main\n", "the trunk's next change");
+        },
+        |s, o| {
+            add_pr(s, 1, o);
+            s.prs.get_mut(&1).unwrap().conflicting = true;
+            s.forbids_force = true;
+        },
+    )
+    .await
+}
+
+/// The commit `rev`'s parents.
+fn parents(world: &World, rev: &str) -> Vec<String> {
+    let line = git(&world.origin, &["rev-list", "--parents", "-n1", rev]);
+    line.split_whitespace().skip(1).map(str::to_owned).collect()
+}
+
+#[tokio::test]
+async fn a_branch_that_merged_the_trunk_in_is_merged_again_with_no_agent_and_no_force() {
+    let world = merged_in_pr().await;
+    let before = world.pr(1).head_ref_oid;
+    let trunk = world.branch("main");
+    let _drain = world.drain().await;
+    world.tick_until(|w| !w.merged().is_empty()).await;
+    assert_eq!(*world.agent.updates.lock().unwrap(), [Update::Either]);
+    assert!(!world.did(1, "resolved"), "{:?}", world.kinds(1));
+    assert!(!world.did(1, "ejected"));
+    let head = world.pr(1).head_ref_oid;
+    assert_eq!(parents(&world, &head), [before, trunk]);
+    let message = git(&world.origin, &["log", "-1", "--format=%B", &head]);
+    assert!(message.contains(UPDATED_BY), "{message}");
+}
+
+#[tokio::test]
+async fn a_repo_that_merges_by_rebasing_gets_a_rebase() {
+    let world = merged_in_pr().await;
+    world.gh.with_mut(|s| {
+        s.repo_merge_methods = Some(vec!["rebase".into()]);
+        s.forbids_force = false;
+    });
+    let _drain = world.drain().await;
+    world.tick_until(|w| !w.merged().is_empty()).await;
+    let updates = world.agent.updates.lock().unwrap().clone();
+    assert!(updates.iter().all(|u| *u == Update::Rebase), "{updates:?}");
+    let head = world.pr(1).head_ref_oid;
+    assert_eq!(parents(&world, &head).len(), 1);
+}
+
+#[tokio::test]
+async fn a_rebase_that_runs_out_of_time_merges_the_trunk_in_instead() {
+    let world = World::one_pr("feature.txt", "other.txt").await;
+    world
+        .gh
+        .with_mut(|s| s.prs.get_mut(&1).unwrap().conflicting = true);
+    *world.agent.times_out.lock().unwrap() = 1;
+    let before = world.pr(1).head_ref_oid;
+    let _drain = world.drain().await;
+    world.tick_until(|w| !w.merged().is_empty()).await;
+    let updates = world.agent.updates.lock().unwrap().clone();
+    assert_eq!(updates, [Update::Either, Update::Merge]);
+    assert!(world.did(1, "merging-base"), "{:?}", world.kinds(1));
+    assert!(!world.did(1, "ejected"));
+    let head = world.pr(1).head_ref_oid;
+    assert_eq!(parents(&world, &head)[0], before);
+}
+
+#[tokio::test]
+async fn a_rebase_that_runs_out_of_time_where_it_cannot_merge_runs_again_not_ejected() {
+    let world = World::one_pr("feature.txt", "other.txt").await;
+    world.gh.with_mut(|s| {
+        s.prs.get_mut(&1).unwrap().conflicting = true;
+        s.repo_merge_methods = Some(vec!["rebase".into()]);
+    });
+    // Off the lane, then in it, as the lane takes what getting ready could not settle.
+    *world.agent.times_out.lock().unwrap() = 2;
+    let _drain = world.drain().await;
+    let mut failed_ticks = 0;
+    let since = Instant::now();
+    while world.merged().is_empty() {
+        assert!(
+            since.elapsed() < SETTLES_WITHIN,
+            "stuck: {:?}",
+            world.kinds(1)
+        );
+        if let Err(e) = world.try_tick().await {
+            assert!(TimedOut::caused(&e), "{e:#}");
+            failed_ticks += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        failed_ticks, 1,
+        "the lane's job ran out of time, and ran again"
+    );
+    assert_eq!(world.tasks(), [Task::Rebase, Task::Rebase, Task::Rebase]);
+    assert!(!world.did(1, "ejected"), "{:?}", world.kinds(1));
+}
+
+#[tokio::test]
+async fn a_layer_over_a_rebased_one_is_rebased_too() {
+    // The layer above merged the trunk in; the layer below did not, and is rebased.
+    let world = World::new(
+        |o| {
+            commit(o, "shared.txt", "base\n", "start");
+            git(o, &["checkout", "-q", "-b", "pr-1"]);
+            commit(o, "lower.txt", "from layer 1\n", "layer 1");
+            git(o, &["checkout", "-q", "-b", "pr-2"]);
+            commit(o, "upper.txt", "from layer 2\n", "layer 2");
+            git(o, &["checkout", "-q", "main"]);
+            commit(o, "other.txt", "from main\n", "the trunk's change");
+            git(o, &["checkout", "-q", "pr-2"]);
+            git(o, &["merge", "-q", "--no-edit", "main"]);
+            git(o, &["checkout", "-q", "main"]);
+            commit(o, "more.txt", "from main\n", "the trunk's next change");
+        },
+        |s, o| {
+            s.add_stack(1, &[1, 2], &[1, 2]);
+            point_at_branch(s, 1, o);
+            point_at_branch(s, 2, o);
+        },
+    )
+    .await;
+    let event = rebase_stack(&world).await;
+    assert!(matches!(event, Event::Rebased { .. }), "{event:?}");
+    let updates = world.agent.updates.lock().unwrap().clone();
+    assert_eq!(updates, [Update::Either, Update::Rebase]);
+    let below = git(&world.origin, &["rev-parse", "pr-2~1"]);
+    assert_eq!(below, world.branch("pr-1"));
+}
+
+#[tokio::test]
+async fn a_layer_over_a_merged_one_may_merge_too() {
+    let world = World::new(
+        |o| {
+            commit(o, "shared.txt", "base\n", "start");
+            git(o, &["checkout", "-q", "-b", "pr-1"]);
+            commit(o, "lower.txt", "from layer 1\n", "layer 1");
+            git(o, &["checkout", "-q", "main"]);
+            commit(o, "other.txt", "from main\n", "the trunk's change");
+            git(o, &["checkout", "-q", "pr-1"]);
+            git(o, &["merge", "-q", "--no-edit", "main"]);
+            git(o, &["checkout", "-q", "-b", "pr-2"]);
+            commit(o, "upper.txt", "from layer 2\n", "layer 2");
+            // The layer above keeps up with the one below by merging it.
+            git(o, &["checkout", "-q", "pr-1"]);
+            commit(o, "lower.txt", "more from layer 1\n", "layer 1 again");
+            git(o, &["checkout", "-q", "pr-2"]);
+            git(o, &["merge", "-q", "--no-edit", "pr-1"]);
+            git(o, &["checkout", "-q", "main"]);
+            commit(o, "more.txt", "from main\n", "the trunk's next change");
+        },
+        |s, o| {
+            s.add_stack(1, &[1, 2], &[1, 2]);
+            point_at_branch(s, 1, o);
+            point_at_branch(s, 2, o);
+            s.forbids_force = true;
+        },
+    )
+    .await;
+    let heads = [world.pr(1).head_ref_oid, world.pr(2).head_ref_oid];
+    let event = rebase_stack(&world).await;
+    assert!(matches!(event, Event::Rebased { .. }), "{event:?}");
+    let updates = world.agent.updates.lock().unwrap().clone();
+    assert_eq!(updates, [Update::Either, Update::Either]);
+    let lower = world.branch("pr-1");
+    assert_eq!(
+        parents(&world, &lower),
+        [heads[0].clone(), world.branch("main")]
+    );
+    assert_eq!(parents(&world, "pr-2"), [heads[1].clone(), lower]);
+}
+
 #[tokio::test]
 async fn a_failed_check_is_fixed_off_the_lane_then_merges() {
     let world = World::one_pr("feature.txt", "other.txt").await;
@@ -780,148 +1120,51 @@ async fn a_failed_check_is_fixed_off_the_lane_then_merges() {
     assert!(log.contains("the PR's change"), "{log}");
 }
 
-/// A repo whose PRs' authors run the agent. Its review, which needs no model key there, is off:
-/// no review worker runs here.
-const AUTHORS_AGENT: &str = "agent:\n  runs: local\nreview:\n  enabled: false\n";
-
 #[tokio::test]
-async fn with_the_authors_agent_a_pr_is_reviewed_without_a_model_key() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world
-        .gh
-        .with_mut(|s| s.config = Some("agent:\n  runs: local\n".into()));
-    world.tick().await;
-    assert_eq!(world.lane(), [(1, "Held(Reviewing)".into())]);
-    let reviews = world.store.reviews.lock().unwrap().clone();
-    assert_eq!(
-        reviews.len(),
-        1,
-        "a review of its head, for the author's agent"
-    );
-}
-
-#[tokio::test]
-async fn with_the_authors_agent_a_conflict_waits_for_their_push_then_merges() {
-    let world = World::one_pr("shared.txt", "shared.txt").await;
-    world.gh.with_mut(|s| s.config = Some(AUTHORS_AGENT.into()));
-    let before = world.pr(1).head_ref_oid;
-    let _drain = world.drain().await;
-    for _ in 0..3 {
-        world.tick().await;
-    }
-    let held = format!("Held(AuthorRebase {{ head: {before:?} }})");
-    assert_eq!(world.lane(), [(1, held)]);
-    assert_eq!(world.branch("pr-1"), before, "nothing pushed to it");
-
-    // The author's agent rebases it, keeping the PR's side, and pushes.
-    git(&world.origin, &["checkout", "-q", "pr-1"]);
-    git(&world.origin, &["rebase", "-q", "-X", "theirs", "main"]);
-    git(&world.origin, &["checkout", "-q", "main"]);
-    world.gh.with_mut(|s| point_at_branch(s, 1, &world.origin));
-    world.tick_until(|w| !w.merged().is_empty()).await;
-    // Only the lane's plain rebases, which leave a conflict as it is.
-    assert!(
-        world.tasks().iter().all(|t| *t == Task::Rebase),
-        "{:?}",
-        world.tasks()
-    );
-    assert!(
-        !world.did(1, "resolved"),
-        "MergeLoop's agent resolved nothing"
-    );
-    assert!(!world.did(1, "ejected"));
-}
-
-#[tokio::test]
-async fn with_the_authors_agent_a_failed_check_waits_for_their_fix_then_merges() {
+async fn a_flaky_job_runs_again_off_the_lane_and_merges_with_no_fix() {
     let world = World::one_pr("feature.txt", "other.txt").await;
     world.gh.with_mut(|s| {
-        s.config = Some(AUTHORS_AGENT.into());
         checks_fail(s, 1);
+        s.actions = true;
+        s.flaky = true;
     });
     let _drain = world.drain().await;
-    for _ in 0..3 {
-        world.tick().await;
-    }
-    let head = world.pr(1).head_ref_oid;
-    let held = format!(r#"Held(AuthorFix {{ head: {head:?}, checks: ["ci"] }})"#);
-    assert_eq!(world.lane(), [(1, held)]);
-    assert!(!world.did(1, "fixing"));
+    world.tick().await;
+    assert_eq!(world.lane(), [(1, "Held(PrepChecks)".into())]);
 
-    // The author's agent commits a fix on top, and pushes: its checks pass.
-    git(&world.origin, &["checkout", "-q", "pr-1"]);
-    commit(&world.origin, "feature.txt", "fixed\n", "Fix the check");
-    git(&world.origin, &["checkout", "-q", "main"]);
-    world.gh.with_mut(|s| point_at_branch(s, 1, &world.origin));
     world.tick_until(|w| !w.merged().is_empty()).await;
-    let fixed = |t: &Task| matches!(t, Task::FixChecks { .. });
-    assert!(!world.tasks().iter().any(fixed), "{:?}", world.tasks());
-    assert!(!world.did(1, "fixing"));
+    let fixes = world.tasks();
+    assert!(
+        !fixes.iter().any(|t| matches!(t, Task::FixChecks { .. })),
+        "{fixes:?}"
+    );
+    assert!(world.did(1, "rerunning"), "{:?}", world.kinds(1));
+    assert_eq!(world.gh.with(|s| s.reran.len()), 1);
 }
 
 #[tokio::test]
-async fn with_the_authors_agent_a_failure_the_lane_finds_goes_back_to_them_without_fixes() {
+async fn a_job_that_fails_again_without_a_model_key_ejects_with_no_agent() {
     let world = World::one_pr("feature.txt", "other.txt").await;
     world.gh.with_mut(|s| {
-        // MergeLoop's fixes are off: the author's still go on.
-        s.config = Some(format!("{AUTHORS_AGENT}fix_ci:\n  enabled: false\n"));
         s.checks.insert("ci".into(), CheckState::Failed);
-        let passed = BTreeMap::from([("ci".to_owned(), CheckState::Passed)]);
-        s.checks_on.insert(s.head(1), passed);
+        s.actions = true;
     });
+    world.forget_model_key().await;
     let _drain = world.drain().await;
-    for _ in 0..3 {
-        world.tick().await;
-    }
-    // On the head the lane rebased, whose checks failed.
-    let head = world.pr(1).head_ref_oid;
-    let held = format!(r#"Held(AuthorFix {{ head: {head:?}, checks: ["ci"] }})"#);
-    assert_eq!(world.lane(), [(1, held)], "{:?}", world.kinds(1));
-    assert!(!world.did(1, "ejected"));
-}
+    world.tick_until(|w| w.did(1, "ejected")).await;
 
-#[tokio::test]
-async fn review_a_local_fix_that_still_fails_makes_a_new_need() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.gh.with_mut(|s| {
-        s.config = Some(AUTHORS_AGENT.into());
-        checks_fail(s, 1);
-    });
-    world.tick().await;
-    let hold_message = || {
-        let lanes = world.store.lanes.lock().unwrap();
-        let entry = &lanes[&world.key()].entries[0];
-        let EntryState::Held(hold) = &entry.state else {
-            panic!("expected an author hold, got {:?}", entry.state);
-        };
-        assert!(hold.of_author());
-        hold.to_string()
-    };
-    let before = (hold_message(), world.store.events.lock().unwrap().clone());
-
-    // The agent follows the fix-checks brief, but its attempted fix still fails CI.
-    // CI can finish between queue ticks, so the queue need not observe Pending.
-    git(&world.origin, &["checkout", "-q", "pr-1"]);
-    commit(
-        &world.origin,
-        "feature.txt",
-        "attempted fix\n",
-        "Try fixing CI",
+    let tasks = world.tasks();
+    assert!(
+        !tasks.iter().any(|t| matches!(t, Task::FixChecks { .. })),
+        "no agent runs: {tasks:?}"
     );
-    git(&world.origin, &["checkout", "-q", "main"]);
-    world.gh.with_mut(|s| {
-        point_at_branch(s, 1, &world.origin);
-        checks_fail(s, 1);
-    });
-    world.tick().await;
-    world.tick().await;
-
-    // next_need hashes the hold and newest queue event, with no head SHA. If both
-    // stay unchanged, the agent running `then --after <id>` waits forever.
-    let after = (hold_message(), world.store.events.lock().unwrap().clone());
-    assert_ne!(
-        after, before,
-        "a new head that still fails must change next_need's inputs so the author can act again"
+    assert!(world.did(1, "rerunning"), "{:?}", world.kinds(1));
+    let comment = world.gh.with(|s| s.comments.last().unwrap().1.clone());
+    assert!(comment.contains("required checks failed: ci"), "{comment}");
+    assert!(comment.contains("no Anthropic API key"), "{comment}");
+    assert!(
+        comment.contains("http://localhost:8080/o/settings"),
+        "{comment}"
     );
 }
 
@@ -958,73 +1201,24 @@ async fn a_failure_the_lane_finds_is_fixed_off_it_then_merges() {
 }
 
 #[tokio::test]
-async fn a_review_s_findings_are_fixed_and_reviewed_again() {
+async fn a_review_s_findings_go_back_to_the_author_and_are_never_fixed() {
     let world = World::one_pr("feature.txt", "other.txt").await;
     world.review_on();
     world.tick().await;
     assert_eq!(world.lane(), [(1, "Held(Reviewing)".into())]);
     let before = world.pr(1).head_ref_oid;
 
-    let review = world.sent_back().await;
-    world.fix_review(review).await;
-    let Task::FixReview { findings } = &world.tasks()[0] else {
-        panic!("{:?}", world.tasks());
-    };
-    assert_eq!(findings[0].id, "f1");
-    let head = world.branch("pr-1");
-    assert_ne!(head, before);
-    let message = git(&world.origin, &["log", "-1", "--format=%B", &head]);
-    assert!(message.contains(FIXED_BY), "{message}");
-    assert!(world.did(1, "review-fixing") && world.did(1, "review-fixed"));
-    let first = world.store.review(review).await.unwrap().unwrap();
-    assert!(first.agent_fixed, "the author's rounds are not spent");
-
-    // The next tick reviews what the agent pushed, and that review lets it go on.
-    world.tick().await;
-    assert_eq!(world.store.newest_review(1).0, head);
-    assert_eq!(world.lane(), [(1, "Held(Reviewing)".into())]);
-    assert!(world.merged().is_empty());
-    world.store.finish_review(1, ReviewStatus::Approved);
-    world.tick_until(|w| !w.merged().is_empty()).await;
-}
-
-#[tokio::test]
-async fn a_fix_the_agent_cannot_make_leaves_the_findings_to_the_author() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    *world.agent.fails.lock().unwrap() = Some("the agent gave up".into());
-    let before = world.pr(1).head_ref_oid;
-    let review = world.sent_back().await;
-    world.fix_review(review).await;
-    assert!(world.did(1, "review-unfixed"), "{:?}", world.kinds(1));
+    world.conclude(100).await;
+    assert!(world.tasks().is_empty(), "{:?}", world.tasks());
     assert_eq!(world.branch("pr-1"), before);
-    let first = world.store.review(review).await.unwrap().unwrap();
-    assert!(!first.agent_fixed);
-}
+    assert!(world.did(1, "review-sent-back"), "{:?}", world.kinds(1));
+    assert_eq!(world.posted(), [1], "one thread, for the author");
+    assert_eq!(world.review_states(), ["CHANGES_REQUESTED"]);
+    assert!(world.gh.with(|s| s.reviews[0].1.contains(REVIEW_MARKS[0])));
 
-#[tokio::test]
-async fn a_pr_with_no_fixes_left_gets_no_review_fix() {
-    let world = World::new(
-        |o| {
-            commit(o, "shared.txt", "base\n", "start");
-            git(o, &["checkout", "-q", "-b", "pr-1"]);
-            commit(o, "feature.txt", "from the pr\n", "the PR's change");
-            for i in 0..3 {
-                commit(
-                    o,
-                    "fix.txt",
-                    &format!("{i}\n"),
-                    &format!("Fix\n\n{FIXED_BY}"),
-                );
-            }
-            git(o, &["checkout", "-q", "main"]);
-        },
-        |s, o| add_pr(s, 1, o),
-    )
-    .await;
-    let review = world.sent_back().await;
-    world.fix_review(review).await;
-    assert!(world.tasks().is_empty(), "the budget is its commits");
-    assert!(!world.did(1, "review-fixing"));
+    world.tick().await;
+    assert!(world.tasks().is_empty());
+    assert!(world.merged().is_empty());
 }
 
 #[tokio::test]
@@ -1083,23 +1277,22 @@ fn departures() -> [Departure; 3] {
 }
 
 #[tokio::test]
-async fn a_pr_that_leaves_while_its_review_fix_runs_gets_no_push() {
+async fn a_pr_that_leaves_while_its_check_fix_runs_gets_no_push() {
     for (how, leaves) in departures() {
         let world = World::one_pr("feature.txt", "other.txt").await;
         let before = world.pr(1).head_ref_oid;
         let gh = world.gh.clone();
         world.during(async move { gh.with_mut(leaves) });
-        let review = world.sent_back().await;
-        world.fix_review(review).await;
+        let _drain = world.fix_checks().await;
+        world.job_done().await;
         assert_eq!(world.tasks().len(), 1, "{how}");
         assert_eq!(world.branch("pr-1"), before, "{how}");
-        assert!(world.did(1, "review-unfixed"), "{how}");
-        assert!(!world.did(1, "review-fixed"), "{how}");
+        assert!(!world.did(1, "published"), "{how}");
     }
 }
 
 #[tokio::test]
-async fn a_pr_that_leaves_while_its_review_fix_waits_for_the_cache_gets_no_push() {
+async fn a_pr_that_leaves_while_its_check_fix_waits_for_the_cache_gets_no_push() {
     for (how, leaves) in departures() {
         let world = World::one_pr("feature.txt", "other.txt").await;
         let before = world.pr(1).head_ref_oid;
@@ -1113,11 +1306,11 @@ async fn a_pr_that_leaves_while_its_review_fix_waits_for_the_cache_gets_no_push(
                 drop(cache);
             });
         });
-        let review = world.sent_back().await;
-        world.fix_review(review).await;
+        let _drain = world.fix_checks().await;
+        world.job_done().await;
         assert_eq!(world.tasks().len(), 1, "{how}");
         assert_eq!(world.branch("pr-1"), before, "{how}");
-        assert!(!world.did(1, "review-fixed"), "{how}");
+        assert!(!world.did(1, "published"), "{how}");
     }
 }
 
@@ -1145,15 +1338,12 @@ async fn a_pr_that_leaves_while_its_rebase_runs_gets_no_push() {
 #[tokio::test]
 async fn a_job_waits_for_the_cache_but_the_agent_does_not_hold_it() {
     let world = World::one_pr("feature.txt", "other.txt").await;
-    let review = world.sent_back().await;
 
-    // The fetch waits for whoever has the cache.
+    // The fetch waits for whoever has the cache: past the drain's wait, no agent yet.
     let held = world.ctx.caches.lock(&repo()).await;
-    let fixing = world.fix_review(review);
-    let waited = tokio::time::timeout(Duration::from_millis(300), fixing).await;
-    assert!(waited.is_err(), "it went on past the lock");
+    let _drain = world.fix_checks().await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(world.tasks().is_empty(), "no agent before the fetch");
-    drop(held);
 
     // While the agent works, the cache is free.
     let ctx = world.ctx.clone();
@@ -1161,8 +1351,8 @@ async fn a_job_waits_for_the_cache_but_the_agent_does_not_hold_it() {
         let free = tokio::time::timeout(Duration::from_secs(5), ctx.caches.lock(&repo())).await;
         free.expect("the agent's job holds the cache");
     });
-    world.fix_review(review).await;
-    assert!(world.did(1, "review-fixed"), "{:?}", world.kinds(1));
+    drop(held);
+    world.until(|w| w.did(1, "published")).await;
 }
 
 #[tokio::test]
@@ -1214,7 +1404,7 @@ async fn approved_stack(
         let head = world.pr(n).head_ref_oid;
         let r = world
             .store
-            .start_review(1, &repo(), n, &head)
+            .start_review(1, &repo(), n, &head, None)
             .await
             .unwrap();
         world.store.finish_review(r.number, ReviewStatus::Approved);
@@ -1278,34 +1468,16 @@ async fn a_stack_s_lower_layer_is_fixed_off_the_lane_and_the_layer_above_goes_on
 }
 
 #[tokio::test]
-async fn a_review_s_fix_on_a_lower_layer_moves_the_layer_above_onto_it() {
-    let world = stack("lower.txt", "upper.txt", "other.txt").await;
-    let review = world.sent_back().await;
-    world.fix_review(review).await;
-    assert!(matches!(
-        world.tasks()[..],
-        [Task::FixReview { .. }, Task::Rebase]
-    ));
-    let lower = world.branch("pr-1");
-    assert!(a_fix(&world, &lower));
-    assert_eq!(under_upper(&world), lower);
-    assert!(world.did(1, "review-fixed"), "{:?}", world.kinds(1));
-    let first = world.store.review(review).await.unwrap().unwrap();
-    assert!(first.agent_fixed);
-    assert!(world.ctx.prep.claim(&world.key(), 1).is_some());
-}
-
-#[tokio::test]
 async fn a_push_to_the_layer_above_while_a_fix_runs_stops_its_push() {
     let world = stack("lower.txt", "upper.txt", "other.txt").await;
     let lower = world.branch("pr-1");
     let gh = world.gh.clone();
     world.during(async move { gh.with_mut(|s| s.push(2, "pushed")) });
-    let review = world.sent_back().await;
-    world.fix_review(review).await;
+    let _drain = world.fix_checks().await;
+    world.job_done().await;
     assert_eq!(world.tasks().len(), 1);
     assert_eq!(world.branch("pr-1"), lower);
-    assert!(world.did(1, "review-unfixed"), "{:?}", world.kinds(1));
+    assert!(!world.did(1, "published"), "{:?}", world.kinds(1));
 }
 
 #[tokio::test]
@@ -1315,13 +1487,14 @@ async fn a_restack_that_fails_after_the_fix_leaves_the_stack_to_the_lane() {
     let agent = world.agent.clone();
     world.during(async {});
     world.during(async move { *agent.fails.lock().unwrap() = Some("the agent broke".into()) });
-    let review = world.sent_back().await;
-    world.fix_review(review).await;
+    let drain = world.fix_checks().await;
+    let key = world.key();
+    world.until(|w| w.tasks().len() == 2).await;
+    world.until(|w| w.ctx.prep.claim(&key, 1).is_some()).await;
+    drop(drain);
     let lower = world.branch("pr-1");
     assert!(a_fix(&world, &lower), "the fix is published");
     assert_eq!(under_upper(&world), old, "the layer above is not");
-    assert!(world.did(1, "review-unfixed"), "{:?}", world.kinds(1));
-    assert!(world.ctx.prep.claim(&world.key(), 1).is_some());
 
     // The lane rebases the whole stack, the layer above onto the fix.
     *world.agent.fails.lock().unwrap() = None;
@@ -1395,7 +1568,7 @@ async fn only_the_layer_whose_conflict_the_agent_resolved_loses_its_approval() {
     assert!(
         world
             .gh
-            .with(|s| !s.branches.contains_key("mergepatrol/restack-1"))
+            .with(|s| !s.branches.contains_key("mergeloop/restack-1"))
     );
 }
 
@@ -1409,148 +1582,21 @@ async fn a_clean_rebase_keeps_every_layers_approval() {
 }
 
 #[tokio::test]
-async fn a_finding_the_agent_fixes_is_never_posted() {
+async fn a_pr_pushed_to_during_the_review_gets_no_out_of_date_review() {
     let world = World::one_pr("feature.txt", "other.txt").await;
     world.review_on();
     world.tick().await;
-    let before = world.pr(1).head_ref_oid;
-    let review = world.conclude(100).await;
-    assert_ne!(world.branch("pr-1"), before, "the agent pushed its fix");
-    assert!(world.did(1, "review-fixed"), "{:?}", world.kinds(1));
-    assert_eq!(world.posted(), Vec::<usize>::new());
-    assert!(!world.fixing(review));
-}
-
-#[tokio::test]
-async fn a_finding_the_fix_leaves_is_posted_after_it() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    *world.agent.fails.lock().unwrap() = Some("the agent gave up".into());
-    let posted = world.gh.clone();
-    world.during(async move {
-        assert!(
-            posted.with(|s| s.reviews.is_empty()),
-            "not while the fix runs"
-        );
-    });
-    let review = world.conclude(100).await;
-    assert!(world.did(1, "review-unfixed"), "{:?}", world.kinds(1));
-    assert_eq!(world.posted(), [1], "one thread, for the author");
-    assert!(!world.fixing(review));
-}
-
-#[tokio::test]
-async fn an_unsubmitted_author_review_does_not_reset_completed_review_rounds() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    world.sent_back().await;
-    // Three completed reviews sent findings back. A fourth head waited for its
-    // author's agent, but another push superseded it before anything was posted.
-    {
-        let mut reviews = world.store.reviews.lock().unwrap();
-        let mut completed = reviews[0].clone();
-        reviews.clear();
-        for id in 1..=3 {
-            completed.id = id;
-            completed.head_sha = format!("completed-head-{id}");
-            reviews.push(completed.clone());
-        }
-    }
-    let abandoned = world
-        .store
-        .start_review(1, &repo(), 1, "superseded-author-head")
-        .await
-        .unwrap();
-    world
-        .store
-        .await_author(abandoned.id, abandoned.claim, "Review this head")
-        .await
-        .unwrap();
-
-    let mut settings = world.ctx.config.repo_defaults.clone();
-    settings.agent.runs = mergepatrol_core::Runs::Local;
-    let id = world.conclude_with(90, &settings).await;
-    let finished = world.store.review(id).await.unwrap().unwrap();
-    assert_eq!(
-        finished.status,
-        ReviewStatus::Asks,
-        "an unsubmitted review is not a completed round: three completed send-backs still require a human"
-    );
-}
-
-#[tokio::test]
-async fn with_the_authors_agent_its_reviews_findings_go_to_the_author_unfixed() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    let mut settings = world.ctx.config.repo_defaults.clone();
-    settings.agent.runs = mergepatrol_core::Runs::Local;
-    let review = world.conclude_with(100, &settings).await;
-    assert!(
-        world.tasks().iter().all(|t| *t == Task::Rebase),
-        "{:?}",
-        world.tasks()
-    );
-    assert_eq!(world.posted(), [1], "one thread, for the author");
-    assert!(!world.fixing(review));
-}
-
-#[tokio::test]
-async fn a_finding_is_posted_at_once_while_a_job_holds_the_pr() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    let _job = world.ctx.prep.claim(&world.key(), 1).unwrap();
-    world.conclude(100).await;
-    assert!(world.tasks().is_empty(), "no fix");
-    assert_eq!(world.posted(), [1]);
-}
-
-#[tokio::test]
-async fn a_pr_pushed_to_during_the_fix_gets_no_out_of_date_review() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    *world.agent.fails.lock().unwrap() = Some("the agent gave up".into());
-    let gh = world.gh.clone();
-    world.during(async move {
-        gh.with_mut(|s| s.prs.get_mut(&1).unwrap().head_ref_oid = "pushed".into());
-    });
-    let review = world.conclude(100).await;
-    assert_eq!(world.posted(), Vec::<usize>::new());
-    let r = world.store.review(review).await.unwrap().unwrap();
-    assert_eq!(
-        r.status,
-        ReviewStatus::Stale,
-        "the new head gets its own review"
-    );
-}
-
-#[tokio::test]
-async fn a_review_that_asks_a_human_posts_nothing_once_the_pr_was_pushed_to() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    // The author's agent reviews, so no fix runs: what it found goes straight to GitHub.
-    let mut settings = world.ctx.config.repo_defaults.clone();
-    settings.agent.runs = mergepatrol_core::Runs::Local;
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
-    // The author pushes a fix while the review runs.
-    world.gh.with_mut(|s| s.push(1, "fixed"));
-    let review = world.conclude_review(r, 100, &settings).await;
-    assert_eq!(
-        world.posted(),
-        Vec::<usize>::new(),
-        "nothing about the old head"
-    );
-    let r = world.store.review(review).await.unwrap().unwrap();
+    world.gh.with_mut(|s| s.push(1, "pushed"));
+    let settings = world.ctx.config.repo_defaults.clone();
+    world.conclude_review(&r, finding(100), &settings).await;
+    assert_eq!(world.posted(), Vec::<usize>::new());
+    let r = world.store.review(r.id).await.unwrap().unwrap();
     assert_eq!(
         r.status,
         ReviewStatus::Stale,
@@ -1559,14 +1605,38 @@ async fn a_review_that_asks_a_human_posts_nothing_once_the_pr_was_pushed_to() {
 }
 
 #[tokio::test]
-async fn a_review_that_clears_everything_posts_nothing_but_resolves_what_it_found_fixed() {
+async fn the_next_review_says_what_became_of_what_the_last_sent_back() {
     let world = World::one_pr("feature.txt", "other.txt").await;
     world.review_on();
     world.tick().await;
-    // A finding the author was left with, in a thread.
-    let job = world.ctx.prep.claim(&world.key(), 1).unwrap();
+    let first = world.conclude(100).await;
+
+    // The author pushes a fix, and the next review reports it fine, as fixed.
+    world.gh.with_mut(|s| s.push(1, "fixed"));
+    let fixed = Finding {
+        lean: Lean::Fine,
+        settled: Some(Settled::Fixed),
+        ..finding(100)
+    };
+    let settings = world.ctx.config.repo_defaults.clone();
+    let head = world.pr(1).head_ref_oid;
+    let r = world
+        .store
+        .start_review(1, &repo(), 1, &head, None)
+        .await
+        .unwrap();
+    world.conclude_review(&r, fixed, &settings).await;
+    let r = world.store.review(first).await.unwrap().unwrap();
+    assert_eq!(r.findings[0].outcome, Some(Outcome::Fixed));
+}
+
+#[tokio::test]
+async fn a_review_that_clears_everything_resolves_and_dismisses_what_it_found_fixed() {
+    let world = World::one_pr("feature.txt", "other.txt").await;
+    world.review_on();
+    world.tick().await;
+    // A finding sent back to the author, in a thread.
     world.conclude(100).await;
-    drop(job);
     assert_eq!(world.posted(), [1]);
 
     // The author pushes, and the next review clears everything.
@@ -1580,53 +1650,30 @@ async fn a_review_that_clears_everything_posts_nothing_but_resolves_what_it_foun
         replies[0].starts_with("Cleared by the review"),
         "{replies:?}"
     );
+    assert_eq!(world.review_states(), ["DISMISSED"]);
 }
 
 #[tokio::test]
-async fn a_finding_is_posted_when_the_fix_errors() {
+async fn a_review_that_asks_a_human_comments_and_dismisses_what_it_sent_back() {
     let world = World::one_pr("feature.txt", "other.txt").await;
     world.review_on();
     world.tick().await;
-    *world.store.review_reads_fail.lock().unwrap() = true;
-    let review = world.conclude(100).await;
-    assert!(world.tasks().is_empty(), "no fix");
-    assert_eq!(world.posted(), [1]);
-    assert!(!world.fixing(review));
-}
+    world.conclude(100).await;
 
-#[tokio::test]
-async fn a_review_whose_post_fails_after_the_fix_runs_again() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    *world.agent.fails.lock().unwrap() = Some("the agent gave up".into());
-    // GitHub fails the read of the PR after the fix.
-    let gh = world.gh.clone();
-    world.during(async move { gh.with_mut(|s| s.outage = 1) });
-    let review = world.conclude(100).await;
-    assert!(world.did(1, "review-unfixed"), "{:?}", world.kinds(1));
-    assert_eq!(world.posted(), Vec::<usize>::new());
-    let r = world.store.review(review).await.unwrap().unwrap();
-    assert_eq!(r.status, ReviewStatus::Pending, "the worker runs it again");
-    assert!(!world.fixing(review));
-}
-
-#[tokio::test]
-async fn a_fix_whose_branch_moves_under_it_gets_no_out_of_date_review() {
-    let world = World::one_pr("feature.txt", "other.txt").await;
-    world.review_on();
-    world.tick().await;
-    // The branch moves, though the PR GitHub shows still has the reviewed head.
-    let gh = world.gh.clone();
-    world.during(async move {
-        gh.with_mut(|s| {
-            let elsewhere = s.trunk.clone();
-            s.branches.insert("pr-1".into(), elsewhere);
-        });
-    });
-    let review = world.conclude(100).await;
-    assert!(!world.did(1, "review-fixed"), "{:?}", world.kinds(1));
-    assert_eq!(world.posted(), Vec::<usize>::new());
-    let r = world.store.review(review).await.unwrap().unwrap();
-    assert_eq!(r.status, ReviewStatus::Stale);
+    // The author pushes, and the next review only asks a human.
+    world.gh.with_mut(|s| s.push(1, "pushed"));
+    let head = world.pr(1).head_ref_oid;
+    let r = world
+        .store
+        .start_review(1, &repo(), 1, &head, None)
+        .await
+        .unwrap();
+    let asks = Finding {
+        needs_human: true,
+        ..finding(100)
+    };
+    let settings = world.ctx.config.repo_defaults.clone();
+    world.conclude_review(&r, asks, &settings).await;
+    assert!(world.did(1, "review-asks"), "{:?}", world.kinds(1));
+    assert_eq!(world.review_states(), ["DISMISSED", "COMMENTED"]);
 }

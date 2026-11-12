@@ -7,7 +7,7 @@ use std::time::Duration;
 use mergepatrol_core::{CheckFailure, Provider};
 use mergepatrol_executor::protocol::{
     ANSWER_FILE, ApiAccess, BUNDLE_FILE, JobOutcome, JobSpec, REVIEW_FILE, ResolverSpec,
-    ReviewOutput, Task,
+    ReviewOutput, Task, Update,
 };
 use mergepatrol_executor::{Executor, LocalExecutor};
 
@@ -72,6 +72,7 @@ fn spec(url: &Path, head: &str, trunk: &str) -> JobSpec {
             settings_url: Some(SETTINGS.into()),
         },
         task: Default::default(),
+        update: Default::default(),
     }
 }
 
@@ -285,7 +286,14 @@ fn with_fake_claude_running(dir: &Path, shell: &str, answer: &str) -> LocalExecu
     std::fs::create_dir(&bin).unwrap();
     let events = [
         serde_json::json!({ "type": "assistant" }),
-        serde_json::json!({ "type": "result", "result": answer, "total_cost_usd": 0.12 }),
+        // 10,000 input at $4 and 4,000 output at $20 per million on Claude Opus 5.5: $0.12.
+        serde_json::json!({ "type": "result", "result": answer, "modelUsage": {
+            "claude-opus-5-5": {
+                "inputTokens": 10_000, "outputTokens": 4_000, "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0, "cacheCreationEphemeral5mInputTokens": 0,
+                "cacheCreationEphemeral1hInputTokens": 0,
+            },
+        }}),
     ];
     let lines: String = events.iter().map(|e| format!("echo '{e}'\n")).collect();
     let lines = format!("{shell}\n{lines}");
@@ -328,6 +336,7 @@ async fn a_fix_that_fails_still_tells_what_it_spent() {
         spec.resolver.api = Some(ApiAccess {
             base_url: "http://127.0.0.1:9".into(),
             token: "job-token".into(),
+            on_plan: false,
         });
         spec.task = Task::FixChecks {
             failures: vec![CheckFailure {
@@ -368,6 +377,7 @@ async fn a_fix_that_proposes_a_title_says_it_for_the_orchestrator_to_set() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::FixChecks {
         failures: vec![CheckFailure {
@@ -401,6 +411,7 @@ async fn a_rebase_agent_with_a_shell_may_regenerate_but_not_move_head() {
         spec.resolver.api = Some(ApiAccess {
             base_url: "http://127.0.0.1:9".into(),
             token: "job-token".into(),
+            on_plan: false,
         });
         let out = tmp.path().join("out");
         let result = with_fake_claude_running(tmp.path(), shell, "Resolved.")
@@ -429,43 +440,31 @@ async fn a_rebase_agent_with_a_shell_may_regenerate_but_not_move_head() {
     assert!(!bundled);
 }
 
-#[tokio::test]
-async fn a_fix_of_a_review_commits_what_the_agent_changed_with_the_fix_trailer() {
+/// Runs a fix of `feature.txt` whose agent runs `shell` and answers `answer`, then MergeLoop runs
+/// `verify`: the fix commit's message, and the files it changed.
+async fn fixed_with(shell: &str, answer: &str, verify: &[&str]) -> (String, String) {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
     let (head, trunk) = remote(&origin, "feature.txt", "other.txt");
 
-    let seen = tmp.path().join("prompt");
-    let shell = format!(
-        "printf '%s' \"$*\" > {} && echo fixed > feature.txt",
-        seen.display()
-    );
-    let executor = with_fake_claude_running(tmp.path(), &shell, "done");
+    let executor = with_fake_claude_running(tmp.path(), shell, answer);
     let mut spec = spec(&origin, &head, &trunk);
+    spec.verify = verify.iter().map(|c| c.to_string()).collect();
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
-    spec.task = Task::FixReview {
-        findings: vec![
-            serde_json::from_value(serde_json::json!({
-                "kind": "other", "title": "The socket leaks", "file": "feature.txt", "line": 1,
-                "confidence": 90, "lean": "change", "finding": "It stays open.",
-                "suggestion": "Close it."
-            }))
-            .unwrap(),
-        ],
+    spec.task = Task::FixChecks {
+        failures: vec![CheckFailure {
+            name: "Desktop Knip".into(),
+            details: "feature.txt is wrong".into(),
+        }],
     };
     let out = tmp.path().join("out");
-    let result = executor.run("t7", &spec, &out).await.unwrap();
+    let result = executor.run("t-fix", &spec, &out).await.unwrap();
     assert!(matches!(result.outcome, JobOutcome::Done), "{result:?}");
-    let prompt = std::fs::read_to_string(&seen).unwrap();
-    assert!(
-        prompt.contains("The socket leaks (feature.txt:1)"),
-        "{prompt}"
-    );
-    assert!(prompt.contains("Close it."), "{prompt}");
 
     let check = tmp.path().join("check");
     std::fs::create_dir(&check).unwrap();
@@ -480,13 +479,37 @@ async fn a_fix_of_a_review_commits_what_the_agent_changed_with_the_fix_trailer()
             "refs/heads/result:refs/heads/result",
         ],
     );
-    let log = git(&check, &["log", "-1", "--format=%B", "result"]);
-    assert!(log.contains("Fix the review's findings"), "{log}");
-    assert!(log.contains("Fixed-by: mergepatrol"), "{log}");
+    (
+        git(&check, &["log", "-1", "--format=%B", "result"]),
+        git(&check, &["diff", "--name-only", "result~1", "result"]),
+    )
 }
 
 #[tokio::test]
-async fn a_fix_of_a_review_on_a_stack_layer_goes_on_top_of_that_layer() {
+async fn a_fix_is_committed_with_the_subject_the_agent_writes() {
+    let answer = "MERGELOOP_COMMIT: fix(auth): stop exporting Session";
+    let (message, _) = fixed_with("echo fixed > feature.txt", answer, &[]).await;
+    assert!(
+        message.starts_with("fix(auth): stop exporting Session\n\nFixed-by: mergeloop"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_fix_without_a_subject_names_the_check() {
+    let (message, _) = fixed_with("echo fixed > feature.txt", "done", &[]).await;
+    assert!(message.starts_with("Fix Desktop Knip\n\n"), "{message}");
+}
+
+#[tokio::test]
+async fn a_fix_keeps_the_agents_new_files_but_not_what_the_checks_leave() {
+    let shell = "echo fixed > feature.txt && echo new > added.txt";
+    let (_, files) = fixed_with(shell, "done", &["echo junk > coverage.out"]).await;
+    assert_eq!(files, "added.txt\nfeature.txt");
+}
+
+#[tokio::test]
+async fn a_fix_on_a_stack_layer_goes_on_top_of_that_layer() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
@@ -507,16 +530,13 @@ async fn a_fix_of_a_review_on_a_stack_layer_goes_on_top_of_that_layer() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
-    spec.task = Task::FixReview {
-        findings: vec![
-            serde_json::from_value(serde_json::json!({
-                "kind": "other", "title": "Wrong", "file": "l2.txt", "line": 1,
-                "confidence": 90, "lean": "change", "finding": "It is wrong.",
-                "suggestion": "Fix it."
-            }))
-            .unwrap(),
-        ],
+    spec.task = Task::FixChecks {
+        failures: vec![CheckFailure {
+            name: "ci".into(),
+            details: "l2.txt is wrong".into(),
+        }],
     };
     let out = tmp.path().join("out");
     let result = executor.run("t-layer", &spec, &out).await.unwrap();
@@ -552,7 +572,7 @@ async fn a_review_since_an_approval_names_only_the_queues_commits() {
     git(&origin, &["add", "-A"]);
     git(
         &origin,
-        &["commit", "-qm", "Fix ci\n\nFixed-by: mergepatrol, a"],
+        &["commit", "-qm", "Fix ci\n\nFixed-by: mergeloop, a"],
     );
     let head = git(&origin, &["rev-parse", "HEAD"]);
 
@@ -564,11 +584,14 @@ async fn a_review_since_an_approval_names_only_the_queues_commits() {
     spec.resolver.api = Some(mergepatrol_executor::protocol::ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "t".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
         sent_back: Vec::new(),
         since: Some(approved),
+        reviewed: None,
+        depth: mergepatrol_core::Depth::Standard,
     };
     let result = executor
         .run("t6", &spec, &tmp.path().join("out"))
@@ -580,6 +603,90 @@ async fn a_review_since_an_approval_names_only_the_queues_commits() {
     assert!(prompt.contains("Fix ci"), "{prompt}");
 }
 
+/// The prompt a review job gives its agent, of `head` in `origin`, after a review of `reviewed`.
+async fn review_prompt_after(
+    tmp: &Path,
+    origin: &Path,
+    trunk: &str,
+    head: &str,
+    reviewed: &str,
+) -> String {
+    let seen = tmp.join("prompt");
+    let keep = format!("printf '%s' \"$*\" > {}", seen.display());
+    let answer = r#"{"summary":"s","findings":[]}"#;
+    let executor = with_fake_claude_running(tmp, &keep, answer);
+    let mut spec = spec(origin, head, trunk);
+    spec.resolver.api = Some(mergepatrol_executor::protocol::ApiAccess {
+        base_url: "http://127.0.0.1:9".into(),
+        token: "t".into(),
+        on_plan: false,
+    });
+    spec.task = Task::Review {
+        answered: Vec::new(),
+        sent_back: Vec::new(),
+        since: None,
+        reviewed: Some(reviewed.into()),
+        depth: mergepatrol_core::Depth::Standard,
+    };
+    let result = executor.run("t7", &spec, &tmp.join("out")).await.unwrap();
+    assert!(matches!(result.outcome, JobOutcome::Done), "{result:?}");
+    std::fs::read_to_string(&seen).unwrap()
+}
+
+/// A remote whose `pr` branch was reviewed at its one commit: the trunk's head and that commit.
+fn reviewed_pr(origin: &Path) -> (String, String) {
+    std::fs::create_dir(origin).unwrap();
+    git(origin, &["init", "-q", "-b", "main"]);
+    let trunk = commit(origin, "app.rs", "one\n");
+    git(origin, &["checkout", "-q", "-b", "pr"]);
+    (trunk, commit(origin, "app.rs", "two\n"))
+}
+
+#[tokio::test]
+async fn a_review_after_findings_went_back_reads_only_what_changed_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let (trunk, reviewed) = reviewed_pr(&origin);
+    let head = commit(&origin, "app.rs", "three\n");
+
+    let prompt = review_prompt_after(tmp.path(), &origin, &trunk, &head, &reviewed).await;
+    assert!(
+        prompt.contains(&format!("Review only `git diff {reviewed}..HEAD`")),
+        "{prompt}"
+    );
+}
+
+#[tokio::test]
+async fn a_review_after_a_rebase_reads_the_whole_pr_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let (_, reviewed) = reviewed_pr(&origin);
+    git(&origin, &["checkout", "-q", "main"]);
+    let trunk = commit(&origin, "other.rs", "moved on\n");
+    git(&origin, &["checkout", "-q", "pr"]);
+    git(&origin, &["rebase", "-q", "main"]);
+    let head = commit(&origin, "app.rs", "three\n");
+
+    let prompt = review_prompt_after(tmp.path(), &origin, &trunk, &head, &reviewed).await;
+    assert!(!prompt.contains("Review only"), "{prompt}");
+}
+
+#[tokio::test]
+async fn a_review_after_the_trunk_was_merged_in_reads_the_whole_pr_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let (_, reviewed) = reviewed_pr(&origin);
+    git(&origin, &["checkout", "-q", "main"]);
+    let trunk = commit(&origin, "other.rs", "moved on\n");
+    git(&origin, &["checkout", "-q", "pr"]);
+    // As GitHub's "Update branch" does: the head still descends from the reviewed one.
+    git(&origin, &["merge", "-q", "--no-edit", "main"]);
+    let head = commit(&origin, "app.rs", "three\n");
+
+    let prompt = review_prompt_after(tmp.path(), &origin, &trunk, &head, &reviewed).await;
+    assert!(!prompt.contains("Review only"), "{prompt}");
+}
+
 #[tokio::test]
 async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
     let tmp = tempfile::tempdir().unwrap();
@@ -589,7 +696,9 @@ async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
     let lines: String = (1..=20).map(|i| format!("line {i}\n")).collect();
     let trunk = commit(&origin, "app.rs", &lines);
     git(&origin, &["checkout", "-q", "-b", "pr"]);
-    let changed = lines.replace("line 10\n", "line 10 changed\n");
+    let changed = lines
+        .replace("line 10\n", "line 10 changed\n")
+        .replace("line 19\n", "line 19 changed\n");
     let head = commit(&origin, "app.rs", &changed);
 
     let answer = serde_json::json!({
@@ -598,7 +707,8 @@ async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
             "kind": "security", "title": "Line 10 changed", "file": "app.rs", "line": 10,
             "confidence": 64, "lean": "fine", "finding": "f", "unsure": "u",
             "checked": ["c"], "would_clear": "w", "suggestion": "s",
-            "related": [{ "file": "app.rs", "line": 2, "why": "context" }]
+            "related": [{ "file": "app.rs", "line": 2, "why": "context" }],
+            "also_at": [{ "file": "app.rs", "line": 19 }]
         }]
     })
     .to_string();
@@ -606,11 +716,14 @@ async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
         sent_back: Vec::new(),
         since: None,
+        reviewed: None,
+        depth: mergepatrol_core::Depth::Standard,
     };
     let out = tmp.path().join("out");
     // The fake CLI echoes its answer, so one line: `echo` would break a `\n`.
@@ -640,6 +753,14 @@ async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
     );
     let related: Vec<&str> = f.related[0].code.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(related, ["line 1", "line 2", "line 3", "line 4", "line 5"]);
+    // Each other place the bug is shows the PR's change there.
+    let also: Vec<&str> = f.also_at[0]
+        .code
+        .iter()
+        .filter(|c| c.hot)
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(also, ["line 19 changed"]);
 
     // A question about it, answered in plain text.
     spec.task = Task::Question {
@@ -661,10 +782,9 @@ async fn a_review_writes_what_the_agent_found_with_the_code_it_is_about() {
 }
 
 /// The review's word that a command fails counts for nothing: the job runs each change's command
-/// on the head with only the files it names. The fix then starts from that test, must leave it as
-/// it is, and must make it pass.
+/// on the head with only the files it names.
 #[tokio::test]
-async fn evidence_counts_only_once_the_job_saw_it_fail_and_the_fix_must_make_it_pass() {
+async fn evidence_counts_only_once_the_job_saw_it_fail() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
@@ -673,11 +793,14 @@ async fn evidence_counts_only_once_the_job_saw_it_fail_and_the_fix_must_make_it_
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
         sent_back: Vec::new(),
         since: None,
+        reviewed: None,
+        depth: mergepatrol_core::Depth::Standard,
     };
     let change = |title: &str, evidence: serde_json::Value| {
         serde_json::json!({
@@ -739,70 +862,6 @@ async fn evidence_counts_only_once_the_job_saw_it_fail_and_the_fix_must_make_it_
     // Each command runs on a fresh tree: no ignored file the agent or an earlier command left.
     assert!(evidence(4).failed);
     assert!(!evidence(5).failed, "{:?}", evidence(5));
-
-    // The fix: the review's test is in place, and passes once the fix is in.
-    let mut fix = |dir: &Path, shell: &str| {
-        spec.task = Task::FixReview {
-            findings: vec![review.findings[0].clone()],
-        };
-        let spec = spec.clone();
-        let dir = dir.to_owned();
-        let shell = shell.to_owned();
-        async move {
-            let out = dir.join("out");
-            let result = with_fake_claude_running(&dir, &shell, "done")
-                .run("t9", &spec, &out)
-                .await
-                .unwrap();
-            (result, out)
-        }
-    };
-    let fixed = tempfile::tempdir().unwrap();
-    let shell = "test -f check.sh && echo fixed > app.txt";
-    let (result, out) = fix(fixed.path(), shell).await;
-    assert!(matches!(result.outcome, JobOutcome::Done), "{result:?}");
-    let check = tmp.path().join("check");
-    std::fs::create_dir(&check).unwrap();
-    git(&check, &["init", "-q"]);
-    git(&check, &["fetch", "-q", origin.to_str().unwrap(), "pr"]);
-    let bundle = out.join(BUNDLE_FILE);
-    let refspec = "refs/heads/result:refs/heads/result";
-    git(&check, &["fetch", "-q", bundle.to_str().unwrap(), refspec]);
-    assert_eq!(
-        git(&check, &["show", "result:check.sh"]),
-        "grep -q fixed app.txt",
-        "the review's test is committed with the fix"
-    );
-
-    let weakened = tempfile::tempdir().unwrap();
-    let (result, _) = fix(weakened.path(), "echo true > check.sh").await;
-    let JobOutcome::Failed { reason } = result.outcome else {
-        panic!("{result:?}");
-    };
-    assert!(reason.contains("changed the review's test"), "{reason}");
-
-    let missed = tempfile::tempdir().unwrap();
-    let (result, _) = fix(missed.path(), "echo other > app.txt").await;
-    let JobOutcome::Failed { reason } = result.outcome else {
-        panic!("{result:?}");
-    };
-    assert!(reason.contains("`sh check.sh` still fails"), "{reason}");
-
-    // A command may write files too: the review's test is checked once every command ran.
-    let mut rewrites = review.findings[0].clone();
-    rewrites.evidence.as_mut().unwrap().command = "sh check.sh && echo true > check.sh".into();
-    spec.task = Task::FixReview {
-        findings: vec![rewrites],
-    };
-    let rewritten = tempfile::tempdir().unwrap();
-    let result = with_fake_claude_running(rewritten.path(), "echo fixed > app.txt", "done")
-        .run("t10", &spec, &rewritten.path().join("out"))
-        .await
-        .unwrap();
-    let JobOutcome::Failed { reason } = result.outcome else {
-        panic!("{result:?}");
-    };
-    assert!(reason.contains("changed the review's test"), "{reason}");
 }
 
 #[tokio::test]
@@ -815,11 +874,14 @@ async fn a_review_the_agent_cannot_give_fails_and_says_why() {
     spec.resolver.api = Some(ApiAccess {
         base_url: "http://127.0.0.1:9".into(),
         token: "job-token".into(),
+        on_plan: false,
     });
     spec.task = Task::Review {
         answered: Vec::new(),
         sent_back: Vec::new(),
         since: None,
+        reviewed: None,
+        depth: mergepatrol_core::Depth::Standard,
     };
     let out = tmp.path().join("out");
     let result = with_fake_claude(tmp.path(), "Looks good to me!")
@@ -1000,6 +1062,7 @@ async fn an_openai_conflict_is_resolved_through_the_proxy() {
     spec.resolver.api = Some(ApiAccess {
         base_url: Api::of(Provider::OpenAi, &spec.resolver.model).base_url(&proxy_url),
         token: granted.token.clone(),
+        on_plan: false,
     });
     let out = tmp.path().join("out");
     let executor = LocalExecutor {
@@ -1028,5 +1091,204 @@ async fn an_openai_conflict_is_resolved_through_the_proxy() {
         "{resolved}"
     );
     let log = git(&check, &["log", "-1", "--format=%B", "FETCH_HEAD"]);
-    assert!(log.contains("Resolved-by: mergepatrol, codex ("), "{log}");
+    assert!(log.contains("Resolved-by: mergeloop, codex ("), "{log}");
+}
+
+/// A branch kept up to date by merging, as #237's author does: `a.ts` conflicted with the trunk
+/// once, and a merge commit on the branch resolved it. The trunk then moved on elsewhere.
+/// Returns the remote's PR head and trunk.
+fn merged_branch(dir: &Path) -> (String, String) {
+    git(dir, &["init", "-q", "-b", "main"]);
+    commit(dir, "a.ts", "base\n");
+    git(dir, &["checkout", "-q", "-b", "pr"]);
+    commit(dir, "a.ts", "pr\n");
+    git(dir, &["checkout", "-q", "main"]);
+    commit(dir, "a.ts", "main\n");
+    git(dir, &["checkout", "-q", "pr"]);
+    let out = Command::new("git")
+        .args(["-c", "user.name=Ada", "-c", "user.email=ada@example.com"])
+        .args(["merge", "-q", "main"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the merge conflicts");
+    git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+    std::fs::write(dir.join("a.ts"), "main\npr\n").unwrap();
+    git(dir, &["add", "a.ts"]);
+    git(dir, &["commit", "-q", "--no-edit"]);
+    let head = git(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(dir, &["rev-list", "--parents", "-n1", &head])
+            .split(' ')
+            .count(),
+        3
+    );
+    git(dir, &["checkout", "-q", "main"]);
+    let trunk = commit(dir, "other.txt", "from main\n");
+    (head, trunk)
+}
+
+/// The job's bundle, fetched into a fresh repo with `main` from `origin`, at `result`.
+fn fetched_result(dir: &Path, origin: &Path, out: &Path) -> std::path::PathBuf {
+    let check = dir.join("check");
+    std::fs::create_dir(&check).unwrap();
+    git(&check, &["init", "-q"]);
+    git(
+        &check,
+        &["fetch", "-q", origin.to_str().unwrap(), "main", "pr"],
+    );
+    git(
+        &check,
+        &[
+            "fetch",
+            "-q",
+            out.join(BUNDLE_FILE).to_str().unwrap(),
+            "refs/heads/result:refs/heads/result",
+        ],
+    );
+    check
+}
+
+#[tokio::test]
+async fn a_branch_that_merged_the_trunk_in_is_updated_by_merging_it_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    let (head, trunk) = merged_branch(&origin);
+
+    // No agent: the branch already resolves the conflict a rebase would replay.
+    let mut spec = spec(&origin, &head, &trunk);
+    spec.leave_conflicts = true;
+    spec.update = Update::Either;
+    let out = tmp.path().join("out");
+    let result = executor().run("t-merged", &spec, &out).await.unwrap();
+    assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
+
+    let check = fetched_result(tmp.path(), &origin, &out);
+    assert_merge_of(&check, &head, &trunk);
+    assert_eq!(git(&check, &["show", "result:a.ts"]), "main\npr");
+    assert_eq!(git(&check, &["show", "result:other.txt"]), "from main");
+    let message = git(&check, &["log", "-1", "--format=%B", "result"]);
+    assert!(message.starts_with("Merge main into pr"), "{message}");
+    assert!(message.contains("Updated-by: mergeloop"), "{message}");
+
+    // A repo that merges PRs by rebasing them gets its rebase, conflict and all.
+    spec.update = Update::Rebase;
+    let result = executor()
+        .run("t-merged-rebase", &spec, &tmp.path().join("out2"))
+        .await
+        .unwrap();
+    let JobOutcome::Failed { reason } = result.outcome else {
+        panic!("{result:?}")
+    };
+    assert!(reason.starts_with("it conflicts in a.ts"), "{reason}");
+}
+
+/// `result` is a merge commit of `trunk` into `head`.
+fn assert_merge_of(check: &Path, head: &str, trunk: &str) {
+    assert_eq!(
+        git(check, &["rev-list", "--parents", "-n1", "result"]),
+        format!("{} {head} {trunk}", git(check, &["rev-parse", "result"]))
+    );
+}
+
+#[tokio::test]
+async fn a_linear_branch_whose_rebase_conflicts_and_merge_does_not_is_merged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    commit(&origin, "a.ts", "base\n");
+    git(&origin, &["checkout", "-q", "-b", "pr"]);
+    // A change to `a.ts` the branch later undoes: replayed, it conflicts; merged, it is gone.
+    commit(&origin, "a.ts", "tried\n");
+    commit(&origin, "a.ts", "base\n");
+    let head = commit(&origin, "feature.txt", "from the pr\n");
+    git(&origin, &["checkout", "-q", "main"]);
+    let trunk = commit(&origin, "a.ts", "main\n");
+
+    let mut spec = spec(&origin, &head, &trunk);
+    spec.leave_conflicts = true;
+    spec.update = Update::Either;
+    let out = tmp.path().join("out");
+    let result = executor().run("t-linear", &spec, &out).await.unwrap();
+    assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
+    let check = fetched_result(tmp.path(), &origin, &out);
+    assert_merge_of(&check, &head, &trunk);
+    assert_eq!(git(&check, &["show", "result:a.ts"]), "main");
+}
+
+#[tokio::test]
+async fn a_linear_branch_that_rebases_cleanly_is_rebased() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    let (head, trunk) = remote(&origin, "feature.txt", "other.txt");
+    let mut spec = spec(&origin, &head, &trunk);
+    spec.update = Update::Either;
+    let out = tmp.path().join("out");
+    let result = executor().run("t-clean", &spec, &out).await.unwrap();
+    assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
+    let check = fetched_result(tmp.path(), &origin, &out);
+    assert_eq!(git(&check, &["rev-parse", "result~1"]), trunk);
+    assert_eq!(
+        git(&check, &["rev-list", "--count", "--merges", "result"]),
+        "0"
+    );
+}
+
+#[tokio::test]
+async fn a_rebase_that_ran_out_of_time_is_merged_instead() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    let (head, trunk) = remote(&origin, "feature.txt", "other.txt");
+    let mut spec = spec(&origin, &head, &trunk);
+    spec.update = Update::Merge;
+    let out = tmp.path().join("out");
+    let result = executor().run("t-forced", &spec, &out).await.unwrap();
+    assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
+    let check = fetched_result(tmp.path(), &origin, &out);
+    assert_merge_of(&check, &head, &trunk);
+}
+
+#[tokio::test]
+async fn a_merge_that_conflicts_has_the_agent_resolve_it_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    let (head, _) = merged_branch(&origin);
+    // The trunk changes `a.ts` again, after the branch's merge.
+    let trunk = commit(&origin, "a.ts", "main again\n");
+
+    let mut spec = spec(&origin, &head, &trunk);
+    spec.update = Update::Either;
+    spec.resolver.api = Some(ApiAccess {
+        base_url: "http://127.0.0.1:9".into(),
+        token: "job-token".into(),
+        on_plan: false,
+    });
+    let out = tmp.path().join("out");
+    let result = with_fake_claude_running(
+        tmp.path(),
+        "printf 'main again\\npr\\n' > a.ts",
+        "Resolved.",
+    )
+    .run("t-merge-conflict", &spec, &out)
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, JobOutcome::Done, "{result:?}");
+    let resolved = result
+        .events
+        .iter()
+        .filter(|e| e.kind == "resolved")
+        .count();
+    assert_eq!(resolved, 1, "{:?}", result.events);
+
+    let check = fetched_result(tmp.path(), &origin, &out);
+    assert_merge_of(&check, &head, &trunk);
+    assert_eq!(git(&check, &["show", "result:a.ts"]), "main again\npr");
+    let message = git(&check, &["log", "-1", "--format=%B", "result"]);
+    assert!(message.contains("Resolved-by: mergeloop"), "{message}");
+    assert!(message.contains("Updated-by: mergeloop"), "{message}");
 }

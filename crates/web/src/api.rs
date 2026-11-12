@@ -1,22 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use mergepatrol_core::{
-    AgentSettings, EFFORTS, Entry, EntryState, FixCiSettings, Labels, Lane, ModelOverrides, Person,
-    PrSummary, Provider, REPO_CONFIG_PATH, RepoName, RepoSettings, Runs, Spend, SpendTask, Stage,
-    Step, TaskModel, WorkspaceDefaults, current_step,
+    AgentSettings, ConfigPath, ConfigText, EFFORTS, Entry, EntryState, FixCiSettings, Labels, Lane,
+    LayerSummary, ModelOverrides, Person, PrSummary, Provider, RepoName, RepoSettings, Spend,
+    SpendTask, Stage, Step, TaskModel, WorkspaceDefaults, current_step,
 };
 use mergepatrol_github::{
-    App, AsUser, BranchFile, CheckRunState, DiffOf, GitObject, InboxPull, Installation, Proposal,
-    PullDetail, PullRef, PullRequest, SYMLINK_MODE, TimelineEvent, setup,
+    App, BranchFile, ConfigFile, GitObject, Installation, Proposal, PullRef, SYMLINK_MODE, setup,
 };
 use mergepatrol_resolver::{DeviceLogin, KeyCheck, check_api_key};
 use mergepatrol_store::{
     CHATGPT_DEVICE_LOGIN, CHATGPT_LOGIN, Change, DeveloperStats, EventRecord, ExitQuery,
-    ExitRecord, ExitStats, InboxRow, LaneKey, RepoState, ReviewRecord, Scope, Slice, Store,
-    api_key_secret,
+    ExitRecord, ExitStats, LaneKey, RepoState, ReviewRecord, Scope, Slice, Store, api_key_secret,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -80,7 +78,7 @@ pub struct EntryView {
     /// What the queue is doing with it now. Null unless `state` is `active`, or until its job
     /// has begun.
     pub step: Option<ActiveStepView>,
-    /// The fixes it has used, for its checks and its review.
+    /// The fixes it has used, for its checks.
     pub fixes: u32,
     /// The fixes it gets.
     pub fix_budget: u32,
@@ -92,19 +90,12 @@ pub struct EntryView {
     pub pull: PullView,
     /// A stack's PRs, bottom to top: `number` is the stack's. Empty for a PR.
     pub layers: Vec<u32>,
+    /// A stack's PRs as of the last tick, bottom to top. Empty for a PR, and for a stack until
+    /// the tick after it was saved without them.
+    pub stack: Vec<LayerView>,
     /// The agent's review of the PR, or of the stack's layer it is held for, else its top: the
     /// newest, of whatever head.
     pub review: Option<crate::review::ReviewBriefView>,
-}
-
-/// An open PR that is not in the queue.
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct OpenPullView {
-    pub number: u32,
-    pub draft: bool,
-    #[serde(flatten)]
-    pub pull: PullView,
 }
 
 /// What the dashboard shows of a PR, queued or not.
@@ -129,6 +120,47 @@ pub struct PullView {
     pub requested: Vec<PersonView>,
     /// The head commit's combined checks. `None` without checks.
     pub checks: Option<ChecksView>,
+}
+
+/// What the dashboard shows of a PR of a stack.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct LayerView {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub head_ref: String,
+    /// `None` for a deleted account.
+    pub author: Option<PersonView>,
+    pub additions: u32,
+    pub deletions: u32,
+    /// The head commit's combined checks. `None` without checks.
+    pub checks: Option<ChecksView>,
+}
+
+impl From<LayerSummary> for LayerView {
+    fn from(l: LayerSummary) -> Self {
+        LayerView {
+            number: l.number as u32,
+            title: l.title,
+            url: l.url,
+            head_ref: l.head_ref,
+            author: l.author.map(PersonView::from),
+            additions: l.additions as u32,
+            deletions: l.deletions as u32,
+            checks: checks_view(l.checks.as_deref()),
+        }
+    }
+}
+
+/// GitHub's combined state of a commit's checks, as the dashboard shows it.
+fn checks_view(state: Option<&str>) -> Option<ChecksView> {
+    match state {
+        Some("SUCCESS") => Some(ChecksView::Passed),
+        Some("FAILURE" | "ERROR") => Some(ChecksView::Failed),
+        Some(_) => Some(ChecksView::Pending),
+        None => None,
+    }
 }
 
 #[derive(Serialize, TS)]
@@ -182,11 +214,12 @@ impl EntryView {
             number,
             priority,
             state,
-            summary: pr,
+            summary: mut pr,
             layers,
             heads: _,
             recheck: _,
         } = e;
+        let stack = std::mem::take(&mut pr.stack);
         let stage = state.stage().map(StageView::from);
         let (fixes, fix_budget) = (pr.fixes, pr.fix_budget);
         let (state, detail, hold) = match state {
@@ -210,6 +243,7 @@ impl EntryView {
             hold,
             pull: pr.into(),
             layers: layers.into_iter().map(|n| n as u32).collect(),
+            stack: stack.into_iter().map(LayerView::from).collect(),
             review,
         }
     }
@@ -242,12 +276,7 @@ impl From<PrSummary> for PullView {
                 })
                 .collect(),
             requested: pr.requested.into_iter().map(PersonView::from).collect(),
-            checks: match pr.checks.as_deref() {
-                Some("SUCCESS") => Some(ChecksView::Passed),
-                Some("FAILURE" | "ERROR") => Some(ChecksView::Failed),
-                Some(_) => Some(ChecksView::Pending),
-                None => None,
-            },
+            checks: checks_view(pr.checks.as_deref()),
         }
     }
 }
@@ -259,96 +288,6 @@ pub enum EntryStateView {
     Waiting,
     Held,
     Active,
-}
-
-/// The signed-in user's PRs, and the PRs that ask for their review, across their workspaces.
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct YouView {
-    /// Theirs and open, updated last first.
-    pub authored: Vec<InboxPullView>,
-    /// Asked of them, or of a team of theirs, updated last first.
-    pub review_requested: Vec<InboxPullView>,
-    /// Theirs, merged in the last week, last first.
-    pub merged: Vec<InboxPullView>,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct InboxPullView {
-    pub repo: String,
-    pub number: u32,
-    /// The branch it merges into.
-    pub base: String,
-    pub draft: bool,
-    pub updated_at: String,
-    /// When it merged, for a merged one.
-    pub merged_at: Option<String>,
-    /// The workspace the PR is in, to act on it in.
-    pub workspace: u32,
-    /// Whether MergeLoop runs on the repo, so the PR can be queued.
-    pub queues: bool,
-    /// Where the queue has it. `None` when it is not queued.
-    pub queue: Option<QueueSpotView>,
-    /// Comments and reviews by others since the user last opened it here, or last said
-    /// something on it.
-    pub unread: u32,
-    /// Until when the user snoozed it, RFC 3339. A snooze is over once someone else says
-    /// something on the PR.
-    pub snoozed_until: Option<String>,
-    /// Its review threads no one resolved yet, of the first 100.
-    pub unresolved_threads: u32,
-    #[serde(flatten)]
-    pub pull: PullView,
-}
-
-/// A PR's place in its lane, in merge order.
-#[derive(Clone, Debug, Serialize, TS)]
-#[ts(export)]
-pub struct QueueSpotView {
-    pub state: EntryStateView,
-    /// From 1. A held PR has one too: last, after those waiting.
-    pub place: u32,
-    /// The PRs in the lane.
-    pub of: u32,
-    pub priority: bool,
-    /// Why it is held.
-    pub detail: Option<String>,
-    /// Why it is held, typed: whether it waits on its author or on others.
-    pub hold: Option<crate::v1::HoldReasonView>,
-}
-
-/// Puts a PR out of the user's inbox for a while.
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct SnoozePull {
-    /// From 1 to a year's.
-    pub minutes: u32,
-}
-
-/// Asks the reviewers who have not answered to review, in a comment that mentions them.
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct NudgePull {
-    pub reviewers: Vec<String>,
-}
-
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct ReviewPull {
-    pub verdict: VerdictView,
-    pub body: String,
-    /// Then queue it, as the Queue button would.
-    pub queue: bool,
-}
-
-#[derive(Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum VerdictView {
-    Approve,
-    RequestChanges,
-    Comment,
 }
 
 #[derive(Serialize, TS)]
@@ -468,7 +407,8 @@ pub struct LlmRunsView {
     pub turns: u32,
     /// Of the runs whose CLI told their cost.
     pub cost_usd: f64,
-    /// The runs whose CLI did not, such as Codex's: `cost_usd` leaves them out.
+    /// The runs without a cost, such as one on a model we have no price for: `cost_usd` leaves
+    /// them out.
     pub unpriced: u32,
 }
 
@@ -641,7 +581,7 @@ pub struct RepoView {
     pub on: bool,
     /// Set in the dashboard. `None` follows the config file.
     pub enabled: Option<bool>,
-    /// The default branch has `.mergepatrol/mergepatrol.yml`, as of the last look.
+    /// The default branch has the config file, as of the last look.
     pub has_config: bool,
     /// Why the queue is paused: the config file does not parse.
     pub config_error: Option<String>,
@@ -658,10 +598,6 @@ pub struct SetRepo {
 #[derive(Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RepoSettingsView {
-    /// Who resolves conflicts and fixes failed checks: MergeLoop's agent, or the author's.
-    #[serde(default)]
-    #[ts(type = "\"hosted\" | \"local\"")]
-    pub runs: Runs,
     pub label: String,
     pub batch_size: u32,
     #[ts(type = "\"anthropic\" | \"openai\" | \"openrouter\"")]
@@ -738,7 +674,6 @@ impl From<ModelOverridesView> for ModelOverrides {
 impl From<RepoSettings> for RepoSettingsView {
     fn from(s: RepoSettings) -> Self {
         RepoSettingsView {
-            runs: s.agent.runs,
             label: s.label,
             batch_size: s.batch_size as u32,
             provider: s.agent.provider,
@@ -760,7 +695,6 @@ impl From<RepoSettingsView> for RepoSettings {
             label: v.label.trim().to_owned(),
             batch_size: v.batch_size as usize,
             agent: AgentSettings {
-                runs: v.runs,
                 provider: v.provider,
                 model: v.model.trim().to_owned(),
                 effort: v.effort,
@@ -1073,39 +1007,6 @@ impl From<EventRecord> for EventView {
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct FixQuery {
-    repo: String,
-    sha: String,
-}
-
-/// A fix the agent pushed, as `git diff` prints it.
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct FixView {
-    pub patch: String,
-}
-
-/// The changes of the fix agent's commit `sha`. Not of any other commit.
-pub(crate) async fn fix(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path(id): Path<u64>,
-    Query(q): Query<FixQuery>,
-) -> Result<Json<FixView>, ApiError> {
-    let repo = RepoName::parse(&q.repo).ok_or(ApiError::bad_request("repo must be owner/name"))?;
-    let id = caller.repo(&app, id, &repo).await?;
-    if q.sha.len() != 40 || !q.sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ApiError::bad_request("sha must be a commit SHA"));
-    }
-    let patch = installation(&app, id)
-        .await?
-        .fix_patch(&repo, &q.sha)
-        .await?
-        .ok_or_else(|| ApiError::Status(StatusCode::NOT_FOUND, "no such fix".into()))?;
-    Ok(Json(FixView { patch }))
-}
-
 const HISTORY_PAGE: u32 = 50;
 
 #[derive(Deserialize)]
@@ -1125,7 +1026,7 @@ pub(crate) struct HistoryQuery {
 }
 
 impl HistoryQuery {
-    fn repo(&self) -> Result<Option<RepoName>, ApiError> {
+    pub(crate) fn repo(&self) -> Result<Option<RepoName>, ApiError> {
         self.repo
             .as_deref()
             .map(|r| RepoName::parse(r).ok_or(ApiError::bad_request("repo must be owner/name")))
@@ -1141,7 +1042,7 @@ impl HistoryQuery {
         }
     }
 
-    fn days(&self) -> Result<u32, ApiError> {
+    pub(crate) fn days(&self) -> Result<u32, ApiError> {
         match self.days {
             1..=365 => Ok(self.days),
             _ => Err(ApiError::bad_request("days must be from 1 to 365")),
@@ -1340,362 +1241,6 @@ pub(crate) async fn set_repo(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// How many open PRs the queue page lists below the queue.
-const OPEN_PULLS: u32 = 50;
-
-/// The repo's open PRs into its default branch that are not in its queue, updated last first.
-/// From the inbox, so a viewer's polling reads nothing of GitHub. Until the inbox has read all of
-/// the repo, read as the user: each viewer's polling spends their own rate limit, not the
-/// queue's. A revoked token means signing in again.
-pub(crate) async fn open_pulls(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name)): Path<(u64, String, String)>,
-) -> Result<Json<Vec<OpenPullView>>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    // The config file as the queue last read it, `Some(None)` for none: its trigger label says
-    // which PRs are queued. Until both are read, as the user.
-    let kept = match app.store.inbox_open(id, &repo).await? {
-        Some(nodes) => app.store.config_read(id, &repo).await?.map(|c| (nodes, c)),
-        None => None,
-    };
-    let (pulls, labels) = match kept {
-        Some((nodes, config)) => {
-            let pulls = nodes
-                .into_iter()
-                .map(serde_json::from_value)
-                .collect::<Result<Vec<PullRequest>, _>>()
-                .map_err(anyhow::Error::from)?;
-            (pulls, labels_in(&app, id, config.as_deref()).await?)
-        }
-        None => {
-            let gh = AsUser::new(caller.github_token(&app)?)?;
-            let file = as_user(gh.default_branch_file(&repo, REPO_CONFIG_PATH).await, &repo)?;
-            let (labels, trunk) = labels_of(&app, id, file).await?;
-            let pulls = as_user(
-                gh.open_pull_requests(&repo, &trunk, OPEN_PULLS).await,
-                &repo,
-            )?;
-            (pulls, labels)
-        }
-    };
-    // A stack's layers are in the queue with it, though one layer alone may have the label.
-    let queued: HashSet<u64> = app
-        .store
-        .lanes(id)
-        .await?
-        .into_iter()
-        .filter(|(key, _)| key.repo == repo)
-        .flat_map(|(_, lane)| lane.entries)
-        .flat_map(|e| std::iter::once(e.number).chain(e.layers))
-        .collect();
-    Ok(Json(
-        pulls
-            .into_iter()
-            .filter(|pr| !pr.has_label(&labels.trigger) && !queued.contains(&pr.number))
-            .take(OPEN_PULLS as usize)
-            .map(|pr| OpenPullView {
-                number: pr.number as u32,
-                draft: pr.is_draft,
-                pull: pr.summary().into(),
-            })
-            .collect(),
-    ))
-}
-
-/// What the detail pane shows of an open PR beyond its [`OpenPullView`].
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct PullDetailView {
-    /// The head commit's SHA.
-    pub head: String,
-    /// The base branch's commit, by SHA. With `head`, what the PR's diff is of.
-    pub base: String,
-    /// The description as GitHub renders it, sanitized by GitHub. In a private repo, images of
-    /// its own files carry short-lived signed URLs, so any page can load them.
-    pub body_html: String,
-    pub labels: Vec<LabelView>,
-    /// The head commit's check runs and commit statuses.
-    pub checks: Vec<CheckRunView>,
-    /// Oldest first, up to the last 100 events.
-    pub timeline: Vec<TimelineItemView>,
-    /// Its review comments: how many threads are open, of how many.
-    pub review_threads: ReviewThreadsView,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct ReviewThreadsView {
-    /// Unresolved, of the threads read.
-    pub open: u32,
-    pub total: u32,
-    /// The threads read: the first 100. Under `total`, more may be open than `open` says.
-    pub read: u32,
-    /// The unresolved ones, in the PR's order.
-    pub open_threads: Vec<ReviewThreadView>,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct ReviewThreadView {
-    pub path: String,
-    pub line: Option<u32>,
-    pub author: Option<String>,
-    /// The first line of its first comment.
-    pub title: String,
-    pub url: String,
-    /// Its comments, replies too.
-    pub comments: u32,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct LabelView {
-    pub name: String,
-    /// Hex, without `#`.
-    pub color: String,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct CheckRunView {
-    /// `workflow / job` for an Actions job.
-    pub name: String,
-    pub state: CheckRunStateView,
-    pub url: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-}
-
-#[derive(Serialize, TS)]
-#[serde(rename_all = "lowercase")]
-#[ts(export)]
-pub enum CheckRunStateView {
-    Passed,
-    Failed,
-    Pending,
-    Skipped,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct TimelineItemView {
-    pub at: String,
-    /// `None` for a deleted account.
-    pub actor: Option<PersonView>,
-    pub event: TimelineEventView,
-}
-
-#[derive(Serialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export)]
-pub enum TimelineEventView {
-    Commit {
-        sha: String,
-        headline: String,
-    },
-    Review {
-        approval: ReviewStateView,
-        body_html: String,
-    },
-    Comment {
-        body_html: String,
-    },
-    /// A user's login, or a team's name.
-    ReviewRequested {
-        reviewer: String,
-    },
-    Labeled {
-        label: LabelView,
-        added: bool,
-    },
-    ForcePushed {
-        before: String,
-        after: String,
-    },
-    ReadyForReview,
-    ConvertedToDraft,
-}
-
-#[derive(Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ReviewStateView {
-    Approved,
-    ChangesRequested,
-    Commented,
-    Dismissed,
-}
-
-impl From<mergepatrol_github::Label> for LabelView {
-    fn from(l: mergepatrol_github::Label) -> Self {
-        LabelView {
-            name: l.name,
-            color: l.color,
-        }
-    }
-}
-
-impl From<PullDetail> for PullDetailView {
-    fn from(d: PullDetail) -> Self {
-        let read = d.threads.len() as u32;
-        let open_threads: Vec<ReviewThreadView> = d
-            .threads
-            .into_iter()
-            .filter(|t| !t.resolved)
-            .map(|t| ReviewThreadView {
-                path: t.path,
-                line: t.line,
-                author: t.author,
-                title: t.title,
-                url: t.url,
-                comments: t.comments,
-            })
-            .collect();
-        PullDetailView {
-            head: d.head,
-            base: d.base,
-            review_threads: ReviewThreadsView {
-                open: open_threads.len() as u32,
-                total: d.thread_count.max(read),
-                read,
-                open_threads,
-            },
-            body_html: d.body_html,
-            labels: d.labels.into_iter().map(LabelView::from).collect(),
-            checks: d
-                .checks
-                .into_iter()
-                .map(|c| CheckRunView {
-                    name: c.name,
-                    state: match c.state {
-                        CheckRunState::Passed => CheckRunStateView::Passed,
-                        CheckRunState::Failed => CheckRunStateView::Failed,
-                        CheckRunState::Pending => CheckRunStateView::Pending,
-                        CheckRunState::Skipped => CheckRunStateView::Skipped,
-                    },
-                    url: c.url,
-                    started_at: c.started_at,
-                    completed_at: c.completed_at,
-                })
-                .collect(),
-            timeline: d
-                .timeline
-                .into_iter()
-                .map(|t| TimelineItemView {
-                    at: t.at,
-                    actor: t.actor.map(PersonView::from),
-                    event: match t.event {
-                        TimelineEvent::Commit { sha, headline } => {
-                            TimelineEventView::Commit { sha, headline }
-                        }
-                        TimelineEvent::Review { state, body_html } => TimelineEventView::Review {
-                            approval: match state.as_str() {
-                                "APPROVED" => ReviewStateView::Approved,
-                                "CHANGES_REQUESTED" => ReviewStateView::ChangesRequested,
-                                "DISMISSED" => ReviewStateView::Dismissed,
-                                _ => ReviewStateView::Commented,
-                            },
-                            body_html,
-                        },
-                        TimelineEvent::Comment { body_html } => {
-                            TimelineEventView::Comment { body_html }
-                        }
-                        TimelineEvent::ReviewRequested { reviewer } => {
-                            TimelineEventView::ReviewRequested { reviewer }
-                        }
-                        TimelineEvent::Labeled { label, added } => TimelineEventView::Labeled {
-                            label: label.into(),
-                            added,
-                        },
-                        TimelineEvent::ForcePushed { before, after } => {
-                            TimelineEventView::ForcePushed { before, after }
-                        }
-                        TimelineEvent::ReadyForReview => TimelineEventView::ReadyForReview,
-                        TimelineEvent::ConvertedToDraft => TimelineEventView::ConvertedToDraft,
-                    },
-                })
-                .collect(),
-        }
-    }
-}
-
-/// An open PR's description, labels, checks and timeline, read as the user like the open PRs.
-pub(crate) async fn pull_detail(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<Json<PullDetailView>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    caller.repo(&app, id, &repo).await?;
-    let gh = AsUser::new(caller.github_token(&app)?)?;
-    let detail = as_user(
-        gh.pull_detail(&repo, number, &app.signed_images).await,
-        &repo,
-    )?;
-    Ok(Json(detail.into()))
-}
-
-#[derive(Deserialize)]
-pub(crate) struct PullDiffQuery {
-    /// One of the PR's commits. The whole PR without one.
-    commit: Option<String>,
-    /// The whole PR's head and base commits, as `pull_detail` gives them: with both, its diff
-    /// is kept until they change.
-    head: Option<String>,
-    base: Option<String>,
-}
-
-/// A PR's changes, or one commit's, as `git diff` prints them.
-#[derive(Serialize, TS)]
-#[ts(export)]
-pub struct PullDiffView {
-    pub patch: String,
-}
-
-/// An open PR's diff, or one of its commits', read as the user. Each user's diffs are kept by
-/// what they are of, so a read again costs GitHub nothing.
-pub(crate) async fn pull_diff(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Query(q): Query<PullDiffQuery>,
-) -> Result<Json<PullDiffView>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    caller.repo(&app, id, &repo).await?;
-    fn sha<'a>(name: &str, sha: &'a Option<String>) -> Result<Option<&'a str>, ApiError> {
-        match sha {
-            Some(s) if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) => Err(
-                ApiError::bad_request(&format!("{name} must be a commit SHA")),
-            ),
-            _ => Ok(sha.as_deref()),
-        }
-    }
-    let of = match (
-        sha("commit", &q.commit)?,
-        sha("head", &q.head)?,
-        sha("base", &q.base)?,
-    ) {
-        (Some(commit), _, _) => DiffOf::Commit(commit),
-        (None, Some(head), Some(base)) => DiffOf::Pull(Some((head, base))),
-        (None, None, None) => DiffOf::Pull(None),
-        _ => return Err(ApiError::bad_request("head and base go together")),
-    };
-    let gh = AsUser::new(caller.github_token(&app)?)?;
-    let patch = as_user(
-        gh.pull_diff(&repo, number, of, &app.pull_diffs).await,
-        &repo,
-    )?;
-    let patch = patch.as_ref().clone().ok_or_else(|| {
-        ApiError::Status(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "This diff is too large to show here.".into(),
-        )
-    })?;
-    Ok(Json(PullDiffView { patch }))
-}
-
 #[derive(Deserialize, TS)]
 #[ts(export)]
 pub struct QueuePull {
@@ -1730,7 +1275,7 @@ pub struct QueuedView {
     /// "Queued.", or that it goes on hold, or what the agent cannot do for it, and why.
     pub message: String,
     /// As `GET /api/v1` says it.
-    pub mergepatrol: RepoStatusView,
+    pub mergeloop: RepoStatusView,
 }
 
 impl QueuedView {
@@ -1753,7 +1298,7 @@ impl QueuedView {
         }
         QueuedView {
             message,
-            mergepatrol: status,
+            mergeloop: status,
         }
     }
 }
@@ -1878,354 +1423,13 @@ pub(crate) async fn relabeled(
     wake.wake(id, repo);
 }
 
-/// Closes an open PR, as the user. The queue lists only the open PRs it does not have, so
-/// none of its own.
-pub(crate) async fn close_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<StatusCode, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let token = caller.github_token(&app)?;
-    as_user(
-        setup::close_pull_as(&token, &repo.to_string(), number).await,
-        &repo,
-    )?;
-    app.store.inbox_closed(id, &repo, number).await?;
-    tracing::info!(installation = id, %repo, number, "closed from the dashboard");
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Marks a draft PR ready for review, as the user. The queue holds a draft, so it wakes to read
-/// the PR again; the You tab moves it out of the drafts now.
-pub(crate) async fn ready_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<StatusCode, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let token = caller.github_token(&app)?;
-    match setup::ready_for_review_as(&token, &repo.to_string(), number).await {
-        Err(e) if e.is::<setup::Refused>() => {
-            return Err(ApiError::Status(
-                StatusCode::FORBIDDEN,
-                format!("You need write access to {repo}, or to have opened the PR, for that."),
-            ));
-        }
-        result => as_user(result, &repo)?,
-    }
-    published(&*app.store, &*app.wake, id, repo.clone(), number).await?;
-    tracing::info!(installation = id, %repo, number, "marked ready from the dashboard");
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// The draft PR was marked ready from the dashboard or MCP: out of the You tab's drafts now, and
-/// the queue, which holds drafts, wakes to read it again.
-pub(crate) async fn published(
-    store: &dyn Store,
-    wake: &dyn Wake,
-    id: u64,
-    repo: RepoName,
-    number: u64,
-) -> Result<(), ApiError> {
-    store.inbox_ready(id, &repo, number).await?;
-    relabeled(store, wake, id, repo, &[number]).await;
-    Ok(())
-}
-
-/// How long the You tab lists a merged PR.
-const MERGED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
-
-/// The user's inbox, as webhooks keep it, with where the queue has each PR.
-pub(crate) async fn you(
-    State(app): State<AppState>,
-    caller: Caller,
-) -> Result<Json<YouView>, ApiError> {
-    let user = caller.user()?;
-    let ids = user.installations();
-    let inbox = app.store.inbox(user.login(), ids, MERGED_FOR).await?;
-    // Authored or asked to review is not enough: the user may since have lost the repo.
-    let mut readable = HashMap::new();
-    for &id in ids {
-        readable.insert(id, user.readable(&app, id).await?);
-    }
-    let on: HashSet<(u64, RepoName)> = app
-        .store
-        .repos()
-        .await?
-        .into_iter()
-        .filter(|r| ids.contains(&r.installation_id) && r.on())
-        .map(|r| (r.installation_id, r.repo))
-        .collect();
-    let mut spots = HashMap::new();
-    for &id in ids {
-        let (lanes, _) = reviewed(&app, id, app.store.lanes(id).await?).await?;
-        spots.extend(queue_spots(lanes));
-    }
-    let view = |rows: Vec<InboxRow>| -> Vec<InboxPullView> {
-        rows.into_iter()
-            .filter_map(|row| {
-                let p = InboxPull::from_node(&row.node)
-                    .inspect_err(|e| tracing::warn!(error = %format!("{e:#}"), "an inbox PR"))
-                    .ok()?;
-                if !readable.get(&row.installation_id)?.contains(&p.repo) {
-                    return None;
-                }
-                Some(InboxPullView {
-                    number: p.pr.number as u32,
-                    base: p.pr.merges_into().to_owned(),
-                    draft: p.pr.is_draft,
-                    merged_at: (p.state == "merged").then(|| p.closed_at.clone()).flatten(),
-                    workspace: row.installation_id as u32,
-                    queues: on.contains(&(row.installation_id, p.repo.clone())),
-                    queue: spots.get(&(p.repo.clone(), p.pr.number)).cloned(),
-                    unread: unread(&p.activity, user.login(), row.seen_at.as_deref()),
-                    snoozed_until: row
-                        .snoozed
-                        .filter(|(at, _)| unread(&p.activity, user.login(), Some(at)) == 0)
-                        .map(|(_, until)| until),
-                    unresolved_threads: p.pr.unresolved_threads,
-                    pull: p.pr.summary().into(),
-                    updated_at: p.updated_at,
-                    repo: p.repo.to_string(),
-                })
-            })
-            .collect()
-    };
-    Ok(Json(YouView {
-        authored: view(inbox.authored),
-        review_requested: view(inbox.requested),
-        merged: view(inbox.merged),
-    }))
-}
-
-/// What others said since `me` last opened the PR, or last said something on it: GitHub's
-/// times compare as strings.
-fn unread(activity: &[(String, String)], me: &str, seen: Option<&str>) -> u32 {
-    let mine = activity
-        .iter()
-        .filter(|(who, _)| who.eq_ignore_ascii_case(me))
-        .map(|(_, at)| at.as_str())
-        .max();
-    let since = seen.max(mine).unwrap_or("");
-    activity
-        .iter()
-        .filter(|(who, at)| !who.eq_ignore_ascii_case(me) && at.as_str() > since)
-        .count() as u32
-}
-
-/// The user opened the PR in the dashboard: what came before is read.
-pub(crate) async fn seen_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<StatusCode, ApiError> {
-    let id = caller.workspace(id)?;
-    let repo = repo_name(owner, name)?;
-    app.store
-        .inbox_seen(caller.user()?.login(), id, &repo, number)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Puts the PR out of the user's inbox for `minutes`.
-pub(crate) async fn snooze_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<SnoozePull>,
-) -> Result<StatusCode, ApiError> {
-    let id = caller.workspace(id)?;
-    let repo = repo_name(owner, name)?;
-    if !(1..=366 * 24 * 60).contains(&body.minutes) {
-        return Err(ApiError::bad_request("minutes must be from 1 to a year's"));
-    }
-    let snooze = std::time::Duration::from_secs(u64::from(body.minutes) * 60);
-    app.store
-        .inbox_snooze(caller.user()?.login(), id, &repo, number, Some(snooze))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Puts a snoozed PR back in the user's inbox.
-pub(crate) async fn unsnooze_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-) -> Result<StatusCode, ApiError> {
-    let id = caller.workspace(id)?;
-    let repo = repo_name(owner, name)?;
-    app.store
-        .inbox_snooze(caller.user()?.login(), id, &repo, number, None)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Mentions the reviewers in a comment as the user, so GitHub tells them.
-pub(crate) async fn nudge_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<NudgePull>,
-) -> Result<StatusCode, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let login = |l: &String| {
-        !l.is_empty() && l.len() <= 39 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    if body.reviewers.is_empty() || !body.reviewers.iter().all(login) {
-        return Err(ApiError::bad_request("reviewers must be GitHub logins"));
-    }
-    let mentions: Vec<String> = body.reviewers.iter().map(|r| format!("@{r}")).collect();
-    let text = format!(
-        "{}, could you review this when you have a moment?",
-        mentions.join(" ")
-    );
-    let token = caller.github_token(&app)?;
-    as_user(
-        setup::comment_as(&token, &repo.to_string(), number, &text).await,
-        &repo,
-    )?;
-    app.store.inbox_changed(id, &repo, number).await?;
-    tracing::info!(installation = id, %repo, number, "nudged from the dashboard");
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Where the queue has each PR of these lanes. A stack's layers each take the stack's spot.
-fn queue_spots(lanes: Vec<(LaneKey, Lane)>) -> HashMap<(RepoName, u64), QueueSpotView> {
-    let mut spots = HashMap::new();
-    for (key, lane) in lanes {
-        let entries = in_merge_order(lane.entries);
-        let of = entries.len() as u32;
-        for (i, e) in entries.into_iter().enumerate() {
-            let (state, detail, hold) = match e.state {
-                EntryState::Waiting => (EntryStateView::Waiting, None, None),
-                EntryState::Held(reason) => (
-                    EntryStateView::Held,
-                    Some(reason.to_string()),
-                    Some(crate::v1::HoldView::from(&reason).reason),
-                ),
-                EntryState::Active => (EntryStateView::Active, None, None),
-            };
-            let spot = QueueSpotView {
-                state,
-                place: i as u32 + 1,
-                of,
-                priority: e.priority,
-                detail,
-                hold,
-            };
-            for n in std::iter::once(e.number).chain(e.layers) {
-                spots.insert((key.repo.clone(), n), spot.clone());
-            }
-        }
-    }
-    spots
-}
-
-/// Reviews the PR as the user, then queues it if they asked. The queue reads the PR again now:
-/// a review may be what held it.
-pub(crate) async fn review_pull(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<ReviewPull>,
-) -> Result<StatusCode, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let token = caller.github_token(&app)?;
-    let gh = installation(&app, id).await?;
-    let text = body.body.trim();
-    let review = match body.verdict {
-        VerdictView::Approve => {
-            let login = match &caller {
-                Caller::User(user) => Some(user.login().to_owned()),
-                Caller::Token(_) => as_user(setup::login_of(&token).await, &repo)?,
-            };
-            match login {
-                Some(login) => approval(&gh, &repo, number, &login).await?,
-                // A workflow's token is no user's, so no PR's author.
-                None => Some(setup::Verdict::Approve),
-            }
-        }
-        VerdictView::RequestChanges => Some(setup::Verdict::RequestChanges),
-        VerdictView::Comment => Some(setup::Verdict::Comment),
-    };
-    match review {
-        Some(verdict) => post_review(&token, &repo, number, verdict, text).await?,
-        // GitHub takes no empty comment, and the author's approval has nothing else to post.
-        None if !text.is_empty() => {
-            post_review(&token, &repo, number, setup::Verdict::Comment, text).await?;
-        }
-        None => {}
-    }
-    tracing::info!(installation = id, %repo, number, review = ?review, "reviewed from the dashboard");
-    // The inbox shows the review now; GitHub's reads, a moment later, settle it.
-    match &caller {
-        Caller::User(user) if review != Some(setup::Verdict::Comment) => {
-            app.store
-                .inbox_reviewed(id, &repo, number, user.login())
-                .await?;
-        }
-        _ => app.store.inbox_changed(id, &repo, number).await?,
-    }
-    if body.queue {
-        queue(&app, &gh, &token, &repo, number, false).await?;
-        tracing::info!(installation = id, %repo, number, "queued from the dashboard");
-    } else {
-        relabeled(&*app.store, &*app.wake, id, repo, &[number]).await;
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// What `login`'s approval posts: `None` for a PR they opened, which GitHub lets no author
-/// approve. The author's approval posts no review, and still takes the PR into the queue: where
-/// GitHub asks for an approval before it merges, the queue holds it there for a reviewer's.
-pub(crate) async fn approval(
-    gh: &Installation,
-    repo: &RepoName,
-    number: u64,
-    login: &str,
-) -> Result<Option<setup::Verdict>, ApiError> {
-    let pr = gh.pull_request(repo, number).await?;
-    Ok((!pr.authored_by(login)).then_some(setup::Verdict::Approve))
-}
-
-/// Reviews the PR as the user, with GitHub's refusal theirs to read.
-async fn post_review(
-    token: &str,
-    repo: &RepoName,
-    number: u64,
-    verdict: setup::Verdict,
-    body: &str,
-) -> Result<(), ApiError> {
-    setup::review_as(token, &repo.to_string(), number, verdict, body)
-        .await
-        .map_err(|e| {
-            if let Some(setup::Rejected(why)) = e.downcast_ref() {
-                ApiError::Status(StatusCode::UNPROCESSABLE_ENTITY, why.clone())
-            } else if e.is::<setup::Refused>() {
-                ApiError::Status(
-                    StatusCode::FORBIDDEN,
-                    format!("GitHub won't let you review PRs in {repo}."),
-                )
-            } else if e.is::<setup::Revoked>() {
-                ApiError::Status(StatusCode::UNAUTHORIZED, "Sign in again first.".into())
-            } else {
-                e.into()
-            }
-        })
-}
-
 /// The repo's queue labels, and its default branch, as the config file there sets them.
 async fn repo_labels(
     app: &AppState,
     gh: &Installation,
     repo: &RepoName,
 ) -> Result<(Labels, String), ApiError> {
-    let file = gh.default_branch_file(repo, REPO_CONFIG_PATH).await?;
+    let file = gh.config_file(repo).await?;
     labels_of(app, gh.id, file).await
 }
 
@@ -2233,15 +1437,20 @@ async fn repo_labels(
 async fn labels_of(
     app: &AppState,
     id: u64,
-    file: BranchFile,
+    file: ConfigFile,
 ) -> Result<(Labels, String), ApiError> {
-    Ok((labels_in(app, id, file.text.as_deref()).await?, file.branch))
+    let config = ConfigText {
+        at: file.at,
+        text: file.file.text,
+    };
+    Ok((labels_in(app, id, &config).await?, file.file.branch))
 }
 
 /// The labels a config file sets: the workspace's where it says nothing, or there is none.
-async fn labels_in(app: &AppState, id: u64, config: Option<&str>) -> Result<Labels, ApiError> {
+async fn labels_in(app: &AppState, id: u64, config: &ConfigText) -> Result<Labels, ApiError> {
     let defaults = inherited(app, id).await?;
-    let settings = RepoSettings::from_file(config, &defaults)
+    let settings = config
+        .settings(&defaults)
         .map_err(|e| ApiError::Status(StatusCode::CONFLICT, e))?;
     Ok(settings.labels())
 }
@@ -2282,10 +1491,14 @@ pub(crate) fn repo_name(owner: String, name: String) -> Result<RepoName, ApiErro
 }
 
 /// MergeLoop's branch for the PR that changes a repo's config file.
-const CONFIG_BRANCH: &str = "mergepatrol/config";
+const CONFIG_BRANCH: &str = "mergeloop/config";
 
 /// The skill that tells a repo's agents how its queue works. The setup PR adds it.
 const SKILL: &str = include_str!("skill.md");
+/// The skill's dir in a skills dir.
+const SKILL_NAME: &str = "mergeloop";
+/// Its dir from before the rename, which an update of the skill moves to `SKILL_NAME`.
+const LEGACY_SKILL_NAME: &str = "mergepatrol";
 /// Where agents look for repo skills: `.agents` for most, `.claude` for Claude Code.
 const SKILL_DIRS: [&str; 2] = [".agents/skills", ".claude/skills"];
 
@@ -2298,20 +1511,17 @@ pub(crate) async fn repo_config(
     let repo = repo_name(owner, name)?;
     let id = caller.repo(&app, id, &repo).await?;
     let gh = installation(&app, id).await?;
-    let file = gh.default_branch_file(&repo, REPO_CONFIG_PATH).await?;
-    let defaults = &inherited(&app, id).await?;
-    let error = RepoSettings::from_file(file.text.as_deref(), defaults).err();
+    let ConfigFile { at, file } = gh.config_file(&repo).await?;
+    let defaults = &at.inherit(&inherited(&app, id).await?);
+    let error = RepoSettings::from_file_at(at, file.text.as_deref(), defaults).err();
     let pull_request = gh.open_pr_from(&repo, CONFIG_BRANCH).await?;
     // Edits start from the open PR, so updating it keeps the changes already in it.
     let text = match pull_request {
-        Some(_) => {
-            gh.branch_file(&repo, CONFIG_BRANCH, REPO_CONFIG_PATH)
-                .await?
-        }
+        Some(_) => gh.branch_file(&repo, CONFIG_BRANCH, at.path()).await?,
         None => file.text.clone(),
     };
-    let settings =
-        RepoSettings::from_file(text.as_deref(), defaults).unwrap_or_else(|_| defaults.clone());
+    let settings = RepoSettings::from_file_at(at, text.as_deref(), defaults)
+        .unwrap_or_else(|_| defaults.clone());
     let follows = text
         .as_deref()
         .is_none_or(|t| settings.written_in(t, defaults));
@@ -2321,7 +1531,7 @@ pub(crate) async fn repo_config(
         defaults: defaults.clone().into(),
         efforts: EFFORTS.map(str::to_owned).into(),
         providers: Provider::SUPPORTED.map(ProviderView::from).into(),
-        path: REPO_CONFIG_PATH.into(),
+        path: at.path().into(),
         has_file: file.text.is_some(),
         default_branch: file.branch,
         error,
@@ -2345,10 +1555,10 @@ pub(crate) async fn propose_repo_config(
     settings
         .check()
         .map_err(|e| ApiError::Status(StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    let defaults = inherited(&app, id).await?;
-    let content = settings.to_yaml(&defaults);
     let gh = installation(&app, id).await?;
-    let base = gh.default_branch_file(&repo, REPO_CONFIG_PATH).await?;
+    let ConfigFile { at, file: base } = gh.config_file(&repo).await?;
+    let defaults = at.inherit(&inherited(&app, id).await?);
+    let content = settings.to_yaml(&defaults);
     if base.text.as_deref() == Some(content.as_str()) {
         return Err(ApiError::Status(
             StatusCode::CONFLICT,
@@ -2361,10 +1571,7 @@ pub(crate) async fn propose_repo_config(
     };
     let open = gh.open_pr_from(&repo, CONFIG_BRANCH).await?;
     let on_branch = match open {
-        Some(_) => {
-            gh.branch_file(&repo, CONFIG_BRANCH, REPO_CONFIG_PATH)
-                .await?
-        }
+        Some(_) => gh.branch_file(&repo, CONFIG_BRANCH, at.path()).await?,
         None => None,
     };
     let loses_comments = [base.text.as_deref(), on_branch.as_deref()]
@@ -2377,8 +1584,8 @@ pub(crate) async fn propose_repo_config(
     {
         dequeue(&app, &gh, &token, &repo, pr.number).await?;
     }
-    let (title, body) = config_pr(&settings, base.text.is_some(), &base.branch, &skills);
-    let mut files = vec![(REPO_CONFIG_PATH, content.as_str())];
+    let (title, body) = config_pr(&settings, at, base.text.is_some(), &base.branch, &skills);
+    let mut files = vec![(at.path(), content.as_str())];
     files.extend(skills.iter().map(|p| (p.as_str(), SKILL)));
     let pr = gh
         .propose_file(
@@ -2386,6 +1593,7 @@ pub(crate) async fn propose_repo_config(
             Proposal {
                 base: &base,
                 files: &files,
+                removed: &[],
                 branch: CONFIG_BRANCH,
                 title,
                 body: &body,
@@ -2458,7 +1666,6 @@ impl From<WorkspaceDefaultsView> for WorkspaceDefaults {
             label: v.label.trim().to_owned(),
             batch_size: v.batch_size as usize,
             agent: AgentSettings {
-                runs: Default::default(),
                 provider: v.provider,
                 model: v.model.trim().to_owned(),
                 effort: v.effort,
@@ -2519,7 +1726,7 @@ pub(crate) async fn set_repo_defaults(
 }
 
 /// MergeLoop's branch for the PR that updates a repo's skill.
-const SKILL_BRANCH: &str = "mergepatrol/skill";
+const SKILL_BRANCH: &str = "mergeloop/skill";
 
 /// Where a repo's copy of the skill is against the one MergeLoop ships.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
@@ -2534,13 +1741,15 @@ pub enum SkillStateView {
     Missing,
 }
 
-/// A repo's `mergepatrol` skill on its default branch.
+/// A repo's `mergeloop` skill on its default branch.
 #[derive(Serialize, TS)]
 #[ts(export)]
 pub struct SkillView {
     pub state: SkillStateView,
     /// The copies an update writes.
     pub paths: Vec<String>,
+    /// The copies under the skill's name from before the rename, which an update deletes.
+    pub legacy: Vec<String>,
     pub default_branch: String,
     /// MergeLoop's open PR that updates it.
     pub pull_request: Option<PullRequestRef>,
@@ -2549,16 +1758,20 @@ pub struct SkillView {
     pub pull_request_current: bool,
 }
 
-/// The state of the skill's copies, by path, and the paths an update writes.
-fn skill_plan(copies: &[(String, Option<String>)]) -> (SkillStateView, Vec<String>) {
+/// The state of the skill's copies, by path, with the `legacy` copies there are, and the paths
+/// an update writes.
+fn skill_plan(
+    copies: &[(String, Option<String>)],
+    legacy: &[String],
+) -> (SkillStateView, Vec<String>) {
     let stale: Vec<String> = copies
         .iter()
         .filter(|(_, text)| text.as_deref() != Some(SKILL))
         .map(|(path, _)| path.clone())
         .collect();
-    let state = if stale.is_empty() {
+    let state = if stale.is_empty() && legacy.is_empty() {
         SkillStateView::Current
-    } else if copies.iter().all(|(_, text)| text.is_none()) {
+    } else if copies.iter().all(|(_, text)| text.is_none()) && legacy.is_empty() {
         SkillStateView::Missing
     } else {
         SkillStateView::Outdated
@@ -2566,27 +1779,45 @@ fn skill_plan(copies: &[(String, Option<String>)]) -> (SkillStateView, Vec<Strin
     (state, stale)
 }
 
+/// The skill's file in skills dir `dir`, under the skill's `name`.
+fn skill_file(dir: &str, name: &str) -> String {
+    format!("{dir}/{name}/SKILL.md")
+}
+
 /// What a lookup of the skill reads for each skills dir: each step of its path, which must be
-/// a dir and not a link, the skill on the default branch, and the skill on the update's branch.
-fn skill_lookups(dir: &str) -> [(String, String); 5] {
+/// a dir and not a link, the skill on the default branch, the skill on the update's branch, and
+/// the copy under its old name on the default branch.
+fn skill_lookups(dir: &str) -> [(String, String); SKILL_LOOKUPS] {
     let top = dir.split('/').next().unwrap_or(dir);
-    let skill = format!("{dir}/mergepatrol");
-    let file = format!("{skill}/SKILL.md");
+    let file = skill_file(dir, SKILL_NAME);
     [
         ("HEAD".into(), top.into()),
         ("HEAD".into(), dir.into()),
-        ("HEAD".into(), skill),
+        ("HEAD".into(), format!("{dir}/{SKILL_NAME}")),
         ("HEAD".into(), file.clone()),
         (format!("refs/heads/{SKILL_BRANCH}"), file),
+        ("HEAD".into(), skill_file(dir, LEGACY_SKILL_NAME)),
     ]
+}
+
+const SKILL_LOOKUPS: usize = 6;
+
+/// One skills dir's copy, as `skill_copy` reads it.
+#[derive(Debug, PartialEq, Eq)]
+struct SkillCopy {
+    /// On the default branch.
+    text: Option<String>,
+    /// On the update's branch.
+    on_branch: Option<String>,
+    /// Whether the default branch has the copy under the skill's old name.
+    legacy: bool,
 }
 
 /// One skills dir's copy, from its `skill_lookups`: `None` when a step of its path is a link
 /// to elsewhere, as `.claude/skills` to `.agents/skills`, since a commit cannot write through
-/// it and the link shows the skill there already. Else its text on the default branch, and on
-/// the update's branch.
-fn skill_copy(objects: &[Option<GitObject>]) -> Option<(Option<String>, Option<String>)> {
-    let [top, dir, skill, file, branch] = objects else {
+/// it and the link shows the skill there already.
+fn skill_copy(objects: &[Option<GitObject>]) -> Option<SkillCopy> {
+    let [top, dir, skill, file, branch, legacy] = objects else {
         return None;
     };
     let link = |o: &Option<GitObject>| matches!(o, Some(GitObject::Blob(_)));
@@ -2599,7 +1830,11 @@ fn skill_copy(objects: &[Option<GitObject>]) -> Option<(Option<String>, Option<S
         Some(GitObject::Blob(t)) => Some(t.clone()),
         _ => None,
     };
-    Some((text(file), text(branch)))
+    Some(SkillCopy {
+        text: text(file),
+        on_branch: text(branch),
+        legacy: matches!(legacy, Some(GitObject::Blob(_))),
+    })
 }
 
 /// The skill as the repo has it, in one read: its state, the paths an update writes, whether
@@ -2616,14 +1851,18 @@ async fn repo_skill(
     let found = gh.objects_at(repo, &refs, SKILL_BRANCH).await?;
     let mut copies = Vec::new();
     let mut on_branch = Vec::new();
-    for (dir, objects) in SKILL_DIRS.iter().zip(found.objects.chunks(5)) {
-        if let Some((text, branch)) = skill_copy(objects) {
-            let path = format!("{dir}/mergepatrol/SKILL.md");
-            on_branch.push((path.clone(), branch));
-            copies.push((path, text));
+    let mut legacy = Vec::new();
+    for (dir, objects) in SKILL_DIRS.iter().zip(found.objects.chunks(SKILL_LOOKUPS)) {
+        if let Some(copy) = skill_copy(objects) {
+            let path = skill_file(dir, SKILL_NAME);
+            on_branch.push((path.clone(), copy.on_branch));
+            copies.push((path, copy.text));
+            if copy.legacy {
+                legacy.push(skill_file(dir, LEGACY_SKILL_NAME));
+            }
         }
     }
-    let (state, paths) = skill_plan(&copies);
+    let (state, paths) = skill_plan(&copies, &legacy);
     let pull_request_current = found.pull_request.is_some()
         && on_branch
             .iter()
@@ -2632,6 +1871,7 @@ async fn repo_skill(
     let view = SkillView {
         state,
         paths,
+        legacy,
         default_branch: found.head.branch.clone(),
         pull_request: found.pull_request.map(PullRequestRef::from),
         pull_request_current,
@@ -2639,7 +1879,7 @@ async fn repo_skill(
     Ok((view, found.head))
 }
 
-/// Whether the repo's copy of the `mergepatrol` skill is the one MergeLoop ships now.
+/// Whether the repo's copy of the `mergeloop` skill is the one MergeLoop ships now.
 pub(crate) async fn repo_skill_view(
     State(app): State<AppState>,
     caller: Caller,
@@ -2663,14 +1903,14 @@ pub(crate) async fn update_repo_skill(
     let id = caller.repo(&app, id, &repo).await?;
     let token = caller.github_token(&app)?;
     let gh = installation(&app, id).await?;
-    let (SkillView { state, paths, .. }, base) = repo_skill(&gh, &repo).await?;
-    if state == SkillStateView::Current || paths.is_empty() {
+    let (skill, base) = repo_skill(&gh, &repo).await?;
+    if skill.state == SkillStateView::Current {
         return Err(ApiError::Status(
             StatusCode::CONFLICT,
             format!("`{}` already has the current skill.", base.branch),
         ));
     }
-    let pr = propose_skill(&gh, &repo, &paths, &base).await?;
+    let pr = propose_skill(&gh, &repo, &skill, &base).await?;
     tracing::info!(installation = id, %repo, pr = pr.number, "proposed the current skill");
     let file = UpdatedFileView::Skill;
     Ok(Json(if repo_queues(&app, id, &repo).await? {
@@ -2680,27 +1920,44 @@ pub(crate) async fn update_repo_skill(
     }))
 }
 
-/// Opens a PR that writes the current skill to `paths`, or updates the one open.
+/// Opens a PR that writes the current skill to the copies `skill` lists, and deletes its copies
+/// under the old name, or updates the one open.
 async fn propose_skill(
     gh: &Installation,
     repo: &RepoName,
-    paths: &[String],
+    skill: &SkillView,
     base: &BranchFile,
 ) -> anyhow::Result<PullRef> {
-    let files: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), SKILL)).collect();
-    let list: Vec<String> = paths.iter().map(|p| format!("`{p}`")).collect();
-    let body = format!(
-        "This PR writes the current MergeLoop agent skill to {}, so coding agents in this repo follow how MergeLoop works now: they queue their PRs, then work every review comment to resolved. Once it merges into `{}`, agents read the new skill.
-
-It replaces the copy that is there, so a change made to the skill in this repo is lost: carry it over in this PR if you want to keep it.",
-        list.join(" and "),
-        base.branch
-    );
+    let files: Vec<(&str, &str)> = skill.paths.iter().map(|p| (p.as_str(), SKILL)).collect();
+    let removed: Vec<&str> = skill.legacy.iter().map(String::as_str).collect();
+    let listed = |paths: &[String]| {
+        let list: Vec<String> = paths.iter().map(|p| format!("`{p}`")).collect();
+        list.join(" and ")
+    };
+    let mut body = String::new();
+    if !skill.paths.is_empty() {
+        body.push_str(&format!(
+            "This PR writes the current MergeLoop agent skill to {}, so coding agents in this repo follow how MergeLoop works now: they queue their PRs, then work every review comment to resolved. Once it merges into `{}`, agents read the new skill.\n\nIt replaces the copy that is there, so a change made to the skill in this repo is lost: carry it over in this PR if you want to keep it.",
+            listed(&skill.paths),
+            base.branch
+        ));
+    }
+    if !skill.legacy.is_empty() {
+        let it = match body.is_empty() {
+            true => "This PR",
+            false => "\n\nIt also",
+        };
+        body.push_str(&format!(
+            "{it} deletes {}, the skill under its name from before Mergepatrol became MergeLoop, so agents read only the `mergeloop` skill.",
+            listed(&skill.legacy)
+        ));
+    }
     gh.propose_file(
         repo,
         Proposal {
             base,
             files: &files,
+            removed: &removed,
             branch: SKILL_BRANCH,
             title: "Update the MergeLoop skill",
             body: &body,
@@ -2854,12 +2111,12 @@ pub(crate) async fn update_repo(
         return skip("MergeLoop is off on this repo.".into());
     }
     let gh = installation(&app, id).await?;
-    let file = gh.default_branch_file(&repo, REPO_CONFIG_PATH).await?;
+    let ConfigFile { at, file } = gh.config_file(&repo).await?;
     let Some(text) = file.text.as_deref() else {
         return skip(format!("{} has no config file.", file.branch));
     };
-    let defaults = &inherited(&app, id).await?;
-    let settings = match RepoSettings::from_file(Some(text), defaults) {
+    let defaults = &at.inherit(&inherited(&app, id).await?);
+    let settings = match RepoSettings::from_file_at(at, Some(text), defaults) {
         Ok(settings) => settings,
         Err(e) => return skip(e),
     };
@@ -2867,10 +2124,7 @@ pub(crate) async fn update_repo(
     let mut pulls = Vec::new();
     let open = gh.open_pr_from(&repo, CONFIG_BRANCH).await?;
     let on_branch = match open {
-        Some(_) => Some(
-            gh.branch_file(&repo, CONFIG_BRANCH, REPO_CONFIG_PATH)
-                .await?,
-        ),
+        Some(_) => Some(gh.branch_file(&repo, CONFIG_BRANCH, at.path()).await?),
         None => None,
     };
     let update = config_update(
@@ -2883,7 +2137,7 @@ pub(crate) async fn update_repo(
         ConfigUpdate::Current => None,
         ConfigUpdate::Queue | ConfigUpdate::Leave | ConfigUpdate::KeepComments => open,
         ConfigUpdate::Propose => Some(
-            propose_rewrite(&gh, &repo, &settings, defaults, &file, text)
+            propose_rewrite(&gh, &repo, &settings, defaults, at, &file, text)
                 .await
                 .map_err(github_failed)?,
         ),
@@ -2933,7 +2187,7 @@ async fn update_skill(
     }
     let pr = match skill.pull_request {
         Some(pr) if skill.pull_request_current => pr,
-        _ => propose_skill(gh, repo, &skill.paths, &base)
+        _ => propose_skill(gh, repo, &skill, &base)
             .await
             .map_err(github_failed)?
             .into(),
@@ -2957,9 +2211,11 @@ async fn propose_rewrite(
     repo: &RepoName,
     settings: &RepoSettings,
     defaults: &RepoSettings,
+    at: ConfigPath,
     base: &BranchFile,
     text: &str,
 ) -> anyhow::Result<PullRef> {
+    let path = at.path();
     let content = settings.to_yaml(defaults);
     let comments = if settings.loses_comments_of(text, defaults) {
         "\n\nIt replaces the file, so the file's comments are lost: carry them over in this PR if you want to keep them."
@@ -2967,14 +2223,15 @@ async fn propose_rewrite(
         ""
     };
     let body = format!(
-        "This PR writes `{REPO_CONFIG_PATH}` the way MergeLoop writes it now: it renames old settings and keeps only those that differ from the workspace, so the rest follow it from now on. The queue runs as it did, with these settings.\n\n{}{comments}",
+        "This PR writes `{path}` the way MergeLoop writes it now: it renames old settings and keeps only those that differ from the workspace, so the rest follow it from now on. The queue runs as it did, with these settings.\n\n{}{comments}",
         settings_list(settings)
     );
     gh.propose_file(
         repo,
         Proposal {
             base,
-            files: &[(REPO_CONFIG_PATH, content.as_str())],
+            files: &[(path, content.as_str())],
+            removed: &[],
             branch: CONFIG_BRANCH,
             title: "Update the MergeLoop settings",
             body: &body,
@@ -3011,7 +2268,7 @@ async fn skill_paths(gh: &Installation, repo: &RepoName) -> Result<Vec<String>, 
     for dir in SKILL_DIRS {
         // A symlink is a blob, so it has text. A dir has none.
         if gh.default_branch_file(repo, dir).await?.text.is_none() {
-            paths.push(format!("{dir}/mergepatrol/SKILL.md"));
+            paths.push(skill_file(dir, SKILL_NAME));
         }
     }
     Ok(paths)
@@ -3066,10 +2323,12 @@ fn settings_list(settings: &RepoSettings) -> String {
 
 fn config_pr(
     settings: &RepoSettings,
+    at: ConfigPath,
     update: bool,
     branch: &str,
     skills: &[String],
 ) -> (&'static str, String) {
+    let path = at.path();
     let list = settings_list(settings);
     let skills = if skills.is_empty() {
         String::new()
@@ -3084,14 +2343,14 @@ fn config_pr(
         (
             "Update the MergeLoop settings",
             format!(
-                "This PR changes `{REPO_CONFIG_PATH}`, as edited in the MergeLoop dashboard. The queue uses the new settings once this PR merges into `{branch}`.\n\n{list}"
+                "This PR changes `{path}`, as edited in the MergeLoop dashboard. The queue uses the new settings once this PR merges into `{branch}`.\n\n{list}"
             ),
         )
     } else {
         (
             "Set up MergeLoop",
             format!(
-                "This PR adds `{REPO_CONFIG_PATH}` with the settings below. Once it merges into `{branch}`, MergeLoop runs a merge queue on this repo: add the `{}` label to a PR to queue it.\n\n{list}{skills}\n\nTo change the settings later, edit the file, or use the MergeLoop dashboard, which opens a PR like this one.",
+                "This PR adds `{path}` with the settings below. Once it merges into `{branch}`, MergeLoop runs a merge queue on this repo: add the `{}` label to a PR to queue it.\n\n{list}{skills}\n\nTo change the settings later, edit the file, or use the MergeLoop dashboard, which opens a PR like this one.",
                 settings.label
             ),
         )
@@ -3359,49 +2618,12 @@ mod tests {
     }
 
     /// The settings form's PUT body, as the browser sent it.
-    const FORM: &str = r#"{"label":"mergepatrol","batch_size":8,"provider":"anthropic","model":"claude-sonnet-5-5","effort":"medium","overrides":{"rebase":{"provider":"openai","model":"gpt-6-luna"},"fix":null,"review":{"provider":"anthropic","model":"claude-fable-5-1"}},"verify":["cargo check"],"fix_ci":true,"fix_ci_attempts":2,"branches":["release"],"review":{"enabled":null,"bars":[]}}"#;
+    const FORM: &str = r#"{"label":"mergeloop","batch_size":8,"provider":"anthropic","model":"claude-sonnet-5-5","effort":"medium","overrides":{"rebase":{"provider":"openai","model":"gpt-6-luna"},"fix":null,"review":{"provider":"anthropic","model":"claude-fable-5-1"}},"verify":["cargo check"],"fix_ci":true,"fix_ci_attempts":2,"branches":["release"],"review":{"enabled":null,"bars":[]}}"#;
     const FORM_OVERRIDES: &str = r#""overrides":{"rebase":{"provider":"openai","model":"gpt-6-luna"},"fix":null,"review":{"provider":"anthropic","model":"claude-fable-5-1"}},"#;
 
     /// An open PR by `@ada` that GitHub won't merge before someone approves it.
-    const ADAS_AWAITING_APPROVAL: &str = r#"{"data":{"repository":{
-        "pullRequest":{"number":7,"state":"OPEN","title":"t","body":"","isDraft":false,"isCrossRepository":false,
-            "reviewDecision":"REVIEW_REQUIRED","baseRefName":"main","headRefName":"t","headRefOid":"abc",
-            "labels":{"nodes":[]},"files":{"nodes":[]},
-            "url":"","createdAt":"","additions":1,"deletions":0,"changedFiles":1,
-            "author":{"__typename":"User","login":"Ada","avatarUrl":"a"},
-            "latestOpinionatedReviews":{"nodes":[]},"reviewRequests":{"nodes":[]},"commits":{"nodes":[]}},
-        "defaultBranchRef":{"name":"main","rules":{"nodes":[]}},
-        "codeowners0":null,"codeowners1":null,"codeowners2":null}}}"#;
-
-    /// GitHub takes no approval from a PR's author, even where the repo needs one to merge.
-    /// The author's approval posts none, and is no dead end: it still queues the PR, which
-    /// waits there for a reviewer.
-    #[tokio::test]
-    async fn an_author_queues_their_own_pr_though_it_awaits_an_approval() {
-        let repo = RepoName::parse("o/r").unwrap();
-        for (login, verdict) in [("ada", None), ("bo", Some(setup::Verdict::Approve))] {
-            let (gh, _) =
-                mergepatrol_github::fake::serve(vec![(200, "", ADAS_AWAITING_APPROVAL)]).await;
-            let Ok(got) = approval(&gh, &repo, 7, login).await else {
-                panic!("{login}'s approval was refused");
-            };
-            assert_eq!(got, verdict, "{login}");
-        }
-    }
-
     fn settings() -> RepoSettings {
         RepoSettings::from(serde_json::from_str::<RepoSettingsView>(FORM).unwrap())
-    }
-
-    /// The dashboard's form has no control for it, and keeps what the file says.
-    #[test]
-    fn the_settings_form_keeps_who_runs_the_agent() {
-        let mut local = settings();
-        local.agent.runs = Runs::Local;
-        assert_eq!(
-            RepoSettings::from(RepoSettingsView::from(local.clone())),
-            local
-        );
     }
 
     /// A file that says nothing over `s`, and one that spells out a setting it already follows.
@@ -3515,28 +2737,39 @@ mod tests {
     #[test]
     fn a_skill_update_writes_each_copy_that_is_not_the_current_skill() {
         let (a, c) = (
-            ".agents/skills/mergepatrol/SKILL.md",
-            ".claude/skills/mergepatrol/SKILL.md",
+            ".agents/skills/mergeloop/SKILL.md",
+            ".claude/skills/mergeloop/SKILL.md",
         );
         let copy = |p: &str, t: Option<&str>| (p.to_owned(), t.map(str::to_owned));
         assert_eq!(
-            skill_plan(&[copy(a, Some(SKILL)), copy(c, Some(SKILL))]),
+            skill_plan(&[copy(a, Some(SKILL)), copy(c, Some(SKILL))], &[]),
             (SkillStateView::Current, vec![])
         );
         assert_eq!(
-            skill_plan(&[copy(a, Some("old")), copy(c, Some(SKILL))]),
+            skill_plan(&[copy(a, Some("old")), copy(c, Some(SKILL))], &[]),
             (SkillStateView::Outdated, vec![a.to_owned()])
         );
         assert_eq!(
-            skill_plan(&[copy(a, Some(SKILL)), copy(c, None)]),
+            skill_plan(&[copy(a, Some(SKILL)), copy(c, None)], &[]),
             (SkillStateView::Outdated, vec![c.to_owned()])
         );
         assert_eq!(
-            skill_plan(&[copy(a, None), copy(c, None)]),
+            skill_plan(&[copy(a, None), copy(c, None)], &[]),
             (SkillStateView::Missing, vec![a.to_owned(), c.to_owned()])
         );
         // Both dirs link elsewhere: nothing to write.
-        assert_eq!(skill_plan(&[]), (SkillStateView::Current, vec![]));
+        assert_eq!(skill_plan(&[], &[]), (SkillStateView::Current, vec![]));
+
+        // A copy under the old name is out of date, though it is the current skill.
+        let legacy = [".agents/skills/mergepatrol/SKILL.md".to_owned()];
+        assert_eq!(
+            skill_plan(&[copy(a, None), copy(c, None)], &legacy),
+            (SkillStateView::Outdated, vec![a.to_owned(), c.to_owned()])
+        );
+        assert_eq!(
+            skill_plan(&[copy(a, Some(SKILL)), copy(c, Some(SKILL))], &legacy),
+            (SkillStateView::Outdated, vec![])
+        );
     }
 
     #[test]
@@ -3544,66 +2777,59 @@ mod tests {
         let dir = || Some(GitObject::Tree(Vec::new()));
         let link = || Some(GitObject::Blob("../.agents/skills".into()));
         let text = |t: &str| Some(GitObject::Blob(t.into()));
+        let copy = |text: Option<&str>, on_branch: Option<&str>, legacy| {
+            Some(SkillCopy {
+                text: text.map(str::to_owned),
+                on_branch: on_branch.map(str::to_owned),
+                legacy,
+            })
+        };
         // A real copy, and the update's branch with the current skill.
         assert_eq!(
-            skill_copy(&[dir(), dir(), dir(), text("old"), text(SKILL)]),
-            Some((Some("old".into()), Some(SKILL.into())))
+            skill_copy(&[dir(), dir(), dir(), text("old"), text(SKILL), None]),
+            copy(Some("old"), Some(SKILL), false)
         );
         // No copy yet.
         assert_eq!(
-            skill_copy(&[dir(), None, None, None, None]),
-            Some((None, None))
+            skill_copy(&[dir(), None, None, None, None, None]),
+            copy(None, None, false)
         );
-        // A link at the top, at `skills`, at `mergepatrol`, or the file itself.
-        assert_eq!(skill_copy(&[link(), None, None, None, None]), None);
-        assert_eq!(skill_copy(&[dir(), link(), None, None, None]), None);
-        assert_eq!(skill_copy(&[dir(), dir(), link(), None, None]), None);
+        // Only the copy under the old name.
+        assert_eq!(
+            skill_copy(&[dir(), dir(), None, None, None, text(SKILL)]),
+            copy(None, None, true)
+        );
+        // A link at the top, at `skills`, at `mergeloop`, or the file itself.
+        assert_eq!(skill_copy(&[link(), None, None, None, None, None]), None);
+        assert_eq!(skill_copy(&[dir(), link(), None, None, None, None]), None);
+        assert_eq!(skill_copy(&[dir(), dir(), link(), None, None, None]), None);
         let file_link = Some(GitObject::Tree(vec![("SKILL.md".into(), SYMLINK_MODE)]));
         assert_eq!(
-            skill_copy(&[dir(), dir(), file_link, text("../../x/SKILL.md"), None]),
+            skill_copy(&[
+                dir(),
+                dir(),
+                file_link,
+                text("../../x/SKILL.md"),
+                None,
+                None
+            ]),
             None
         );
-        assert_eq!(skill_lookups(".claude/skills")[0].1, ".claude");
-    }
-
-    #[test]
-    fn the_open_comments_say_when_more_threads_exist_than_were_read() {
-        use mergepatrol_github::ThreadSummary;
-        let thread = |resolved| ThreadSummary {
-            resolved,
-            path: "a.rs".into(),
-            line: Some(1),
-            author: None,
-            title: "t".into(),
-            url: "u".into(),
-            comments: 1,
-        };
-        let detail = |threads, thread_count| PullDetail {
-            head: String::new(),
-            base: String::new(),
-            body_html: String::new(),
-            labels: Vec::new(),
-            checks: Vec::new(),
-            timeline: Vec::new(),
-            threads,
-            thread_count,
-        };
-        let v = PullDetailView::from(detail(vec![thread(true), thread(false)], 120)).review_threads;
-        assert_eq!((v.open, v.total, v.read), (1, 120, 2));
-        // GitHub's count never says fewer than were read.
-        let v = PullDetailView::from(detail(vec![thread(true)], 0)).review_threads;
-        assert_eq!((v.open, v.total, v.read), (0, 1, 1));
+        let lookups = skill_lookups(".claude/skills");
+        assert_eq!(lookups[0].1, ".claude");
+        assert_eq!(lookups[3].1, ".claude/skills/mergeloop/SKILL.md");
+        assert_eq!(lookups[5].1, ".claude/skills/mergepatrol/SKILL.md");
     }
 
     /// This repo queues through MergeLoop too: its agents read the skill every repo gets.
     #[test]
     fn this_repo_has_the_skill_every_repo_gets() {
         assert_eq!(
-            include_str!("../../../.agents/skills/mergepatrol/SKILL.md"),
+            include_str!("../../../.agents/skills/mergeloop/SKILL.md"),
             SKILL
         );
         assert_eq!(
-            include_str!("../../../.claude/skills/mergepatrol/SKILL.md"),
+            include_str!("../../../.claude/skills/mergeloop/SKILL.md"),
             SKILL
         );
     }
@@ -3674,53 +2900,31 @@ mod tests {
     }
 
     #[test]
-    fn unread_is_what_others_said_since_i_looked_or_last_spoke() {
-        let a = |who: &str, at: &str| (who.to_owned(), at.to_owned());
-        let activity = [a("ann", "1"), a("Me", "2"), a("bo", "3"), a("ann", "5")];
-        assert_eq!(unread(&activity, "me", None), 2);
-        assert_eq!(unread(&activity, "me", Some("4")), 1);
-        assert_eq!(unread(&activity, "me", Some("1")), 2);
-        assert_eq!(unread(&[a("ann", "1")], "me", None), 1);
-        assert_eq!(unread(&[], "me", None), 0);
-    }
+    fn a_stack_shows_each_of_its_prs() {
+        let layer = |number, title: &str, checks: &str| LayerSummary {
+            number,
+            title: title.into(),
+            checks: Some(checks.into()),
+            additions: 3,
+            ..LayerSummary::default()
+        };
+        let mut e = Entry {
+            layers: vec![7, 8],
+            ..entry(10, false, EntryState::Waiting)
+        };
+        e.summary.stack = vec![layer(7, "base", "SUCCESS"), layer(8, "top", "PENDING")];
+        let json = serde_json::to_value(EntryView::new(e, None, None)).unwrap();
+        assert_eq!(json["stack"][0]["number"], 7);
+        assert_eq!(json["stack"][1]["title"], "top");
+        assert_eq!(json["stack"][1]["checks"], "pending");
+        assert_eq!(json["stack"][0]["additions"], 3);
 
-    #[test]
-    fn each_queued_pr_and_stack_layer_has_its_spot_in_merge_order() {
-        let repo = RepoName::parse("o/r").unwrap();
-        let mut stack = entry(9, false, EntryState::Waiting);
-        stack.layers = vec![7, 8, 9];
-        let lane = Lane {
-            entries: vec![
-                entry(
-                    1,
-                    false,
-                    EntryState::Held(mergepatrol_core::Hold::ReviewRequired),
-                ),
-                stack,
-                entry(3, true, EntryState::Waiting),
-                entry(4, false, EntryState::Active),
-            ],
-            ..Lane::default()
-        };
-        let key = LaneKey {
-            installation_id: 1,
-            repo: repo.clone(),
-            trunk: "main".into(),
-        };
-        let spots = queue_spots(vec![(key, lane)]);
-        let spot = |n| &spots[&(repo.clone(), n)];
-        let places: Vec<u32> = [4, 3, 9, 1].into_iter().map(|n| spot(n).place).collect();
-        assert_eq!(places, [1, 2, 3, 4]);
-        assert!(spot(3).priority);
-        assert_eq!(spot(7).place, 3);
-        assert_eq!(spot(8).state, EntryStateView::Waiting);
-        assert_eq!(spot(1).state, EntryStateView::Held);
-        assert_eq!(
-            spot(1).detail.as_deref(),
-            Some("waiting for a required review")
-        );
-        assert!(spots.values().all(|s| s.of == 4));
-        assert!(!spots.contains_key(&(repo, 2)));
+        let pr = serde_json::to_value(EntryView::new(
+            entry(5, false, EntryState::Waiting),
+            None,
+            None,
+        ));
+        assert_eq!(pr.unwrap()["stack"], serde_json::json!([]));
     }
 
     #[test]

@@ -3,7 +3,6 @@
 mod app;
 mod checks;
 mod codeowners;
-mod detail;
 mod files;
 mod repo;
 pub mod setup;
@@ -15,13 +14,9 @@ pub use app::{
 };
 pub use checks::{BranchRules, CheckState, Checks};
 pub use codeowners::CodeOwners;
-pub use detail::{
-    CheckRun, CheckRunState, DiffOf, Label, PullDetail, PullDiffs, SignedImages, ThreadSummary,
-    TimelineEvent, TimelineItem,
-};
-pub use files::{BranchFile, GitObject, ObjectsAt, Proposal, PullRef, SYMLINK_MODE};
+pub use files::{BranchFile, ConfigFile, GitObject, ObjectsAt, Proposal, PullRef, SYMLINK_MODE};
 pub use repo::{
-    BranchMerge, HeadRepository, InboxPull, MergeOutcome, PrDetails, PullRequest, RepoOwner,
+    BranchMerge, BranchMove, HeadRepository, MergeOutcome, PrDetails, PullRequest, RepoOwner,
     RepoSnapshot, ReviewThread, SnapshotParts, StackRef, ThreadComment, TreeEntry, queued,
 };
 pub use setup::{AppCredentials, GithubUser};

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_billing::StripeConfig;
-use mergepatrol_core::{AgentSettings, Provider, RepoSettings};
+use mergepatrol_core::{AgentSettings, DEFAULT_LABEL, Provider, RepoSettings};
 
 /// Settings from the environment. Everything else is set up in the dashboard, or in each repo's
 /// config file.
@@ -88,10 +88,9 @@ impl Config {
             ),
         };
         let repo_defaults = RepoSettings {
-            label: opt("MERGEPATROL_LABEL", "mergepatrol"),
+            label: opt("MERGEPATROL_LABEL", DEFAULT_LABEL),
             batch_size: opt("MERGEPATROL_BATCH_SIZE", "8").parse()?,
             agent: AgentSettings {
-                runs: Default::default(),
                 provider,
                 model,
                 effort: opt("MERGEPATROL_EFFORT", "medium"),

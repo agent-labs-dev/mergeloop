@@ -14,6 +14,7 @@ failed: number, turns: number,
  */
 cost_usd: number, 
 /**
- * The runs whose CLI did not, such as Codex's: `cost_usd` leaves them out.
+ * The runs without a cost, such as one on a model we have no price for: `cost_usd` leaves
+ * them out.
  */
 unpriced: number, };

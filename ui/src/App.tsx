@@ -10,17 +10,16 @@ import {
 } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { resetAnalytics, useAnalytics, useWorkspaceAnalytics } from "./analytics";
-import { fetchSession, fetchSettings, fetchYou, logout } from "./api";
+import { fetchSession, fetchSettings, logout } from "./api";
 import type { AppView } from "./api/AppView";
 import type { SessionView } from "./api/SessionView";
 import type { WorkspaceView } from "./api/WorkspaceView";
 import { Landing } from "./Landing";
 import { NotHere, permalinkAfterSignIn, permalinkAt, rememberPermalink } from "./Permalink";
 import { CreateApp, Install, UnlockSetup } from "./Setup";
-import { TraySignedIn } from "./TraySignedIn";
 import { type ThemeProps, useTheme } from "./theme";
 import { UpdateToast } from "./UpdateToast";
-import { Avatar, feedbackUrl, Mark, ThemeToggle, trayDownloadUrl } from "./ui";
+import { Avatar, feedbackUrl, Mark, ThemeToggle } from "./ui";
 import { WorkspaceContext } from "./workspace";
 
 /** Setup and sign-in errors come back from the server as `?error=`, read before the router starts. */
@@ -38,10 +37,6 @@ export function App() {
   const [error, dismiss] = useRedirectError();
   const [theme, setTheme] = useTheme();
 
-  // The menu bar app's sign-in, whatever this browser's own session is.
-  if (location.pathname === "/tray") {
-    return <TraySignedIn error={error} theme={theme} setTheme={setTheme} />;
-  }
   return (
     <>
       {error && (
@@ -92,7 +87,6 @@ function NoWorkspace({ session, app }: { session: SessionView; app: AppView }) {
 }
 
 const tabs = [
-  ["You", "/$account/you"],
   ["Queue", "/$account/queue"],
   ["History", "/$account/history"],
   ["Settings", "/$account/settings"],
@@ -168,13 +162,6 @@ function Dashboard({ session, theme, setTheme }: { session: SessionView } & Them
           </select>
           <div className="ml-auto flex items-center gap-3">
             <a
-              className="text-muted hover:text-fg max-sm:hidden"
-              href={trayDownloadUrl}
-              title="Your merge queues in the macOS menu bar. Apple silicon, macOS 13 or later. Not notarized yet: if macOS blocks it, click Open Anyway in System Settings › Privacy & Security."
-            >
-              Menu bar app
-            </a>
-            <a
               className="text-muted hover:text-fg"
               href={feedbackUrl}
               target="_blank"
@@ -216,12 +203,11 @@ function Dashboard({ session, theme, setTheme }: { session: SessionView } & Them
               key={to}
               to={to}
               params={{ account: current.account }}
-              className="-mb-px flex items-center gap-1.5 border-b-2 pb-2.5"
+              className="-mb-px border-b-2 pb-2.5"
               activeProps={{ className: "border-fg text-fg" }}
               inactiveProps={{ className: "border-transparent text-muted hover:text-fg" }}
             >
               {label}
-              {to === "/$account/you" && <NeedsYouCount />}
             </Link>
           ))}
         </nav>
@@ -264,17 +250,5 @@ function NoKeyBanner({ workspace, account }: { workspace: number; account: strin
         </Link>
       )}
     </div>
-  );
-}
-
-/** How many PRs ask for the user's review, on the You tab. */
-function NeedsYouCount() {
-  const you = useQuery({ queryKey: ["you"], queryFn: fetchYou, refetchInterval: 30_000 });
-  const n = you.data?.review_requested.length ?? 0;
-  if (!n) return null;
-  return (
-    <span className="rounded-full bg-hot px-1.5 text-[11px] leading-[18px] font-semibold text-white tabular-nums">
-      {n}
-    </span>
   );
 }

@@ -111,6 +111,7 @@ async fn codex_resolves_a_conflict_on_a_chatgpt_plan() {
         effort: "low".into(),
         timeout: Duration::from_secs(300),
         max_turns: 20,
+        on_plan: true,
     };
     let files = vec!["greet.py".to_owned()];
     let transcript = wt.join("transcript.jsonl");
@@ -120,7 +121,9 @@ async fn codex_resolves_a_conflict_on_a_chatgpt_plan() {
             conflicted_files: &files,
             pr_title: "Friendlier greeting",
             pr_body: "Adds a comma and an exclamation mark.",
-            commit_message: "Add punctuation to the greeting",
+            stopped: mergepatrol_resolver::Stopped::Replay {
+                commit_message: "Add punctuation to the greeting",
+            },
             trunk: "main",
             verify: &mergepatrol_resolver::Verify::None,
             transcript: &transcript,

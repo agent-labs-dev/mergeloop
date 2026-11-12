@@ -3,7 +3,9 @@ import type { CodeLineView } from "./CodeLineView";
 import type { EvidenceView } from "./EvidenceView";
 import type { KindView } from "./KindView";
 import type { LeanView } from "./LeanView";
+import type { PlaceView } from "./PlaceView";
 import type { RelatedView } from "./RelatedView";
+import type { VerificationView } from "./VerificationView";
 
 export type FindingView = { id: string, kind: KindView, title: string, file: string | null, line: number | null, 
 /**
@@ -14,7 +16,15 @@ confidence: number, lean: LeanView, finding: string, unsure: string, checked: Ar
  * What showed the change is needed, as MergeLoop ran it: the whole test, also when a
  * comment on GitHub had no room for it.
  */
-evidence: EvidenceView | null, code: Array<CodeLineView>, related: Array<RelatedView>, 
+evidence: EvidenceView | null, 
+/**
+ * What a panel of fresh agents voted on it, for a security change that shows no evidence.
+ */
+verified: VerificationView | null, code: Array<CodeLineView>, related: Array<RelatedView>, 
+/**
+ * The other places the same bug is, past `file` and `line`: a fix settles every one.
+ */
+also_at: Array<PlaceView>, 
 /**
  * The agent asks a human about it.
  */
@@ -38,4 +48,8 @@ needs_human: boolean,
 /**
  * It has a review thread on the PR, which its author resolves.
  */
-threaded: boolean, bar: number | "always_ask", };
+threaded: boolean, bar: number | "always_ask", 
+/**
+ * What became of a change it asked for, once known.
+ */
+outcome: "fixed" | "wrong" | "intended" | "dismissed" | null, };

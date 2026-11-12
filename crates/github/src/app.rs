@@ -52,7 +52,7 @@ pub struct App {
 impl App {
     pub fn new(app_id: u64, private_key_pem: &[u8]) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("mergepatrol/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self {
@@ -351,21 +351,6 @@ impl Installation {
         Ok(res.body["full_name"].as_str().and_then(RepoName::parse))
     }
 
-    /// A GET for a body that is not JSON, in the media type `accept` names: its status and text.
-    pub(crate) async fn get_text(&self, path: &str, accept: &str) -> Result<(StatusCode, String)> {
-        let build = || async move {
-            let mut headers = api_headers();
-            headers.insert("accept", accept.parse()?);
-            Ok(self
-                .app
-                .http
-                .get(format!("{}{path}", self.app.api))
-                .bearer_auth(self.token().await?)
-                .headers(headers))
-        };
-        send(build, &format!("GET {path}")).await
-    }
-
     /// A REST call that returns the status and the body, for callers that branch on the status.
     pub(crate) async fn request(
         &self,
@@ -471,7 +456,7 @@ pub struct AsUser {
 impl AsUser {
     pub fn new(token: String) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("mergepatrol/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self {
@@ -497,20 +482,6 @@ impl AsUser {
                 .json(&body))
         };
         graphql_data(name, None, false, send(build, "POST /graphql").await?)
-    }
-
-    /// A GET whose body is not JSON, such as a diff, by its `accept`.
-    pub(crate) async fn get_text(&self, path: &str, accept: &str) -> Result<(StatusCode, String)> {
-        let build = || async move {
-            let mut headers = api_headers();
-            headers.insert("accept", accept.parse()?);
-            Ok(self
-                .http
-                .get(format!("{}{path}", self.api))
-                .bearer_auth(&self.token)
-                .headers(headers))
-        };
-        send(build, &format!("GET {path}")).await
     }
 
     /// As [`Installation::graphql_missing_ok`].
@@ -748,7 +719,7 @@ pub async fn revoke_token(token: &str) -> Result<()> {
 
 async fn revoke_token_at(api: &str, token: &str) -> Result<()> {
     let http = reqwest::Client::builder()
-        .user_agent(concat!("mergepatrol/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(60))
         .build()?;
     let build = || async {

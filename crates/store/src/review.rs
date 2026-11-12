@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use mergepatrol_core::{
-    Answer, Judged, PrNumber, Question, RepoName, ReviewSettings, ReviewStatus,
+    Answer, Judged, Outcome, PrNumber, Question, RepoName, ReviewSettings, ReviewStatus,
+    carry_back, dismiss_sent_back, newly_settled, settle_answers,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -24,8 +25,8 @@ pub struct ReviewRecord {
     /// The approved head it goes on from: only what the queue's agent changed since needs
     /// reading. `None` reads the whole PR.
     pub since_head: Option<String>,
-    /// The queue's agent fixed what it sent back: it spent none of the author's rounds.
-    pub agent_fixed: bool,
+    /// What the head changes since it left its base, from GitHub: `None` if it was not read.
+    pub diff_id: Option<String>,
     pub status: ReviewStatus,
     /// Which taking of it this is: a worker's writes count only while it is the latest.
     pub claim: i64,
@@ -40,10 +41,8 @@ pub struct ReviewRecord {
     pub answered_by: Option<String>,
     pub note: String,
     pub questions: Vec<Question>,
-    /// What MergeLoop asks of the author's agent, while the review waits for it.
-    pub brief: Option<String>,
-    /// The review the author's agent posted, as it posted it.
-    pub submitted: Option<serde_json::Value>,
+    /// How long it waited on a human, from asking to their answer. `None` until they answer.
+    pub waited_secs: Option<u32>,
     /// RFC 3339.
     pub created_at: String,
     pub updated_at: String,
@@ -102,54 +101,39 @@ pub trait ReviewStore: Send + Sync {
         pr: PrNumber,
         limit: u32,
     ) -> Result<Vec<ReviewRecord>>;
-    /// The review of the PR at `head`: the one there is, or a new one, pending. A stale one is
-    /// pending again.
+    /// The review of the PR at `head`: the one there is, or a new one, pending, of a head that
+    /// changes what `diff_id` says. A stale one is pending again.
     async fn start_review(
         &self,
         installation_id: u64,
         repo: &RepoName,
         pr: PrNumber,
         head: &str,
+        diff_id: Option<&str>,
     ) -> Result<ReviewRecord>;
-    /// Takes the next review to run: a pending one, or one whose run has gone `stale` since a
-    /// worker took it, as a restart leaves it. It is running once taken.
-    async fn claim_review(&self, stale: Duration) -> Result<Option<ReviewRecord>>;
-    /// Ends a running review with what the agent found. False if it is no longer running, or
-    /// the worker no longer holds `claim`. `fixing`: the queue's agent fixes what it sent back
-    /// first, and nothing is posted until `settle_review`.
-    async fn finish_review(
-        &self,
-        id: i64,
-        claim: i64,
-        done: &ReviewDone,
-        fixing: bool,
-    ) -> Result<bool>;
-    /// The agent's fix of what the review sent back is over, and the author has heard of what
-    /// it left them.
-    async fn settle_review(&self, id: i64, claim: i64) -> Result<()>;
-    /// What the agent's fix left the author could not be posted: the review runs again `after`,
-    /// as the worker's next run of it.
-    async fn rerun_review(&self, id: i64, claim: i64, after: Duration) -> Result<()>;
-    /// Puts a running review back to wait `after`, once more, for an error outside the PR.
-    async fn retry_review(&self, id: i64, claim: i64, error: &str, after: Duration) -> Result<()>;
-    /// The PR moved on before the review finished.
-    async fn stale_review(&self, id: i64, claim: i64) -> Result<()>;
-    /// A running review waits for the author's agent, which `brief` tells what to do. No worker
-    /// takes it until that agent posts its review.
-    async fn await_author(&self, id: i64, claim: i64, brief: &str) -> Result<()>;
-    /// The author's agent posted its review of `head`, for a worker to judge: false unless the
-    /// PR's review of that head waits for it, so the first posted is the one judged.
-    async fn submit_review(
+    /// The PR's newest review approved a head whose changes `head`'s are too, by `diff_id`: a
+    /// stack layer the layers below moved. Its approval holds for `head`, which is not reviewed
+    /// again. False if it holds for no other head.
+    async fn carry_unchanged(
         &self,
         installation_id: u64,
         repo: &RepoName,
         pr: PrNumber,
         head: &str,
-        review: &serde_json::Value,
+        diff_id: &str,
     ) -> Result<bool>;
+    /// Takes the next review to run: a pending one, or one whose run has gone `stale` since a
+    /// worker took it, as a restart leaves it. It is running once taken.
+    async fn claim_review(&self, stale: Duration) -> Result<Option<ReviewRecord>>;
+    /// Ends a running review with what the agent found. False if it is no longer running, or
+    /// the worker no longer holds `claim`.
+    async fn finish_review(&self, id: i64, claim: i64, done: &ReviewDone) -> Result<bool>;
+    /// Puts a running review back to wait `after`, once more, for an error outside the PR.
+    async fn retry_review(&self, id: i64, claim: i64, error: &str, after: Duration) -> Result<()>;
+    /// The PR moved on before the review finished.
+    async fn stale_review(&self, id: i64, claim: i64) -> Result<()>;
     /// Lets go of every review and question a worker took, for the next to take them now, and
-    /// ends those claims: only the worker that starts with the queue lock may run them. A review
-    /// whose fix it cut short runs again: what the author should hear of was never posted.
+    /// ends those claims: only the worker that starts with the queue lock may run them.
     async fn release_reviews(&self) -> Result<u64>;
     /// The queue moved the PR from `before` to `after`, a head it made: a rebase, or a fix of
     /// its checks. An approval of `before` holds for `after`, which is not reviewed again.
@@ -172,13 +156,9 @@ pub trait ReviewStore: Send + Sync {
         before: &str,
         after: &str,
     ) -> Result<()>;
-    /// The queue's agent pushed a fix of what the review sent back.
-    async fn mark_agent_fixed(&self, id: i64) -> Result<()>;
-    /// Who the review asks, changed.
-    async fn set_asked(&self, id: i64, asked: &[String]) -> Result<()>;
     /// A human answered the review's asks. False if it no longer asks.
     async fn answer_review(&self, id: i64, answers: &ReviewAnswers) -> Result<bool>;
-    /// Marks the review as having told the PR, on GitHub, to answer it on the dashboard. False
+    /// Marks the review as having told the PR, on GitHub, how to answer its asks. False
     /// if it told it already, or it no longer asks.
     async fn nudge_review(&self, id: i64) -> Result<bool>;
     /// Undoes `nudge_review`, as when posting the note failed, so a later reply tries again.
@@ -202,17 +182,34 @@ pub trait ReviewStore: Send + Sync {
         question: &str,
         answer: std::result::Result<String, String>,
     ) -> Result<bool>;
-    /// The agent withdrew a finding it sent back to the author, on their reply. A review that
-    /// held the PR for the author alone, and now holds it for nothing, approves it. Returns the
-    /// review's status after, or `None` if the finding was not sent back.
-    async fn withdraw_finding(&self, id: i64, finding: &str) -> Result<Option<ReviewStatus>>;
+    /// The agent withdrew a finding it sent back to the author, on their reply, as `outcome`
+    /// says. A review that held the PR for the author alone, and now holds it for nothing,
+    /// approves it. Returns the review's status after, or `None` if the finding was not sent
+    /// back.
+    async fn withdraw_finding(
+        &self,
+        id: i64,
+        finding: &str,
+        outcome: Outcome,
+    ) -> Result<Option<ReviewStatus>>;
+    /// What became of these findings of the review, by id, as the next head's review says. A
+    /// finding keeps the first outcome it was given.
+    async fn settle_findings(&self, id: i64, outcomes: &[(String, Outcome)]) -> Result<()>;
     /// These findings of the review have a thread on the PR.
     async fn mark_threaded(&self, id: i64, findings: &[String]) -> Result<()>;
     /// The author resolved every thread of a review that held the PR for them alone: it
-    /// approves. False if it no longer holds for them alone.
+    /// approves, and what it still sent back was dismissed. False if it no longer holds for
+    /// them alone.
     async fn approve_resolved(&self, id: i64) -> Result<bool>;
     /// The workspace's reviews of the last `days`, newest first.
     async fn reviews_since(&self, installation_id: u64, days: u32) -> Result<Vec<ReviewRecord>>;
+    /// Every review of the workspace's PRs first reviewed in the last `days`, newest first: a
+    /// PR's whole history, never the end of one.
+    async fn reviews_of_prs_since(
+        &self,
+        installation_id: u64,
+        days: u32,
+    ) -> Result<Vec<ReviewRecord>>;
     /// `None`: the workspace never saved any, and has the defaults.
     async fn review_settings(&self, installation_id: u64) -> Result<Option<ReviewSettings>>;
     async fn set_review_settings(
@@ -225,8 +222,9 @@ pub trait ReviewStore: Send + Sync {
 /// A review's columns, for `concat!`: sqlx takes only literal SQL.
 macro_rules! columns {
     () => {
-        r#"id, installation_id, repo, number, head_sha, since_head, agent_fixed, status, claim, error, attempts,
-    summary, findings, asked, answers, answered_by, note, questions, brief, submitted,
+        r#"id, installation_id, repo, number, head_sha, since_head, diff_id, status, claim, error, attempts,
+    summary, findings, asked, answers, answered_by, note, questions,
+    EXTRACT(EPOCH FROM answered_at - asked_at)::INT AS waited_secs,
     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at"#
     };
@@ -242,7 +240,7 @@ fn record(row: &PgRow) -> Result<ReviewRecord> {
         number: row.get::<i64, _>("number") as u64,
         head_sha: row.get("head_sha"),
         since_head: row.get("since_head"),
-        agent_fixed: row.get("agent_fixed"),
+        diff_id: row.get("diff_id"),
         status: ReviewStatus::parse(&status).with_context(|| format!("bad status {status:?}"))?,
         claim: row.get("claim"),
         error: row.get("error"),
@@ -254,8 +252,9 @@ fn record(row: &PgRow) -> Result<ReviewRecord> {
         answered_by: row.get("answered_by"),
         note: row.get("note"),
         questions: serde_json::from_value(row.get("questions"))?,
-        brief: row.get("brief"),
-        submitted: row.get("submitted"),
+        waited_secs: row
+            .get::<Option<i32>, _>("waited_secs")
+            .map(|s| s.max(0) as u32),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -263,6 +262,79 @@ fn record(row: &PgRow) -> Result<ReviewRecord> {
 
 fn records(rows: &[PgRow]) -> Result<Vec<ReviewRecord>> {
     rows.iter().map(record).collect()
+}
+
+impl PgStore {
+    /// Changes a review's findings under its row's lock. `edit` gets them with the review's
+    /// status and whether a human answered it, and returns the status to save with them, or
+    /// `None` to save nothing.
+    async fn edit_findings(
+        &self,
+        id: i64,
+        edit: impl FnOnce(&mut Vec<Judged>, ReviewStatus, bool) -> Option<ReviewStatus> + Send,
+    ) -> Result<Option<ReviewStatus>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT findings, status, answered_by FROM agent_reviews WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut findings: Vec<Judged> = serde_json::from_value(row.get("findings"))?;
+        let status: String = row.get("status");
+        let status =
+            ReviewStatus::parse(&status).with_context(|| format!("bad status {status:?}"))?;
+        let answered = row.get::<Option<String>, _>("answered_by").is_some();
+        let before = findings.clone();
+        let Some(status) = edit(&mut findings, status, answered) else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE agent_reviews SET findings = $2, status = $3, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(serde_json::to_value(&findings)?)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await?;
+        carry_back_outcomes(&mut tx, id, &newly_settled(&before, &findings)).await?;
+        tx.commit().await?;
+        Ok(Some(status))
+    }
+}
+
+/// What review `id` just settled, given to the same open findings of the PR's earlier reviews:
+/// each time a finding was raised is settled with it. Locks from newer to older, as every caller
+/// holds `id` first.
+async fn carry_back_outcomes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+    settled: &[(String, Outcome)],
+) -> Result<()> {
+    if settled.is_empty() {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT e.id, e.findings, e.answers FROM agent_reviews e, agent_reviews r
+         WHERE r.id = $1 AND e.installation_id = r.installation_id AND e.repo = r.repo
+           AND e.number = r.number AND e.id < r.id
+         ORDER BY e.id DESC FOR UPDATE OF e",
+    )
+    .bind(id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let mut findings: Vec<Judged> = serde_json::from_value(row.get("findings"))?;
+        let answers: BTreeMap<String, Answer> = serde_json::from_value(row.get("answers"))?;
+        if carry_back(&mut findings, &answers, settled) {
+            sqlx::query("UPDATE agent_reviews SET findings = $2, updated_at = now() WHERE id = $1")
+                .bind(row.get::<i64, _>("id"))
+                .bind(serde_json::to_value(&findings)?)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -343,19 +415,22 @@ impl ReviewStore for PgStore {
         repo: &RepoName,
         pr: PrNumber,
         head: &str,
+        diff_id: Option<&str>,
     ) -> Result<ReviewRecord> {
         // A stale review of the head waits for the agent again.
         sqlx::query(
-            "INSERT INTO agent_reviews (installation_id, repo, number, head_sha)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO agent_reviews (installation_id, repo, number, head_sha, diff_id)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (installation_id, repo, number, head_sha) DO UPDATE
-             SET status = 'pending', claimed_at = NULL, updated_at = now()
+             SET status = 'pending', claimed_at = NULL, updated_at = now(),
+                 diff_id = COALESCE(EXCLUDED.diff_id, agent_reviews.diff_id)
              WHERE agent_reviews.status = 'stale'",
         )
         .bind(installation_id as i64)
         .bind(repo.to_string())
         .bind(pr as i64)
         .bind(head)
+        .bind(diff_id)
         .execute(&self.pool)
         .await?;
         let row = sqlx::query(concat!(
@@ -371,6 +446,35 @@ impl ReviewStore for PgStore {
         .fetch_one(&self.pool)
         .await?;
         record(&row)
+    }
+
+    async fn carry_unchanged(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+        head: &str,
+        diff_id: &str,
+    ) -> Result<bool> {
+        let carried = sqlx::query(
+            "INSERT INTO agent_reviews (installation_id, repo, number, head_sha, diff_id, status,
+                 summary, findings, asked, answers, answered_by, note, questions)
+             SELECT installation_id, repo, number, $4, diff_id, status, summary, findings, asked,
+                 answers, answered_by, note, questions
+             FROM (SELECT * FROM agent_reviews
+                   WHERE installation_id = $1 AND repo = $2 AND number = $3
+                   ORDER BY id DESC LIMIT 1) newest
+             WHERE status = 'approved' AND diff_id = $5
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(pr as i64)
+        .bind(head)
+        .bind(diff_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(carried.rows_affected() == 1)
     }
 
     async fn claim_review(&self, stale: Duration) -> Result<Option<ReviewRecord>> {
@@ -392,16 +496,11 @@ impl ReviewStore for PgStore {
         row.as_ref().map(record).transpose()
     }
 
-    async fn finish_review(
-        &self,
-        id: i64,
-        claim: i64,
-        done: &ReviewDone,
-        fixing: bool,
-    ) -> Result<bool> {
+    async fn finish_review(&self, id: i64, claim: i64, done: &ReviewDone) -> Result<bool> {
         let updated = sqlx::query(
             "UPDATE agent_reviews SET status = $2, error = $3, summary = $4, findings = $5,
-                 asked = $6, fixing = $8, claimed_at = NULL, retry_at = NULL, updated_at = now()
+                 asked = $6, claimed_at = NULL, retry_at = NULL, updated_at = now(),
+                 asked_at = CASE WHEN $2 = 'asks' THEN now() END
              WHERE id = $1 AND status = 'running' AND claim = $7",
         )
         .bind(id)
@@ -411,36 +510,9 @@ impl ReviewStore for PgStore {
         .bind(serde_json::to_value(&done.findings)?)
         .bind(&done.asked)
         .bind(claim)
-        .bind(fixing)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
-    }
-
-    async fn rerun_review(&self, id: i64, claim: i64, after: Duration) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_reviews SET status = 'pending', fixing = false, claimed_at = NULL,
-                 retry_at = now() + make_interval(secs => $3), updated_at = now()
-             WHERE id = $1 AND claim = $2",
-        )
-        .bind(id)
-        .bind(claim)
-        .bind(after.as_secs_f64())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn settle_review(&self, id: i64, claim: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_reviews SET fixing = false, updated_at = now()
-             WHERE id = $1 AND claim = $2",
-        )
-        .bind(id)
-        .bind(claim)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     async fn retry_review(&self, id: i64, claim: i64, error: &str, after: Duration) -> Result<()> {
@@ -462,9 +534,9 @@ impl ReviewStore for PgStore {
     async fn release_reviews(&self) -> Result<u64> {
         let released = sqlx::query(
             "UPDATE agent_reviews
-             SET status = CASE WHEN status = 'running' OR fixing THEN 'pending' ELSE status END,
-                 fixing = false, claim = claim + 1, claimed_at = NULL, updated_at = now()
-             WHERE claimed_at IS NOT NULL OR fixing",
+             SET status = CASE status WHEN 'running' THEN 'pending' ELSE status END,
+                 claim = claim + 1, claimed_at = NULL, updated_at = now()
+             WHERE claimed_at IS NOT NULL",
         )
         .execute(&self.pool)
         .await?;
@@ -473,7 +545,7 @@ impl ReviewStore for PgStore {
 
     async fn stale_review(&self, id: i64, claim: i64) -> Result<()> {
         sqlx::query(
-            "UPDATE agent_reviews SET status = 'stale', fixing = false, claimed_at = NULL,
+            "UPDATE agent_reviews SET status = 'stale', claimed_at = NULL,
                  updated_at = now()
              WHERE id = $1 AND claim = $2",
         )
@@ -482,43 +554,6 @@ impl ReviewStore for PgStore {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    async fn await_author(&self, id: i64, claim: i64, brief: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_reviews SET status = 'author', brief = $3, claimed_at = NULL,
-                 updated_at = now()
-             WHERE id = $1 AND status = 'running' AND claim = $2",
-        )
-        .bind(id)
-        .bind(claim)
-        .bind(brief)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn submit_review(
-        &self,
-        installation_id: u64,
-        repo: &RepoName,
-        pr: PrNumber,
-        head: &str,
-        review: &serde_json::Value,
-    ) -> Result<bool> {
-        let updated = sqlx::query(
-            "UPDATE agent_reviews SET status = 'pending', submitted = $5, updated_at = now()
-             WHERE installation_id = $1 AND repo = $2 AND number = $3 AND head_sha = $4
-               AND status = 'author'",
-        )
-        .bind(installation_id as i64)
-        .bind(repo.to_string())
-        .bind(pr as i64)
-        .bind(head)
-        .bind(review)
-        .execute(&self.pool)
-        .await?;
-        Ok(updated.rows_affected() > 0)
     }
 
     async fn carry_review(
@@ -530,10 +565,10 @@ impl ReviewStore for PgStore {
         after: &str,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO agent_reviews (installation_id, repo, number, head_sha, status, summary,
-                 findings, asked, answers, answered_by, note, questions)
-             SELECT installation_id, repo, number, $5, status, summary, findings, asked, answers,
-                 answered_by, note, questions
+            "INSERT INTO agent_reviews (installation_id, repo, number, head_sha, diff_id, status,
+                 summary, findings, asked, answers, answered_by, note, questions)
+             SELECT installation_id, repo, number, $5, diff_id, status, summary, findings, asked,
+                 answers, answered_by, note, questions
              FROM agent_reviews
              WHERE installation_id = $1 AND repo = $2 AND number = $3 AND head_sha = $4
                AND status = 'approved'
@@ -577,39 +612,36 @@ impl ReviewStore for PgStore {
         Ok(())
     }
 
-    async fn mark_agent_fixed(&self, id: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_reviews SET agent_fixed = true, updated_at = now() WHERE id = $1",
+    async fn answer_review(&self, id: i64, a: &ReviewAnswers) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT findings FROM agent_reviews WHERE id = $1 AND status = 'asks' FOR UPDATE",
         )
         .bind(id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(())
-    }
-
-    async fn set_asked(&self, id: i64, asked: &[String]) -> Result<()> {
-        sqlx::query("UPDATE agent_reviews SET asked = $2, updated_at = now() WHERE id = $1")
-            .bind(id)
-            .bind(asked)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn answer_review(&self, id: i64, a: &ReviewAnswers) -> Result<bool> {
-        let updated = sqlx::query(
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let mut findings: Vec<Judged> = serde_json::from_value(row.get("findings"))?;
+        let before = findings.clone();
+        settle_answers(&mut findings, &a.answers);
+        sqlx::query(
             "UPDATE agent_reviews SET status = $2, answers = $3, answered_by = $4, note = $5,
-                 updated_at = now()
-             WHERE id = $1 AND status = 'asks'",
+                 findings = $6, answered_at = now(), updated_at = now()
+             WHERE id = $1",
         )
         .bind(id)
         .bind(a.status.as_str())
         .bind(serde_json::to_value(&a.answers)?)
         .bind(&a.by)
         .bind(&a.note)
-        .execute(&self.pool)
+        .bind(serde_json::to_value(&findings)?)
+        .execute(&mut *tx)
         .await?;
-        Ok(updated.rows_affected() == 1)
+        carry_back_outcomes(&mut tx, id, &newly_settled(&before, &findings)).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn nudge_review(&self, id: i64) -> Result<bool> {
@@ -721,74 +753,64 @@ impl ReviewStore for PgStore {
         Ok(true)
     }
 
-    async fn withdraw_finding(&self, id: i64, finding: &str) -> Result<Option<ReviewStatus>> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT findings, status, answered_by FROM agent_reviews WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let mut findings: Vec<Judged> = serde_json::from_value(row.get("findings"))?;
-        let status: String = row.get("status");
-        let status =
-            ReviewStatus::parse(&status).with_context(|| format!("bad status {status:?}"))?;
-        let answered_by: Option<String> = row.get("answered_by");
-        let Some(f) = findings
-            .iter_mut()
-            .find(|f| f.finding.id == finding && f.sent_back)
-        else {
-            return Ok(None);
-        };
-        f.sent_back = false;
-        f.withdrawn = true;
-        // Only the agent's own hold lifts: a human's request for changes stands.
-        let status = match status {
-            ReviewStatus::Changes if answered_by.is_none() => {
-                mergepatrol_core::review_status(&findings, false)
-            }
-            other => other,
-        };
-        sqlx::query(
-            "UPDATE agent_reviews SET findings = $2, status = $3, updated_at = now() WHERE id = $1",
-        )
-        .bind(id)
-        .bind(serde_json::to_value(&findings)?)
-        .bind(status.as_str())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(status))
+    async fn withdraw_finding(
+        &self,
+        id: i64,
+        finding: &str,
+        outcome: Outcome,
+    ) -> Result<Option<ReviewStatus>> {
+        self.edit_findings(id, |findings, status, answered| {
+            let f = findings
+                .iter_mut()
+                .find(|f| f.finding.id == finding && f.sent_back)?;
+            f.sent_back = false;
+            f.withdrawn = true;
+            f.settle(outcome);
+            // Only the agent's own hold lifts: a human's request for changes stands.
+            Some(match status {
+                ReviewStatus::Changes if !answered => {
+                    mergepatrol_core::review_status(findings, false)
+                }
+                other => other,
+            })
+        })
+        .await
     }
 
     async fn mark_threaded(&self, id: i64, ids: &[String]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT findings FROM agent_reviews WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let mut findings: Vec<Judged> = serde_json::from_value(row.get("findings"))?;
-        for f in findings.iter_mut().filter(|f| ids.contains(&f.finding.id)) {
-            f.threaded = true;
-        }
-        sqlx::query("UPDATE agent_reviews SET findings = $2, updated_at = now() WHERE id = $1")
-            .bind(id)
-            .bind(serde_json::to_value(&findings)?)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        self.edit_findings(id, |findings, status, _| {
+            for f in findings.iter_mut().filter(|f| ids.contains(&f.finding.id)) {
+                f.threaded = true;
+            }
+            Some(status)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn settle_findings(&self, id: i64, outcomes: &[(String, Outcome)]) -> Result<()> {
+        self.edit_findings(id, |findings, status, _| {
+            for (finding, outcome) in outcomes {
+                if let Some(f) = findings.iter_mut().find(|f| &f.finding.id == finding) {
+                    f.settle(*outcome);
+                }
+            }
+            Some(status)
+        })
+        .await?;
         Ok(())
     }
 
     async fn approve_resolved(&self, id: i64) -> Result<bool> {
-        let updated = sqlx::query(
-            "UPDATE agent_reviews SET status = 'approved', updated_at = now()
-             WHERE id = $1 AND status = 'changes' AND answered_by IS NULL",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(updated.rows_affected() == 1)
+        let approved = self
+            .edit_findings(id, |findings, status, answered| {
+                (status == ReviewStatus::Changes && !answered).then(|| {
+                    dismiss_sent_back(findings);
+                    ReviewStatus::Approved
+                })
+            })
+            .await?;
+        Ok(approved.is_some())
     }
 
     async fn reviews_since(&self, installation_id: u64, days: u32) -> Result<Vec<ReviewRecord>> {
@@ -797,6 +819,28 @@ impl ReviewStore for PgStore {
             columns!(),
             " FROM agent_reviews
              WHERE installation_id = $1 AND created_at > now() - make_interval(days => $2)
+             ORDER BY id DESC"
+        ))
+        .bind(installation_id as i64)
+        .bind(days as i32)
+        .fetch_all(&self.pool)
+        .await?;
+        records(&rows)
+    }
+
+    async fn reviews_of_prs_since(
+        &self,
+        installation_id: u64,
+        days: u32,
+    ) -> Result<Vec<ReviewRecord>> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM agent_reviews
+             WHERE installation_id = $1 AND (repo, number) IN (
+                 SELECT repo, number FROM agent_reviews WHERE installation_id = $1
+                 GROUP BY repo, number
+                 HAVING min(created_at) > now() - make_interval(days => $2))
              ORDER BY id DESC"
         ))
         .bind(installation_id as i64)
@@ -873,21 +917,224 @@ mod tests {
                     ..Default::default()
                 }),
                 needs_human: false,
+                verified: None,
+                settled: None,
                 code: Vec::new(),
                 related: Vec::new(),
+                also_at: Vec::new(),
             },
             asked,
             sent_back: false,
             withdrawn: false,
             threaded: false,
             bar: Bar::From(90),
+            outcome: None,
         }
+    }
+
+    /// A finished review of `head`, with `findings`.
+    async fn finished(
+        store: &PgStore,
+        head: &str,
+        status: ReviewStatus,
+        findings: Vec<Judged>,
+    ) -> i64 {
+        let r = store.start_review(1, &repo(), 8, head, None).await.unwrap();
+        let claim = store
+            .claim_review(Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap()
+            .claim;
+        let done = ReviewDone {
+            status,
+            error: None,
+            summary: "s".into(),
+            findings,
+            asked: Vec::new(),
+        };
+        assert!(store.finish_review(r.id, claim, &done).await.unwrap());
+        r.id
+    }
+
+    fn outcomes(r: &ReviewRecord) -> Vec<Option<Outcome>> {
+        r.findings.iter().map(|f| f.outcome).collect()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_approval_holds_for_a_head_with_the_same_changes(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let approve = |id| {
+            let store = &store;
+            async move {
+                sqlx::query("UPDATE agent_reviews SET status = 'approved' WHERE id = $1")
+                    .bind(id)
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        let r = store
+            .start_review(1, &repo(), 7, "a", Some("d"))
+            .await
+            .unwrap();
+        assert_eq!(r.diff_id.as_deref(), Some("d"));
+        let repo = repo();
+        let carry = |head, id| store.carry_unchanged(1, &repo, 7, head, id);
+        assert!(!carry("b", "d").await.unwrap(), "not approved yet");
+        approve(r.id).await;
+
+        assert!(!carry("b", "other").await.unwrap(), "other changes");
+        assert!(carry("b", "d").await.unwrap());
+        let b = store.latest_review(1, &repo, 7).await.unwrap().unwrap();
+        assert_eq!(
+            (b.head_sha.as_str(), b.status),
+            ("b", ReviewStatus::Approved)
+        );
+        assert_eq!(b.diff_id.as_deref(), Some("d"));
+        assert!(!carry("b", "d").await.unwrap(), "it has one");
+
+        // A queue fix's review waits, stale, for the head: starting it saves the head's id, so
+        // its approval carries too.
+        store
+            .review_queue_change(1, &repo, 7, "b", "fixed")
+            .await
+            .unwrap();
+        let fixed = store
+            .start_review(1, &repo, 7, "fixed", Some("f"))
+            .await
+            .unwrap();
+        assert_eq!(fixed.diff_id.as_deref(), Some("f"));
+        approve(fixed.id).await;
+        assert!(carry("fixed, restacked", "f").await.unwrap());
+
+        // Only the newest review counts: one that holds the PR is not passed over.
+        store
+            .start_review(1, &repo, 7, "c", Some("e"))
+            .await
+            .unwrap();
+        assert!(!carry("f", "d").await.unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_window_takes_the_prs_first_reviewed_in_it_with_all_their_reviews(pool: PgPool) {
+        let store = PgStore::migrate(pool.clone()).await.unwrap();
+        // #1 was first reviewed 40 days ago, and a rebase carried its approval today.
+        let old = store.start_review(1, &repo(), 1, "a", None).await.unwrap();
+        let carried = store.start_review(1, &repo(), 1, "b", None).await.unwrap();
+        sqlx::query(
+            "UPDATE agent_reviews SET created_at = now() - interval '40 days' WHERE id = $1",
+        )
+        .bind(old.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // #2 was first reviewed 10 days ago, and again today.
+        let first = store.start_review(1, &repo(), 2, "c", None).await.unwrap();
+        let again = store.start_review(1, &repo(), 2, "d", None).await.unwrap();
+        sqlx::query(
+            "UPDATE agent_reviews SET created_at = now() - interval '10 days' WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Another workspace's is not this one's.
+        store.start_review(2, &repo(), 3, "e", None).await.unwrap();
+
+        let ids = |rs: Vec<ReviewRecord>| rs.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store.reviews_of_prs_since(1, 30).await.unwrap()),
+            [again.id, first.id],
+            "#2's whole history, newest first, and none of #1's"
+        );
+        assert_eq!(
+            ids(store.reviews_of_prs_since(1, 60).await.unwrap()),
+            [again.id, first.id, carried.id, old.id]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn each_change_keeps_what_became_of_it_and_how_long_a_human_took(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let change = |id: &str, asked: bool| Judged {
+            finding: Finding {
+                lean: Lean::Change,
+                ..judged(id, asked).finding
+            },
+            sent_back: !asked,
+            ..judged(id, asked)
+        };
+        let id = finished(
+            &store,
+            "aaa",
+            ReviewStatus::Asks,
+            vec![change("f1", true), change("f2", true)],
+        )
+        .await;
+        assert_eq!(store.review(id).await.unwrap().unwrap().waited_secs, None);
+        let answers = ReviewAnswers {
+            answers: BTreeMap::from([
+                ("f1".to_owned(), Answer::Fine),
+                (
+                    "f2".to_owned(),
+                    Answer::Change {
+                        note: String::new(),
+                    },
+                ),
+            ]),
+            by: "mona".into(),
+            note: String::new(),
+            status: ReviewStatus::Changes,
+        };
+        assert!(store.answer_review(id, &answers).await.unwrap());
+        let r = store.review(id).await.unwrap().unwrap();
+        assert_eq!(outcomes(&r), [Some(Outcome::Dismissed), None]);
+        assert!(r.waited_secs.is_some(), "a human answered");
+
+        // The next head's review settles the rest, once.
+        let fixed = [("f2".to_owned(), Outcome::Fixed)];
+        store.settle_findings(id, &fixed).await.unwrap();
+        let wrong = [("f2".to_owned(), Outcome::Wrong)];
+        store.settle_findings(id, &wrong).await.unwrap();
+        let r = store.review(id).await.unwrap().unwrap();
+        assert_eq!(
+            outcomes(&r),
+            [Some(Outcome::Dismissed), Some(Outcome::Fixed)]
+        );
+
+        // Withdrawn on the author's reply, and the rest resolved with no push.
+        let id = finished(
+            &store,
+            "bbb",
+            ReviewStatus::Changes,
+            vec![change("f1", false), change("f2", false)],
+        )
+        .await;
+        store
+            .withdraw_finding(id, "f1", Outcome::Intended)
+            .await
+            .unwrap();
+        store.mark_threaded(id, &["f2".to_owned()]).await.unwrap();
+        assert!(store.approve_resolved(id).await.unwrap());
+        assert!(!store.approve_resolved(id).await.unwrap(), "approved once");
+        let r = store.review(id).await.unwrap().unwrap();
+        let threaded: Vec<bool> = r.findings.iter().map(|f| f.threaded).collect();
+        assert_eq!(threaded, [false, true]);
+        assert_eq!(
+            outcomes(&r),
+            [Some(Outcome::Intended), Some(Outcome::Dismissed)]
+        );
+        assert_eq!(r.waited_secs, None, "no human was asked");
     }
 
     #[sqlx::test(migrations = false)]
     async fn a_withdrawn_finding_lets_the_pr_on_once_nothing_is_sent_back(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
-        let r = store.start_review(1, &repo(), 8, "bbb").await.unwrap();
+        let r = store
+            .start_review(1, &repo(), 8, "bbb", None)
+            .await
+            .unwrap();
         let claim = store
             .claim_review(Duration::from_secs(600))
             .await
@@ -905,12 +1152,7 @@ mod tests {
             findings: vec![back("f1"), back("f2"), judged("f3", false)],
             asked: Vec::new(),
         };
-        assert!(
-            store
-                .finish_review(r.id, claim, &done, false)
-                .await
-                .unwrap()
-        );
+        assert!(store.finish_review(r.id, claim, &done).await.unwrap());
         // The author's reply to a finding sent back is taken like a human's question.
         store
             .add_question(r.id, "f1", "the caller holds the lock", "bot")
@@ -923,61 +1165,52 @@ mod tests {
             .unwrap();
         assert_eq!((taken.id, q.id.as_str()), (r.id, "q1"));
         // Not sent back: nothing to withdraw.
-        assert_eq!(store.withdraw_finding(r.id, "f3").await.unwrap(), None);
         assert_eq!(
-            store.withdraw_finding(r.id, "f1").await.unwrap(),
+            store
+                .withdraw_finding(r.id, "f3", Outcome::Wrong)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .withdraw_finding(r.id, "f1", Outcome::Wrong)
+                .await
+                .unwrap(),
             Some(ReviewStatus::Changes),
             "f2 still holds it"
         );
         assert_eq!(
-            store.withdraw_finding(r.id, "f2").await.unwrap(),
+            store
+                .withdraw_finding(r.id, "f2", Outcome::Wrong)
+                .await
+                .unwrap(),
             Some(ReviewStatus::Approved)
         );
         let r = store.review(r.id).await.unwrap().unwrap();
         assert_eq!(r.status, ReviewStatus::Approved);
         assert!(r.findings[..2].iter().all(|f| f.withdrawn && !f.sent_back));
-    }
-
-    #[sqlx::test(migrations = false)]
-    async fn a_review_waits_for_the_authors_agent_then_takes_the_first_it_posts(pool: PgPool) {
-        let store = PgStore::migrate(pool).await.unwrap();
-        let r = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
-        let stale = Duration::from_secs(600);
-        let claimed = store.claim_review(stale).await.unwrap().unwrap();
-        store
-            .await_author(r.id, claimed.claim, "review it")
-            .await
-            .unwrap();
-        let waiting = store.review(r.id).await.unwrap().unwrap();
-        assert_eq!(waiting.status, ReviewStatus::Author);
-        assert_eq!(waiting.brief.as_deref(), Some("review it"));
         assert_eq!(
-            store.claim_review(stale).await.unwrap(),
-            None,
-            "no worker takes it"
+            outcomes(&r),
+            [Some(Outcome::Wrong), Some(Outcome::Wrong), None]
         );
-
-        let posted = serde_json::json!({ "summary": "s", "findings": [] });
-        let r7 = repo();
-        let submit = |head: &'static str| store.submit_review(1, &r7, 7, head, &posted);
-        assert!(!submit("old").await.unwrap(), "not the head it waits on");
-        assert!(submit("aaa").await.unwrap());
-        assert!(
-            !submit("aaa").await.unwrap(),
-            "the first posted is the one judged"
-        );
-        let judged = store.claim_review(stale).await.unwrap().unwrap();
-        assert_eq!((judged.id, judged.submitted), (r.id, Some(posted)));
     }
 
     #[sqlx::test(migrations = false)]
     async fn a_review_runs_once_per_head_and_waits_for_its_answers(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
-        let r = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
+        let r = store
+            .start_review(1, &repo(), 7, "aaa", None)
+            .await
+            .unwrap();
         assert_eq!(r.status, ReviewStatus::Pending);
         // The same head is the same review.
         assert_eq!(
-            store.start_review(1, &repo(), 7, "aaa").await.unwrap().id,
+            store
+                .start_review(1, &repo(), 7, "aaa", None)
+                .await
+                .unwrap()
+                .id,
             r.id
         );
 
@@ -995,13 +1228,13 @@ mod tests {
         };
         assert!(
             store
-                .finish_review(r.id, claimed.claim, &done, false)
+                .finish_review(r.id, claimed.claim, &done)
                 .await
                 .unwrap()
         );
         assert!(
             !store
-                .finish_review(r.id, claimed.claim, &done, false)
+                .finish_review(r.id, claimed.claim, &done)
                 .await
                 .unwrap(),
             "not running"
@@ -1065,9 +1298,9 @@ mod tests {
         assert_eq!(r.questions[0].answer.as_deref(), Some("because"));
 
         // A review gone stale, as its worker read an older head, is started again.
-        let stale = store.start_review(1, &repo(), 9, "x").await.unwrap();
+        let stale = store.start_review(1, &repo(), 9, "x", None).await.unwrap();
         store.stale_review(stale.id, stale.claim).await.unwrap();
-        let again = store.start_review(1, &repo(), 9, "x").await.unwrap();
+        let again = store.start_review(1, &repo(), 9, "x", None).await.unwrap();
         assert_eq!((again.id, again.status), (stale.id, ReviewStatus::Pending));
 
         // Sent back: no approval to carry over a rebase.
@@ -1085,7 +1318,10 @@ mod tests {
         assert_eq!(store.reviews_of(1, &repo(), 7, 10).await.unwrap().len(), 1);
 
         // A push: a new head, a new review, which the latest one is.
-        let next = store.start_review(1, &repo(), 7, "bbb").await.unwrap();
+        let next = store
+            .start_review(1, &repo(), 7, "bbb", None)
+            .await
+            .unwrap();
         assert_ne!(next.id, r.id);
         let latest = store.latest_reviews(1, &repo(), &[7]).await.unwrap();
         let ids: Vec<i64> = latest.iter().map(|r| r.id).collect();
@@ -1101,7 +1337,10 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_failed_run_waits_before_it_is_tried_again(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
-        let r = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
+        let r = store
+            .start_review(1, &repo(), 7, "aaa", None)
+            .await
+            .unwrap();
         let stale = Duration::from_secs(600);
         let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
         store
@@ -1112,7 +1351,10 @@ mod tests {
         let r = store.review(r.id).await.unwrap().unwrap();
         assert_eq!((r.status, r.attempts), (ReviewStatus::Pending, 1));
         // A run a restart cut short is taken again once stale.
-        let other = store.start_review(1, &repo(), 8, "ccc").await.unwrap();
+        let other = store
+            .start_review(1, &repo(), 8, "ccc", None)
+            .await
+            .unwrap();
         store.claim_review(stale).await.unwrap().unwrap();
         assert_eq!(
             store
@@ -1128,15 +1370,18 @@ mod tests {
     async fn the_next_worker_takes_what_a_restart_cut_short_at_once(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
         let stale = Duration::from_secs(600);
-        let cut = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
-        store.claim_review(stale).await.unwrap().unwrap();
-        let asked = store.start_review(1, &repo(), 8, "bbb").await.unwrap();
-        let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
-        let done = asks();
-        store
-            .finish_review(asked.id, claim, &done, false)
+        let cut = store
+            .start_review(1, &repo(), 7, "aaa", None)
             .await
             .unwrap();
+        store.claim_review(stale).await.unwrap().unwrap();
+        let asked = store
+            .start_review(1, &repo(), 8, "bbb", None)
+            .await
+            .unwrap();
+        let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
+        let done = asks();
+        store.finish_review(asked.id, claim, &done).await.unwrap();
         store
             .add_question(asked.id, "f1", "why?", "mona")
             .await
@@ -1154,61 +1399,21 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_restart_runs_again_a_review_whose_fix_it_cut_short(pool: PgPool) {
-        let store = PgStore::migrate(pool).await.unwrap();
-        let stale = Duration::from_secs(600);
-        let sent = ReviewDone {
-            status: ReviewStatus::Changes,
-            asked: Vec::new(),
-            ..asks()
-        };
-        let cut = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
-        let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
-        assert!(
-            store
-                .finish_review(cut.id, claim, &sent, true)
-                .await
-                .unwrap()
-        );
-        let settled = store.start_review(1, &repo(), 8, "bbb").await.unwrap();
-        let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
-        store
-            .finish_review(settled.id, claim, &sent, true)
-            .await
-            .unwrap();
-        store.settle_review(settled.id, claim).await.unwrap();
-        assert_eq!(store.claim_review(stale).await.unwrap(), None);
-
-        assert_eq!(store.release_reviews().await.unwrap(), 1);
-
-        let again = store.claim_review(stale).await.unwrap().unwrap();
-        assert_eq!(again.id, cut.id);
-        assert_eq!(store.claim_review(stale).await.unwrap(), None);
-        let kept = store.review(settled.id).await.unwrap().unwrap();
-        assert_eq!(kept.status, ReviewStatus::Changes);
-
-        // A review whose post failed after the fix runs again, once its wait is over.
-        store
-            .rerun_review(settled.id, claim, Duration::ZERO)
-            .await
-            .unwrap();
-        let rerun = store.claim_review(stale).await.unwrap().unwrap();
-        assert_eq!(rerun.id, settled.id);
-    }
-
-    #[sqlx::test(migrations = false)]
     async fn a_worker_that_lost_the_queue_lock_changes_nothing(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
         let stale = Duration::from_secs(600);
-        let r = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
-        let old = store.claim_review(stale).await.unwrap().unwrap().claim;
-        let asked = store.start_review(1, &repo(), 8, "bbb").await.unwrap();
-        let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
-        let done = asks();
-        store
-            .finish_review(asked.id, claim, &done, false)
+        let r = store
+            .start_review(1, &repo(), 7, "aaa", None)
             .await
             .unwrap();
+        let old = store.claim_review(stale).await.unwrap().unwrap().claim;
+        let asked = store
+            .start_review(1, &repo(), 8, "bbb", None)
+            .await
+            .unwrap();
+        let claim = store.claim_review(stale).await.unwrap().unwrap().claim;
+        let done = asks();
+        store.finish_review(asked.id, claim, &done).await.unwrap();
         let q = store
             .add_question(asked.id, "f1", "why?", "mona")
             .await
@@ -1220,7 +1425,7 @@ mod tests {
         let new = store.claim_review(stale).await.unwrap().unwrap().claim;
         let (retaken, _) = store.claim_question(stale).await.unwrap().unwrap();
 
-        assert!(!store.finish_review(r.id, old, &done, false).await.unwrap());
+        assert!(!store.finish_review(r.id, old, &done).await.unwrap());
         let later = Duration::from_secs(60);
         store.retry_review(r.id, old, "late", later).await.unwrap();
         store.stale_review(r.id, old).await.unwrap();
@@ -1232,7 +1437,7 @@ mod tests {
         let open = store.review(asked.id).await.unwrap().unwrap();
         assert!(open.questions[0].pending());
 
-        assert!(store.finish_review(r.id, new, &done, false).await.unwrap());
+        assert!(store.finish_review(r.id, new, &done).await.unwrap());
         let answer = Ok("because".to_owned());
         let answered = store.answer_question(asked.id, retaken.claim, &q.id, answer);
         assert!(answered.await.unwrap());
@@ -1241,7 +1446,10 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn the_queues_agent_changing_an_approved_pr_starts_a_review_of_that_change(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
-        let r = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
+        let r = store
+            .start_review(1, &repo(), 7, "aaa", None)
+            .await
+            .unwrap();
         let claim = store
             .claim_review(Duration::from_secs(600))
             .await
@@ -1255,10 +1463,7 @@ mod tests {
             findings: vec![judged("f1", false)],
             asked: Vec::new(),
         };
-        store
-            .finish_review(r.id, claim, &done, false)
-            .await
-            .unwrap();
+        store.finish_review(r.id, claim, &done).await.unwrap();
         store
             .review_queue_change(1, &repo(), 7, "aaa", "fixed")
             .await
@@ -1280,7 +1485,7 @@ mod tests {
 
         // Once that review approves, the next fix goes on from it.
         let started = store
-            .start_review(1, &repo(), 7, "fixed again")
+            .start_review(1, &repo(), 7, "fixed again", None)
             .await
             .unwrap();
         assert_eq!(started.since_head.as_deref(), Some("aaa"), "it keeps that");
@@ -1291,27 +1496,22 @@ mod tests {
             .unwrap()
             .unwrap()
             .claim;
-        store
-            .finish_review(last.id, claim, &done, false)
-            .await
-            .unwrap();
+        store.finish_review(last.id, claim, &done).await.unwrap();
         store
             .review_queue_change(1, &repo(), 7, "fixed again", "fixed once more")
             .await
             .unwrap();
         let next = store.latest_review(1, &repo(), 7).await.unwrap().unwrap();
         assert_eq!(next.since_head.as_deref(), Some("fixed again"));
-
-        assert!(!next.agent_fixed);
-        store.mark_agent_fixed(next.id).await.unwrap();
-        let marked = store.review(next.id).await.unwrap().unwrap();
-        assert!(marked.agent_fixed);
     }
 
     #[sqlx::test(migrations = false)]
     async fn an_approval_holds_for_the_heads_the_queue_makes(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
-        let r = store.start_review(1, &repo(), 7, "aaa").await.unwrap();
+        let r = store
+            .start_review(1, &repo(), 7, "aaa", None)
+            .await
+            .unwrap();
         let claim = store
             .claim_review(Duration::from_secs(600))
             .await
@@ -1325,10 +1525,7 @@ mod tests {
             findings: vec![judged("f1", false)],
             asked: Vec::new(),
         };
-        store
-            .finish_review(r.id, claim, &done, false)
-            .await
-            .unwrap();
+        store.finish_review(r.id, claim, &done).await.unwrap();
         store
             .carry_review(1, &repo(), 7, "aaa", "rebased")
             .await

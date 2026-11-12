@@ -32,16 +32,14 @@ impl AppCredentials {
 }
 
 /// The webhook events that wake a repo's queue: its PRs, reviews, checks, and trunk moves. And
-/// what the You tab keeps of each PR: its comments, and who is on which team.
-pub const WEBHOOK_EVENTS: [&str; 14] = [
+/// what people say on a PR, where the agent's review is answered.
+pub const WEBHOOK_EVENTS: [&str; 13] = [
     "pull_request",
     "pull_request_review",
     "pull_request_review_comment",
     // A review thread resolved, or opened again: the review's gate waits for them all.
     "pull_request_review_thread",
     "issue_comment",
-    "membership",
-    "team",
     "push",
     "check_suite",
     "check_run",
@@ -51,6 +49,8 @@ pub const WEBHOOK_EVENTS: [&str; 14] = [
     // The checks a branch requires.
     "branch_protection_rule",
     "repository_ruleset",
+    // The repo's settings: the merge methods it allows.
+    "repository",
 ];
 
 /// The App that MergeLoop needs. GitHub only delivers webhooks to a public URL, so on
@@ -80,11 +80,10 @@ pub fn manifest(public_url: &str, owner: &str) -> Value {
             "issues": "write",
             "checks": "read",
             "statuses": "read",
-            // The logs of failed GitHub Actions jobs, for the agent that fixes them.
-            "actions": "read",
+            // The logs of failed GitHub Actions jobs, for the agent that fixes them, and running
+            // those jobs again once before a fix.
+            "actions": "write",
             "metadata": "read",
-            // Who is on which team, for the reviews asked of a team.
-            "members": "read",
             // GitHub refuses an App's push that changes `.github/workflows` without it: the rebase
             // or fix of a PR that edits a workflow.
             "workflows": "write",
@@ -318,17 +317,6 @@ pub async fn user(token: &str) -> Result<GithubUser> {
         .await?)
 }
 
-/// The login of the user a token acts as. `None` for an installation token, as a workflow's
-/// `GITHUB_TOKEN` is: GitHub refuses it `/user`, as it names no user.
-pub async fn login_of(token: &str) -> Result<Option<String>> {
-    let res = user_get(token, "/user").await?;
-    if res.status() == reqwest::StatusCode::FORBIDDEN {
-        return Ok(None);
-    }
-    let user: GithubUser = res.error_for_status()?.json().await?;
-    Ok(Some(user.login))
-}
-
 /// An installation of the App that a signed-in user can access.
 #[derive(Clone, Debug)]
 pub struct UserInstallation {
@@ -443,87 +431,12 @@ pub async fn remove_label_as(token: &str, repo: &str, number: u64, label: &str) 
     Ok(())
 }
 
-/// Closes a PR as the user, so GitHub checks that they may: it takes triage access, or being its
-/// author. `Refused` when they may not.
-pub async fn close_pull_as(token: &str, repo: &str, number: u64) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/pulls/{number}");
-    let req = client()?.patch(url).json(&json!({ "state": "closed" }));
-    user_write(token, req).await?.error_for_status()?;
-    Ok(())
-}
-
-/// Marks a draft PR ready for review as the user, so GitHub checks that they may: it takes write
-/// access, or being its author. `Refused` when they may not. A PR already ready is no error.
-pub async fn ready_for_review_as(token: &str, repo: &str, number: u64) -> Result<()> {
-    let pr: Value = user_get(token, &format!("/repos/{repo}/pulls/{number}"))
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    if pr["draft"] != true {
-        return Ok(());
-    }
-    let id = pr["node_id"].as_str().context("a PR without its node id")?;
-    let mutation = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }";
-    let req = client()?
-        .post(format!("{API}/graphql"))
-        .json(&json!({ "query": mutation, "variables": { "id": id } }));
-    let body: Value = user_write(token, req)
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    graphql_errors(&body)
-}
-
-/// A GraphQL answer's errors: `Refused` for a user without the access, else GitHub's message.
-fn graphql_errors(body: &Value) -> Result<()> {
-    let Some(first) = body["errors"].as_array().and_then(|e| e.first()) else {
-        return Ok(());
-    };
-    if first["type"] == "FORBIDDEN" {
-        return Err(Refused.into());
-    }
-    bail!(
-        "{}",
-        first["message"]
-            .as_str()
-            .unwrap_or("GitHub turned the change down.")
-    )
-}
-
-/// Asks these users to review a PR, as the user. `Rejected` for a login GitHub will not ask, as
-/// one without access.
-pub async fn request_reviewers_as(
-    token: &str,
-    repo: &str,
-    number: u64,
-    logins: &[String],
-) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/pulls/{number}/requested_reviewers");
-    let req = client()?.post(url).json(&json!({ "reviewers": logins }));
-    let res = user_write(token, req).await?;
-    if res.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        return Err(Rejected(rejection(&res.json().await.unwrap_or_default())).into());
-    }
-    res.error_for_status()?;
-    Ok(())
-}
-
 /// What a review says of a PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Approve,
     RequestChanges,
     Comment,
-}
-
-/// Comments on a PR as the user.
-pub async fn comment_as(token: &str, repo: &str, number: u64, body: &str) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/issues/{number}/comments");
-    let req = client()?.post(url).json(&json!({ "body": body }));
-    user_write(token, req).await?.error_for_status()?;
-    Ok(())
 }
 
 /// GitHub turned the user's change down, for the reason it gives: approving their own PR, say.
@@ -538,96 +451,11 @@ impl std::fmt::Display for Rejected {
 
 impl std::error::Error for Rejected {}
 
-/// Reviews a PR as the user. `Rejected` for a review GitHub will not take: of their own PR, or
-/// a change request without a comment.
-pub async fn review_as(
-    token: &str,
-    repo: &str,
-    number: u64,
-    verdict: Verdict,
-    body: &str,
-) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/pulls/{number}/reviews");
-    let event = match verdict {
-        Verdict::Approve => "APPROVE",
-        Verdict::RequestChanges => "REQUEST_CHANGES",
-        Verdict::Comment => "COMMENT",
-    };
-    let req = client()?
-        .post(url)
-        .json(&json!({ "event": event, "body": body }));
-    let res = user_write(token, req).await?;
-    if res.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        return Err(Rejected(rejection(&res.json().await.unwrap_or_default())).into());
-    }
-    res.error_for_status()?;
-    Ok(())
-}
-
 /// A comment on a line of the PR, in a review.
 pub struct LineComment<'a> {
     pub path: &'a str,
     pub line: u32,
     pub body: String,
-}
-
-/// Reviews a PR as the user at `head`, with comments on its lines. A comment on a line the PR
-/// did not change goes in the body instead: GitHub takes line comments only on the diff.
-pub async fn review_lines_as(
-    token: &str,
-    repo: &str,
-    number: u64,
-    head: &str,
-    verdict: Verdict,
-    body: &str,
-    comments: &[LineComment<'_>],
-) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/pulls/{number}/reviews");
-    let event = match verdict {
-        Verdict::Approve => "APPROVE",
-        Verdict::RequestChanges => "REQUEST_CHANGES",
-        Verdict::Comment => "COMMENT",
-    };
-    let lines: Vec<Value> = comments
-        .iter()
-        .map(|c| json!({ "path": c.path, "line": c.line, "side": "RIGHT", "body": c.body }))
-        .collect();
-    let send = |lines: &[Value], body: &str| {
-        Ok::<_, anyhow::Error>(client()?.post(&url).json(&json!({
-            "commit_id": head, "event": event, "body": body, "comments": lines,
-        })))
-    };
-    let res = user_write(token, send(&lines, body)?).await?;
-    if res.status() != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        res.error_for_status()?;
-        return Ok(());
-    }
-    let why = rejection(&res.json().await.unwrap_or_default());
-    if comments.is_empty() {
-        return Err(Rejected(why).into());
-    }
-    // A line outside the diff: the comments go in the body.
-    let mut all = body.to_owned();
-    for c in comments {
-        all.push_str(&format!("\n\n**`{}:{}`**\n{}", c.path, c.line, c.body));
-    }
-    let res = user_write(token, send(&[], all.trim())?).await?;
-    if res.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        return Err(Rejected(rejection(&res.json().await.unwrap_or_default())).into());
-    }
-    res.error_for_status()?;
-    Ok(())
-}
-
-/// GitHub's reason in a 422: its first error, which is a string for reviews, or its message.
-fn rejection(body: &Value) -> String {
-    let first = &body["errors"][0];
-    first
-        .as_str()
-        .or_else(|| first["message"].as_str())
-        .or_else(|| body["message"].as_str())
-        .unwrap_or("GitHub turned the review down.")
-        .to_owned()
 }
 
 /// Whether GitHub takes the token, of any kind: `/rate_limit` answers every token, and costs
@@ -691,7 +519,7 @@ async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest
 
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("mergepatrol/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()?)
 }
@@ -699,32 +527,6 @@ fn client() -> Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_graphql_refusal_is_refused_and_any_other_error_says_why() {
-        assert!(graphql_errors(&json!({ "data": {} })).is_ok());
-        let forbidden = json!({ "errors": [{ "type": "FORBIDDEN", "message": "no" }] });
-        assert!(graphql_errors(&forbidden).unwrap_err().is::<Refused>());
-        let other = json!({ "errors": [{ "message": "Pull request is not a draft" }] });
-        assert_eq!(
-            graphql_errors(&other).unwrap_err().to_string(),
-            "Pull request is not a draft"
-        );
-    }
-
-    #[test]
-    fn a_rejected_review_says_why() {
-        let own = json!({ "message": "Unprocessable Entity",
-            "errors": ["Review Can not approve your own pull request"] });
-        assert_eq!(
-            rejection(&own),
-            "Review Can not approve your own pull request"
-        );
-        let field = json!({ "message": "Validation Failed", "errors": [{ "message": "body is required" }] });
-        assert_eq!(rejection(&field), "body is required");
-        assert_eq!(rejection(&json!({ "message": "No" })), "No");
-        assert_eq!(rejection(&Value::Null), "GitHub turned the review down.");
-    }
 
     #[test]
     fn reads_an_expiring_token_and_a_lasting_one() {

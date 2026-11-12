@@ -41,12 +41,45 @@ pub struct PrSummary {
     /// The head commit's combined checks: `SUCCESS`, `FAILURE`, `ERROR`, `PENDING` or
     /// `EXPECTED`. `None` without checks.
     pub checks: Option<String>,
-    /// The fixes the PR has used, for its checks and its review.
+    /// The fixes the PR has used, for its checks.
     #[serde(default)]
     pub fixes: u32,
     /// The fixes it gets.
     #[serde(default)]
     pub fix_budget: u32,
+    /// A stack's PRs, bottom to top. Empty for a PR.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack: Vec<LayerSummary>,
+}
+
+/// What the dashboard shows of each PR of a stack, as of the last tick.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerSummary {
+    pub number: PrNumber,
+    pub title: String,
+    pub url: String,
+    pub head_ref: String,
+    /// `None` for a deleted account.
+    pub author: Option<Person>,
+    pub additions: u64,
+    pub deletions: u64,
+    /// As `PrSummary::checks`.
+    pub checks: Option<String>,
+}
+
+impl From<(PrNumber, PrSummary)> for LayerSummary {
+    fn from((number, pr): (PrNumber, PrSummary)) -> Self {
+        LayerSummary {
+            number,
+            title: pr.title,
+            url: pr.url,
+            head_ref: pr.head_ref,
+            author: pr.author,
+            additions: pr.additions,
+            deletions: pr.deletions,
+            checks: pr.checks,
+        }
+    }
 }
 
 /// Where a queued PR is on its way to the trunk.
@@ -115,8 +148,8 @@ impl EntryState {
         match self {
             EntryState::Waiting | EntryState::Active => Some(Stage::Lane),
             EntryState::Held(hold) => match hold.innermost() {
-                Hold::PrepRebasing | Hold::AuthorRebase { .. } => Some(Stage::Rebase),
-                Hold::PrepChecks | Hold::PrepFixing | Hold::AuthorFix { .. } => Some(Stage::Checks),
+                Hold::PrepRebasing => Some(Stage::Rebase),
+                Hold::PrepChecks | Hold::PrepFixing => Some(Stage::Checks),
                 hold if hold.of_review() => Some(Stage::Review),
                 _ => None,
             },

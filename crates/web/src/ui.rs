@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
@@ -15,7 +15,16 @@ const PUBLIC_URL: &str = "__PUBLIC_URL__";
 
 /// Serves the dashboard. Unknown paths get `index.html`, so client-side routes work, but an
 /// unknown file (a path with an extension) is a 404, so crawlers and link previews see it missing.
-pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
+/// Pages are only read: a POST to a path no route takes is a 405, so a misspelled webhook URL
+/// fails its delivery instead of getting a page.
+pub async fn serve(State(state): State<AppState>, method: Method, uri: Uri) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "GET, HEAD")],
+        )
+            .into_response();
+    }
     let path = uri.path().trim_start_matches('/');
     match path {
         "robots.txt" => return robots(&state.public_url).into_response(),
@@ -118,7 +127,7 @@ fn llms(public_url: &str) -> String {
         .map(|c| c.llms_section(public_url))
         .collect();
     format!(
-        "{}{}{pages}\n## More\n\n- [Changelog]({public_url}/changelog): what changed, newest first\n- [Source](https://github.com/agent-labs-dev/mergepatrol): Apache-2.0, on GitHub\n",
+        "{}{}{pages}\n## More\n\n- [Changelog]({public_url}/changelog): what changed, newest first\n- [Source](https://github.com/agent-labs-dev/mergeloop): Apache-2.0, on GitHub\n",
         LLMS_INTRO.replace("{public_url}", public_url),
         crate::docs::llms_section(public_url)
     )

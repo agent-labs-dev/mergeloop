@@ -16,7 +16,7 @@ a pull request does not go through cleanly. Checked against GitHub's docs on 31 
 | Private repositories | Only for organizations on GitHub Enterprise Cloud | Any GitHub plan, $15 per seat a month after a 14-day trial |
 | Public repositories | Organization-owned repositories | Any public repository, free within a fair-use limit |
 | CI changes | GitHub Actions workflows must run on `merge_group`; other CI on pushes to `gh-readonly-queue/*` branches | None: batches run your existing `pull_request` workflows on a draft PR |
-| How to queue | "Merge when ready", `gh pr merge`, or the GraphQL `enqueuePullRequest` mutation | A label, the dashboard, or the MCP tool `queue_pull`, so people and coding agents queue the same way |
+| How to queue | "Merge when ready", `gh pr merge`, or the GraphQL `enqueuePullRequest` mutation | A label, or the MCP tool `queue_pull`, so people and coding agents queue the same way |
 | A PR that conflicts with its base | Removed from the queue | An agent resolves the conflict, your `verify` commands run, and the PR keeps its place |
 | A required check that fails | The PR is removed | An agent commits a fix on the PR, up to `fix_ci.attempts` times, before ejecting it |
 | A failed group of PRs | The failing PR is removed and the group is rebuilt without it | The batch is split in half repeatedly down to the PR that broke it; the rest merge |
@@ -46,17 +46,17 @@ a pull request does not go through cleanly. Checked against GitHub's docs on 31 
 - **You do not want to touch CI.** Batches open a draft PR, so the `pull_request` workflows you
   have run on the combination.
 - **Coding agents open your pull requests.** The MCP server lets an agent queue its own PR, read
-  why it is held, and answer review questions, with the same permissions GitHub gives its token.
+  why it is held and what to do next, with the same permissions GitHub gives its token.
 
 ## Switching
 
 MergeLoop and GitHub's queue should not both run on one branch: they would race for merges.
 
 1. [Install MergeLoop](/docs/getting-started) and merge the setup PR that adds
-   `.mergepatrol/mergepatrol.yml` ([reference](/docs/configuration)).
+   `.mergeloop/mergeloop.yml` ([reference](/docs/configuration)).
 2. Turn off "Require merge queue" on the branch's ruleset or branch protection.
 3. Keep your required checks. MergeLoop waits for the same ones.
-4. Label pull requests `mergepatrol` instead of pressing "Merge when ready".
+4. Label pull requests `mergeloop` instead of pressing "Merge when ready".
 
 You can leave the `merge_group` trigger in your workflows; nothing calls it.
 

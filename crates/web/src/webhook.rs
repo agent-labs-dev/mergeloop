@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use hmac::{Hmac, KeyInit, Mac};
 use mergepatrol_analytics::{Analytics, WorkspaceInfo};
-use mergepatrol_core::{REPO_CONFIG_PATH, RepoName};
+use mergepatrol_core::{ConfigPath, RepoName};
 use mergepatrol_store::{BRANCH_RULES, Change};
 use serde_json::Value;
 use sha2::Sha256;
@@ -55,9 +55,6 @@ pub(crate) async fn receive(
         installation(&state.analytics, &payload);
     }
     let installation = payload["installation"]["id"].as_u64();
-    if let Some(id) = installation {
-        team_changed(&state, id, event, &payload).await?;
-    }
     let repo = payload["repository"]["full_name"]
         .as_str()
         .and_then(RepoName::parse);
@@ -77,11 +74,6 @@ pub(crate) async fn receive(
                 .set_label_head(installation, &repo, pr, label, head)
                 .await;
         }
-        for pr in inbox_prs(event, &payload) {
-            if stored.is_ok() {
-                stored = state.store.inbox_changed(installation, &repo, pr).await;
-            }
-        }
         for change in changed(event, &payload) {
             if stored.is_ok() {
                 stored = state
@@ -93,8 +85,8 @@ pub(crate) async fn receive(
         if let Some(reply) = crate::pr_reply::reply(event, &payload)
             && let Err(e) = crate::pr_reply::heard(&state, installation, &repo, reply).await
         {
-            // A reply is read once: a failure here loses only the note, or the approval,
-            // which the dashboard still takes.
+            // Lost here, a review is lost, but not the threads' answers: the next delivery
+            // about the PR reads them all again.
             tracing::warn!(installation, %repo, error = %format!("{e:#}"), "could not act on a reply to the agent's review");
         }
         // The queue reads the rest from GitHub, so it wakes even when the write failed. The
@@ -130,59 +122,6 @@ fn installation(analytics: &Analytics, payload: &Value) {
             account_type: i["account"]["type"].as_str().unwrap_or_default(),
         },
     );
-}
-
-/// The PRs the delivery changed of what the You tab shows: themselves, their reviews, comments,
-/// review threads and checks.
-fn inbox_prs(event: Option<&str>, payload: &Value) -> Vec<u64> {
-    let number = |v: &Value| v["number"].as_u64();
-    match event {
-        Some(
-            "pull_request"
-            | "pull_request_review"
-            | "pull_request_review_comment"
-            | "pull_request_review_thread",
-        ) => number(&payload["pull_request"]).into_iter().collect(),
-        // An issue's comment is not a PR's.
-        Some("issue_comment") if !payload["issue"]["pull_request"].is_null() => {
-            number(&payload["issue"]).into_iter().collect()
-        }
-        Some("check_suite") if payload["action"] == "completed" => {
-            payload["check_suite"]["pull_requests"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(number)
-                .collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Keeps who is on which team, for the reviews asked of a team.
-async fn team_changed(
-    state: &AppState,
-    installation: u64,
-    event: Option<&str>,
-    payload: &Value,
-) -> anyhow::Result<()> {
-    let team = payload["team"]["slug"].as_str();
-    match (event, payload["action"].as_str(), team) {
-        (Some("membership"), Some(action @ ("added" | "removed")), Some(team)) => {
-            if let Some(login) = payload["member"]["login"].as_str() {
-                let member = action == "added";
-                state
-                    .store
-                    .set_inbox_member(installation, team, login, member)
-                    .await?;
-            }
-        }
-        (Some("team"), Some("deleted"), Some(team)) => {
-            state.store.delete_inbox_team(installation, team).await?;
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// What the delivery changed of what the queue reads from GitHub.
@@ -229,6 +168,14 @@ fn changed(event: Option<&str>, payload: &Value) -> Vec<Change> {
             changes
         }
         Some("workflow_run") => vec![value("approval", &payload["workflow_run"]["head_sha"])],
+        // The repo's settings, as which merge methods it allows, and whether it is private.
+        Some("repository") => vec![
+            matches!(
+                payload["action"].as_str(),
+                Some("edited" | "privatized" | "publicized")
+            )
+            .then_some(Change::Repo),
+        ],
         // The checks a branch requires, and the reviews.
         Some("branch_protection_rule" | "repository_ruleset") => vec![
             Some(Change::ValuesUnder(BRANCH_RULES.into())),
@@ -239,27 +186,42 @@ fn changed(event: Option<&str>, payload: &Value) -> Vec<Change> {
     changes.into_iter().flatten().collect()
 }
 
-/// Whether a push to the default branch leaves it with the config file, if the push touched the
-/// file. The periodic look at every repo catches what this misses.
+/// Whether a push to the default branch leaves it with the config file, if the push says. It
+/// has one when the last touch of either path left a file there, and none when the last touch of
+/// each removed it. The periodic look at every repo catches what this misses.
 fn config_after_push(payload: &Value) -> Option<bool> {
     let default = payload["repository"]["default_branch"].as_str()?;
     if payload["ref"].as_str()? != format!("refs/heads/{default}") {
         return None;
     }
-    let has = |commit: &Value, list: &str| {
+    let commits = payload["commits"].as_array()?;
+    let has = |commit: &Value, list: &str, path: &str| {
         commit[list]
             .as_array()
-            .is_some_and(|files| files.iter().any(|f| f == REPO_CONFIG_PATH))
+            .is_some_and(|files| files.iter().any(|f| f == path))
     };
-    payload["commits"].as_array()?.iter().rev().find_map(|c| {
-        if has(c, "removed") {
-            Some(false)
-        } else if has(c, "added") || has(c, "modified") {
-            Some(true)
-        } else {
-            None
-        }
-    })
+    // Each path's state after the push: `None` where the push left it alone.
+    let after: Vec<Option<bool>> = ConfigPath::ALL
+        .iter()
+        .map(|at| {
+            commits.iter().rev().find_map(|c| {
+                if has(c, "added", at.path()) || has(c, "modified", at.path()) {
+                    Some(true)
+                } else if has(c, "removed", at.path()) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    if after.contains(&Some(true)) {
+        Some(true)
+    } else if after.iter().all(|a| *a == Some(false)) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// A label went on a fork PR: the PR, the label, and the head it had then. The queue first sees
@@ -327,5 +289,15 @@ mod tests {
             let changes = changed(Some(event), &json!({}));
             assert!(changes.contains(&Change::ValuesUnder(BRANCH_RULES.into())));
         }
+    }
+
+    #[test]
+    fn a_change_to_the_repos_settings_reads_the_repo_again() {
+        let edited = changed(Some("repository"), &json!({ "action": "edited" }));
+        assert_eq!(edited, [Change::Repo]);
+        let private = changed(Some("repository"), &json!({ "action": "privatized" }));
+        assert_eq!(private, [Change::Repo]);
+        let renamed = changed(Some("repository"), &json!({ "action": "renamed" }));
+        assert!(renamed.is_empty(), "{renamed:?}");
     }
 }

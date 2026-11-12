@@ -1,7 +1,7 @@
 //! Drives one repo: polls GitHub, keeps the lane in sync, and runs the PR at the head of the lane
 //! through rebase, checks, fixes for failed checks, and merge.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,20 +13,21 @@ use futures_util::future::try_join_all;
 use mergepatrol_analytics::{Analytics, Exit};
 use mergepatrol_billing::Billing;
 use mergepatrol_core::{
-    BatchStep, BuiltBatch, CHECKS_MISSING_FOR, CHECKS_TIMEOUT, Candidate, CheckFailure,
-    EjectReason, Event, Hold, Job, Lane, LaneChange, LayerHead, PendingMerge, Phase, PrNumber,
-    PrSummary, RECHECK_MESSAGE, REPO_CONFIG_PATH, RepoName, RepoSettings, ReviewSettings,
-    ReviewStatus, Runs, SpendTask, Transition, body_closing_commit_issues,
+    BatchStep, BuiltBatch, CHECKS_MISSING_FOR, CHECKS_TIMEOUT, Candidate, CheckFailure, ConfigPath,
+    EjectReason, EntryState, Event, Hold, Job, Lane, LaneChange, LayerHead, PendingMerge, Phase,
+    PrNumber, PrSummary, RECHECK_MESSAGE, RepoName, RepoSettings, ReviewSettings, ReviewStatus,
+    SpendTask, Transition, body_closing_commit_issues,
 };
-use mergepatrol_executor::Executor;
 use mergepatrol_executor::protocol::{
     ApiAccess, BUNDLE_FILE, JobEvent, JobOutcome, JobSpec, MAX_BUNDLE_BYTES, ResolverSpec, Task,
+    Update,
 };
-use mergepatrol_executor::proxy::{Api, ApiProxy, Granted, REQUESTS_PER_JOB};
+use mergepatrol_executor::proxy::{Api, ApiProxy, Credential, Granted, REQUESTS_PER_JOB};
+use mergepatrol_executor::{Executor, TimedOut};
 use mergepatrol_git::{Git, cache_path};
 use mergepatrol_github::{
-    App, AppCredentials, BranchMerge, CheckState, Installation, MergeOutcome, PullRequest,
-    RateLimited, RepoSnapshot,
+    App, AppCredentials, BranchMerge, BranchMove, CheckState, Installation, MergeOutcome,
+    PullRequest, RateLimited, RepoSnapshot,
 };
 use mergepatrol_store::{AgentTask, Change, GITHUB_APP, LaneKey, PgStore, Scope, Store, Vault};
 use secrecy::ExposeSecret;
@@ -39,7 +40,8 @@ use crate::config::Config;
 use crate::credentials::ChatGpt;
 use crate::github::GitHub;
 use crate::job::{GAVE_UP, LEFT_CONFLICT, RETITLED};
-use crate::publish::{Publish, create_commits, publish};
+use crate::publish::{Publish, create_commits, create_merge, publish};
+use crate::review::REVIEW_MARKS;
 
 const CHECKS_POLL: Duration = Duration::from_secs(15);
 /// With no required checks, how long after a publish its checks may first count as green: a
@@ -65,7 +67,7 @@ const MERGE_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// the PR is ejected. Shorter failures leave it at the head of the queue, to run again.
 const JOB_ERRORS_FOR: Duration = Duration::from_secs(30 * 60);
 /// A fix may change any file but these: CI's own config, and the queue's.
-const FIX_PROTECTED: [&str; 2] = [".github/", ".mergepatrol/"];
+const FIX_PROTECTED: [&str; 3] = [".github/", ".mergeloop/", ".mergepatrol/"];
 /// How long to wait for a fork PR's pull ref to follow a push to the fork.
 const PULL_REF_WAIT: Duration = Duration::from_secs(30);
 /// How long a fork PR may wait for its pin, the head its label went on at, before it leaves.
@@ -75,8 +77,6 @@ const PIN_WAIT: Duration = Duration::from_secs(5 * 60);
 const GITHUB_READS_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often each subscription's seats are brought in line with Stripe.
 const SYNC_SEATS_EVERY: Duration = Duration::from_secs(60);
-/// How long the inbox keeps a PR once it merged or closed. The You tab lists a week of them.
-const INBOX_CLOSED_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub struct Ctx {
     pub config: Config,
@@ -226,8 +226,6 @@ pub async fn lead(ctx: Arc<Ctx>, store: Arc<PgStore>, mut stop: watch::Receiver<
                     Spawned::spawn(prune(ctx.clone()), &alive),
                     Spawned::spawn(sync_seats(ctx.clone()), &alive),
                     Spawned::spawn(crate::redeliver::redeliver(ctx.clone()), &alive),
-                    Spawned::spawn(crate::inbox::read_changed(ctx.clone()), &alive),
-                    Spawned::spawn(crate::inbox::index(ctx.clone()), &alive),
                     Spawned::spawn(crate::review::run(ctx.clone(), alive.clone()), &alive),
                 );
                 let stopping = loop {
@@ -283,10 +281,6 @@ async fn prune(ctx: Arc<Ctx>) {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "could not delete old GitHub reads")
             }
-        }
-        match ctx.store.prune_inbox(INBOX_CLOSED_FOR).await {
-            Ok(n) => tracing::info!(prs = n, "deleted PRs closed long ago from the inbox"),
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), "could not prune the inbox"),
         }
         let jobs = ctx.config.data_dir.join("jobs");
         match prune_job_outputs(&jobs, JOB_OUTPUTS_FOR).await {
@@ -414,7 +408,13 @@ async fn discover_once(ctx: &Ctx) -> Result<()> {
                 .map(|r| r.repo)
                 .collect();
             follow_renames(ctx.store.as_ref(), &gh, &repos).await?;
-            let has = gh.have_file(&repos, REPO_CONFIG_PATH).await?;
+            let mut has = vec![false; repos.len()];
+            for at in ConfigPath::ALL {
+                let here = gh.have_file(&repos, at.path()).await?;
+                has.iter_mut()
+                    .zip(here)
+                    .for_each(|(has, here)| *has |= here);
+            }
             anyhow::Ok(
                 repos
                     .into_iter()
@@ -685,7 +685,7 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
         .store
         .inherited(installation, &ctx.config.repo_defaults)
         .await?;
-    let settings = match RepoSettings::from_file(file.as_deref(), &inherited) {
+    let settings = match file.settings(&inherited) {
         Ok(s) => s,
         Err(e) => {
             // Paused: the settings it would run with are a guess.
@@ -721,10 +721,8 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     let saved = ctx.store.review_settings(installation).await?;
     let mut review = saved.clone().unwrap_or_default().with(&settings.review);
     // On by default, but a review needs the workspace's model key: without one, a workspace
-    // that never chose waits for no review, rather than for a human in its place. The author's
-    // agent needs none.
-    let hosted = settings.agent.runs == Runs::Hosted;
-    if hosted && review.enabled && saved.is_none() && settings.review.enabled.is_none() {
+    // that never chose waits for no review, rather than for a human in its place.
+    if review.enabled && saved.is_none() && settings.review.enabled.is_none() {
         review.enabled = ctx
             .chatgpt
             .credential(
@@ -738,9 +736,9 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     // For the status to tell before a PR is queued: whether the billing gate covers the repo,
     // and which keys the agent's tasks need.
     let agent: Vec<AgentTask> = [
-        (SpendTask::Rebase, hosted),
-        (SpendTask::Fix, hosted && settings.fix_ci.allowed() > 0),
-        (SpendTask::Review, hosted && review.enabled),
+        (SpendTask::Rebase, true),
+        (SpendTask::Fix, settings.fix_ci.allowed() > 0),
+        (SpendTask::Review, review.enabled),
     ]
     .into_iter()
     .filter(|(_, runs)| *runs)
@@ -788,9 +786,11 @@ impl Caches {
 
 /// Why a unit waits for the agent's review, the queue's first gate: each PR's review of its
 /// head, which a tick starts, then its review threads. `heads` are each layer's, bottom to top,
-/// as (PR, head, unresolved review threads).
+/// as (PR, head, unresolved review threads). A head that changes what an approved one did, as a
+/// layer that a restack moved onto new layers below, keeps that approval.
 async fn review_hold(
     ctx: &Ctx,
+    gh: &dyn GitHub,
     key: &LaneKey,
     review: &ReviewSettings,
     stacked: bool,
@@ -800,7 +800,7 @@ async fn review_hold(
     if !review.enabled {
         return Ok(None);
     }
-    for &(number, head, unresolved) in heads {
+    for (i, &(number, head, unresolved)) in heads.iter().enumerate() {
         let latest = ctx
             .store
             .latest_review(key.installation_id, &key.repo, number)
@@ -825,13 +825,45 @@ async fn review_hold(
                 }
             }
             _ => {
-                let r = ctx
-                    .store
-                    .start_review(key.installation_id, &key.repo, number, head)
-                    .await?;
-                // Woken by the caller once the lane is saved: a PR just queued is in it then.
-                *started = true;
-                r.status
+                // A layer's own changes start at the layer below.
+                let base = match i {
+                    0 => key.trunk.as_str(),
+                    _ => heads[i - 1].1,
+                };
+                let diff_id = match gh.diff_id(&key.repo, base, head).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(repo = %key.repo, pr = number, error = %format!("{e:#}"), "could not read the PR's diff");
+                        None
+                    }
+                };
+                let carried = match &diff_id {
+                    Some(id) => {
+                        ctx.store
+                            .carry_unchanged(key.installation_id, &key.repo, number, head, id)
+                            .await?
+                    }
+                    None => false,
+                };
+                if carried {
+                    let why = "its changes are those of the head it approved";
+                    record(ctx, key, number, "review-carried", why).await?;
+                    ReviewStatus::Approved
+                } else {
+                    let r = ctx
+                        .store
+                        .start_review(
+                            key.installation_id,
+                            &key.repo,
+                            number,
+                            head,
+                            diff_id.as_deref(),
+                        )
+                        .await?;
+                    // Woken by the caller once the lane is saved: a PR just queued is in it then.
+                    *started = true;
+                    r.status
+                }
             }
         };
         if let Some(hold) = Hold::of_reviews(stacked, [(number, status)]) {
@@ -849,6 +881,19 @@ async fn review_hold(
         }
     }
     Ok(None)
+}
+
+/// Dismisses the changes MergeLoop's review asked for on PRs its review gate lets go on, as
+/// GitHub would not merge them otherwise. One that fails stays: GitHub turns the merge down,
+/// and says why.
+async fn withdraw_change_requests(gh: &dyn GitHub, repo: &RepoName, layers: &[PullRequest]) {
+    for pr in layers.iter().filter(|pr| pr.changes_requested_by_viewer()) {
+        let why = "MergeLoop's review no longer holds this PR.";
+        let dismissed = gh.dismiss_reviews_marked(repo, pr.number, &REVIEW_MARKS, why);
+        if let Err(e) = dismissed.await {
+            tracing::warn!(%repo, pr = pr.number, error = %format!("{e:#}"), "could not dismiss the review's request for changes");
+        }
+    }
 }
 
 /// Whether the author resolved what the agent's review sent back to them alone: each finding
@@ -908,9 +953,8 @@ async fn tick_lane(
     };
     let mut lane = read.lane(trunk);
     if let Some(merge) = lane.merging.clone() {
-        let method = merge_method(gh, &key, &snap).await?;
         let number = merge.number;
-        if resume_merge(ctx, &settings, gh, &key, &mut lane, &units, merge, &method).await? {
+        if resume_merge(ctx, &settings, gh, &key, &snap, &mut lane, &units, merge).await? {
             units.retain(|u| u.number != number);
         }
     }
@@ -1093,10 +1137,13 @@ async fn sync_lane(
     let mut started = false;
 
     let mut candidates = Vec::new();
+    // The PRs this sync took out of the queue with a comment that says why.
+    let mut dropped: HashSet<PrNumber> = HashSet::new();
     for &unit in &units {
         if unit.stacked && unit.layers.iter().any(|pr| pr.is_cross_repository) {
             let why = "Stacks with a PR from a fork are not supported yet.";
             eject(ctx, settings, gh, key, &unit.prs(), why, "fork").await?;
+            dropped.extend(unit.prs());
             continue;
         }
         let mut pin = None;
@@ -1110,6 +1157,7 @@ async fn sync_lane(
                 Pin::Wait => continue,
                 Pin::Drop { kind, why } => {
                     drop_fork(ctx, settings, gh, key, unit.number, kind, &why).await?;
+                    dropped.insert(unit.number);
                     continue;
                 }
             }
@@ -1135,7 +1183,20 @@ async fn sync_lane(
                     false => (pr.number, pr.head_ref_oid.as_str(), pr.unresolved_threads),
                 })
                 .collect();
-            review_hold(ctx, key, &read.review, unit.stacked, &heads, &mut started).await?
+            let hold = review_hold(
+                ctx,
+                gh,
+                key,
+                &read.review,
+                unit.stacked,
+                &heads,
+                &mut started,
+            )
+            .await?;
+            if hold.is_none() {
+                withdraw_change_requests(gh, repo, &unit.layers).await;
+            }
+            hold
         } {
             Some(reason)
         } else if let Some(reason) = unit.hold_reason() {
@@ -1146,6 +1207,7 @@ async fn sync_lane(
                 Some(Block::Eject(why)) => {
                     let why = format!("Ejected: {why}.");
                     eject(ctx, settings, gh, key, &unit.prs(), &why, "fork").await?;
+                    dropped.extend(unit.prs());
                     continue;
                 }
                 None => None,
@@ -1162,6 +1224,14 @@ async fn sync_lane(
                 fix_budget: match unit.fork() {
                     true => 0,
                     false => settings.fix_ci.allowed(),
+                },
+                stack: match unit.stacked {
+                    true => unit
+                        .layers
+                        .iter()
+                        .map(|pr| (pr.number, pr.summary()).into())
+                        .collect(),
+                    false => Vec::new(),
                 },
                 ..unit.layers[0].summary()
             },
@@ -1186,6 +1256,20 @@ async fn sync_lane(
     let mut prs_of: HashMap<PrNumber, Vec<PrNumber>> =
         lane.entries.iter().map(|e| (e.number, e.prs())).collect();
     prs_of.extend(units.iter().map(|u| (u.number, u.prs())));
+    let prs_of = |n: PrNumber| prs_of.get(&n).cloned().unwrap_or(vec![n]);
+    // A PR still in the queue, in another entry, has not left it.
+    let queued: HashSet<PrNumber> = candidates.iter().flat_map(|c| prs_of(c.number)).collect();
+    let getting_ready: HashSet<PrNumber> = lane
+        .entries
+        .iter()
+        .filter(|e| matches!(&e.state, EntryState::Held(h) if h.of_prep()))
+        .map(|e| e.number)
+        .collect();
+    // Each entry's PRs before the sync: a stack's layers join and leave it while it stays.
+    let before: HashMap<PrNumber, Vec<PrNumber>> =
+        lane.entries.iter().map(|e| (e.number, e.prs())).collect();
+    // Each entry's comment, the last its changes call for.
+    let mut comments: Vec<(PrNumber, String)> = Vec::new();
     for change in lane.sync(&candidates) {
         let (number, kind, message, comment) = match change {
             LaneChange::Enqueued(n) => {
@@ -1195,11 +1279,23 @@ async fn sync_lane(
                     b.queued(installation, snap.private, &authors, unix_now())
                         .await?;
                 }
-                (n, "enqueued", "added to the queue".to_owned(), None)
+                (
+                    n,
+                    "enqueued",
+                    "added to the queue".to_owned(),
+                    Some(ENQUEUED.to_owned()),
+                )
             }
             LaneChange::Dequeued { number, .. } => {
                 ctx.job_errors.clear(key, number);
-                (number, "dequeued", "left the queue".to_owned(), None)
+                let left =
+                    exit_once(ctx, key, &prs_of(number), "dequeued", "left the queue").await?;
+                let left: Vec<PrNumber> = left
+                    .into_iter()
+                    .filter(|n| !queued.contains(n) && !dropped.contains(n))
+                    .collect();
+                comment_left(gh, repo, &labels.trigger, &left).await;
+                continue;
             }
             LaneChange::Held { number, reason } => {
                 let comment = match &gate {
@@ -1211,9 +1307,10 @@ async fn sync_lane(
                     {
                         None
                     }
-                    // Getting ready shows on the dashboard, and in the commits it pushes.
-                    _ if reason.of_prep() => None,
-                    _ if reason.of_author() => Some(for_author(&reason)),
+                    // Once as it starts: each step after shows on the dashboard.
+                    _ if reason.of_prep() => {
+                        (!getting_ready.contains(&number)).then(|| GETTING_READY.to_owned())
+                    }
                     _ => Some(on_hold(&reason)),
                 };
                 (number, "held", reason.to_string(), comment)
@@ -1225,15 +1322,42 @@ async fn sync_lane(
                 Some("No longer on hold. Waiting in its place in the queue.".to_owned()),
             ),
         };
-        let prs = prs_of.get(&number).cloned().unwrap_or(vec![number]);
-        if kind == "dequeued" {
-            exit_once(ctx, key, &prs, kind, &message).await?;
-        } else {
-            record_all(ctx, key, &prs, kind, &message).await?;
-        }
+        record_all(ctx, key, &prs_of(number), kind, &message).await?;
         if let Some(comment) = comment {
-            comment_all(gh, repo, &prs, &comment).await?;
+            comments.retain(|(n, _)| *n != number);
+            comments.push((number, comment));
         }
+    }
+    // The layers that joined or left a stack that stays, which its own changes do not cover.
+    let mut joined_comments: Vec<(Vec<PrNumber>, String)> = Vec::new();
+    for e in lane.entries.clone() {
+        let Some(old) = before.get(&e.number) else {
+            continue;
+        };
+        let now = e.prs();
+        let left: Vec<PrNumber> = old.iter().filter(|n| !now.contains(n)).copied().collect();
+        let joined: Vec<PrNumber> = now.iter().filter(|n| !old.contains(n)).copied().collect();
+        if !left.is_empty() {
+            let left = exit_once(ctx, key, &left, "dequeued", "left the queue").await?;
+            let left: Vec<PrNumber> = left
+                .into_iter()
+                .filter(|n| !queued.contains(n) && !dropped.contains(n))
+                .collect();
+            comment_left(gh, repo, &labels.trigger, &left).await;
+        }
+        if !joined.is_empty() {
+            record_all(ctx, key, &joined, "enqueued", "added to the queue").await?;
+            let covered = comments.iter().any(|(n, _)| *n == e.number);
+            if let Some(comment) = standing(&e.state, gate.as_ref()).filter(|_| !covered) {
+                joined_comments.push((joined, comment));
+            }
+        }
+    }
+    for (number, comment) in comments {
+        comment_all(gh, repo, &prs_of(number), &comment).await?;
+    }
+    for (prs, comment) in joined_comments {
+        comment_all(gh, repo, &prs, &comment).await?;
     }
     ctx.store.save_lane(key, lane).await?;
     if started {
@@ -1324,26 +1448,6 @@ impl Unit {
                     && pr.stack.as_ref().map(|s| s.number) == stack
                     && pr.merges_into() == trunk
             })
-    }
-
-    /// The unit as it is now, and the index of its PR `number`, if that PR is still at `head`, and
-    /// the agent may fix it with fixes left.
-    pub(crate) async fn to_fix(
-        &self,
-        gh: &dyn GitHub,
-        key: &LaneKey,
-        settings: &RepoSettings,
-        number: PrNumber,
-        head: &str,
-    ) -> Result<Option<(Unit, usize)>> {
-        let now = self.refreshed(gh, &key.repo).await?;
-        let layer = now.layers.iter().position(|pr| pr.number == number);
-        let Some(layer) = layer.filter(|&i| now.layers[i].head_ref_oid == head) else {
-            return Ok(None);
-        };
-        let fixes_left = now.fixes_used(gh, &key.repo).await? < settings.fix_ci.allowed();
-        let fixable = now.fixable(&settings.label, &key.trunk);
-        Ok((fixes_left && fixable).then_some((now, layer)))
     }
 
     /// How many fixes its PRs used, of the one budget they share.
@@ -1635,7 +1739,7 @@ async fn exit_once(
     prs: &[PrNumber],
     outcome: &str,
     detail: &str,
-) -> Result<()> {
+) -> Result<Vec<PrNumber>> {
     let mut fresh = Vec::new();
     for n in prs {
         match ctx.store.has_left(key, *n).await? {
@@ -1643,7 +1747,45 @@ async fn exit_once(
             false => fresh.push(*n),
         }
     }
-    exit_all(ctx, key, &fresh, outcome, detail, None).await
+    exit_all(ctx, key, &fresh, outcome, detail, None).await?;
+    Ok(fresh)
+}
+
+/// What the comment of PR `number`, which left the queue, says now that it did: why, as GitHub
+/// shows it. `None` for a PR still open with `label` on, as one queued again.
+async fn left_comment(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    label: &str,
+    number: PrNumber,
+) -> Result<Option<String>> {
+    let pr = gh.pull_request(repo, number).await?;
+    Ok(match pr.state.as_str() {
+        "MERGED" => Some(match gh.merged_as(repo, number, &pr.head_ref_oid).await? {
+            Some(sha) => format!("Merged outside MergeLoop as {sha}."),
+            None => "Merged outside MergeLoop.".to_owned(),
+        }),
+        "CLOSED" => Some("Left the queue: it was closed.".to_owned()),
+        _ if !pr.has_label(label) => Some(format!(
+            "Left the queue: the `{label}` label was removed. Add it again to queue it."
+        )),
+        _ => None,
+    })
+}
+
+/// Writes on each of `prs` that it left the queue, and why. The PRs left already: a comment that
+/// fails is not worth undoing that for.
+async fn comment_left(gh: &dyn GitHub, repo: &RepoName, label: &str, prs: &[PrNumber]) {
+    for n in prs {
+        let written = match left_comment(gh, repo, label, *n).await {
+            Ok(Some(comment)) => gh.sticky_comment(repo, *n, &comment).await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            tracing::warn!(%repo, pr = n, error = %format!("{e:#}"), "could not say that the PR left the queue");
+        }
+    }
 }
 
 async fn comment_all(gh: &dyn GitHub, repo: &RepoName, prs: &[PrNumber], body: &str) -> Result<()> {
@@ -1750,10 +1892,12 @@ async fn finish(
         Outcome::Cancelled => {
             lane.remove(unit.number);
             exit_all(ctx, key, &prs, "cancelled", "the label was removed", None).await?;
+            comment_left(gh, repo, &settings.label, &prs).await;
         }
         Outcome::Left => {
             lane.remove(unit.number);
-            exit_once(ctx, key, &prs, "dequeued", "left the queue").await?;
+            let left = exit_once(ctx, key, &prs, "dequeued", "left the queue").await?;
+            comment_left(gh, repo, &settings.label, &left).await;
         }
         Outcome::Restarted(why) => {
             lane.stop();
@@ -1863,10 +2007,10 @@ async fn resume_merge(
     settings: &RepoSettings,
     gh: &dyn GitHub,
     key: &LaneKey,
+    snap: &RepoSnapshot,
     lane: &mut Lane,
     units: &[Unit],
     merge: PendingMerge,
-    method: &str,
 ) -> Result<bool> {
     let repo = &key.repo;
     let open = units.iter().any(|u| {
@@ -1876,7 +2020,7 @@ async fn resume_merge(
             && u.hold_reason().is_none()
     });
     let sha = if open {
-        match gh.merge(repo, merge.top, &merge.head, method).await? {
+        match merge_allowed(gh, settings, key, snap, merge.top, &merge.head, 0).await? {
             MergeOutcome::Merged { sha } => Some(sha),
             MergeOutcome::Rejected(_) => None,
         }
@@ -1891,12 +2035,25 @@ async fn resume_merge(
     Ok(sha.is_some())
 }
 
-/// The comment of a PR that waits for its author's agent.
-fn for_author(reason: &Hold) -> String {
-    format!(
-        "On hold: {reason}, for the PR's author to settle with a push: MergeLoop's agent does not, as this repo's `agent.runs` is `local`. It keeps its place in the queue. An agent that runs `mergeloop` on this PR is told what to do."
-    )
+/// What the comment of a PR that joins an entry in `state` says: where the entry stands.
+fn standing(state: &EntryState, gate: Option<&mergepatrol_billing::Hold>) -> Option<String> {
+    match state {
+        EntryState::Waiting => Some(ENQUEUED.to_owned()),
+        EntryState::Held(h) => Some(match gate {
+            Some(g) if g.reason == *h => g.comment.clone(),
+            _ if h.of_prep() => GETTING_READY.to_owned(),
+            _ => on_hold(h),
+        }),
+        EntryState::Active => None,
+    }
 }
+
+/// What a PR's comment says once it joins the queue.
+const ENQUEUED: &str = "Added to the queue. Waiting in its place.";
+
+/// What a PR's comment says while it gets ready off the lane, whichever step it is at: each step
+/// shows on the dashboard, and a comment for each would be noise.
+const GETTING_READY: &str = "Getting ready to merge: MergeLoop settles any conflict and sees its checks pass, fixing them if it can. It keeps its place in the queue.";
 
 fn on_hold(reason: &Hold) -> String {
     format!(
@@ -2009,7 +2166,7 @@ async fn build_batch(
     }
     let repo = &key.repo;
     let numbers: Vec<String> = units.iter().map(|u| u.number.to_string()).collect();
-    let branch = format!("mergepatrol/batch-{}", numbers.join("-"));
+    let branch = format!("mergeloop/batch-{}", numbers.join("-"));
     lane.batch_branch = Some(branch.clone());
     ctx.store.save_lane(key, lane).await?;
 
@@ -2253,10 +2410,10 @@ async fn merge_batch(
             return finish(ctx, settings, gh, key, lane, tested, Outcome::Held(reason)).await;
         }
         let top = tested.top();
-        let method = merge_method(gh, key, snap).await?;
         carry_closing_issues(gh, key, snap, &now, &head_shas(tested)).await;
         start_merge(ctx, key, lane, &now, &top.head_ref_oid).await?;
-        match merge_retrying(gh, repo, top.number, &top.head_ref_oid, &method).await? {
+        let (number, head) = (top.number, &top.head_ref_oid);
+        match merge_allowed(gh, settings, key, snap, number, head, MERGE_RETRIES).await? {
             MergeOutcome::Merged { sha } => {
                 let tree = gh.commit_tree(repo, &sha).await?;
                 let merged = Outcome::Merged(sha.clone());
@@ -2332,10 +2489,52 @@ async fn checks_verdict(
     {
         unreported.clear();
     }
+    let reruns: BTreeSet<u64> = match &verdict {
+        (CheckState::Failed, failed) => failed
+            .iter()
+            .filter_map(|n| checks.reruns.get(n).copied())
+            .collect(),
+        _ => BTreeSet::new(),
+    };
     Ok(HeadChecks {
         verdict,
         unreported,
+        reruns: reruns.into_iter().collect(),
     })
+}
+
+/// How long GitHub may take to show the failed jobs it was asked to run again as running.
+const RERUN_STARTS_WITHIN: Duration = Duration::from_secs(2 * 60);
+const RERUN_POLL: Duration = Duration::from_secs(5);
+
+/// Has GitHub Actions run the failed jobs of the workflow runs `runs` on `sha` again, and waits
+/// until `sha`'s checks show them running rather than failed. `Event::ChecksRerun`, or
+/// `Event::RerunFailed` with why not.
+pub(crate) async fn rerun_failed(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    sha: &str,
+    runs: &[u64],
+) -> Result<Event> {
+    for run in runs {
+        if let Err(e) = gh.rerun_failed_jobs(repo, sha, *run).await {
+            return Ok(Event::RerunFailed(format!("{e:#}")));
+        }
+    }
+    let since = Instant::now();
+    loop {
+        let checks = gh.checks(repo, sha).await?;
+        if !checks.reruns.values().any(|run| runs.contains(run)) {
+            return Ok(Event::ChecksRerun);
+        }
+        if since.elapsed() >= RERUN_STARTS_WITHIN {
+            return Ok(Event::RerunFailed(format!(
+                "GitHub did not start the failed jobs again within {} minutes",
+                RERUN_STARTS_WITHIN.as_secs() / 60
+            )));
+        }
+        tokio::time::sleep(RERUN_POLL).await;
+    }
 }
 
 /// The method to merge into the trunk with: the repo's default, unless the repo's settings or the
@@ -2353,6 +2552,8 @@ struct HeadChecks {
     verdict: (CheckState, Vec<String>),
     /// The required checks that never reported on the head, though no other check runs.
     unreported: Vec<String>,
+    /// The workflow runs that can run the failed required checks again.
+    reruns: Vec<u64>,
 }
 
 /// Since when each required check has gone unreported on each of a job's heads, with no other
@@ -2377,19 +2578,55 @@ impl Unreported {
     }
 }
 
+/// Merges the PR with a method the trunk allows. One that the repo's settings turned off since
+/// `snap` was read, GitHub refuses: then the method is chosen again from the settings as they
+/// are now, and the merge tried once more with it.
+async fn merge_allowed(
+    gh: &dyn GitHub,
+    settings: &RepoSettings,
+    key: &LaneKey,
+    snap: &RepoSnapshot,
+    number: PrNumber,
+    head: &str,
+    retries: u32,
+) -> Result<MergeOutcome> {
+    let method = merge_method(gh, key, snap).await?;
+    let outcome = merge_retrying(gh, &key.repo, number, head, &method, retries).await?;
+    let MergeOutcome::Rejected(r) = &outcome else {
+        return Ok(outcome);
+    };
+    if !refuses_method(r) {
+        return Ok(outcome);
+    }
+    // The merge marked the repo changed, so this reads its settings again.
+    let now = gh.snapshot(&key.repo, &settings.labels()).await?;
+    match merge_method(gh, key, &now).await? {
+        again if again == method => Ok(outcome),
+        again => merge_retrying(gh, &key.repo, number, head, &again, retries).await,
+    }
+}
+
+/// Whether GitHub refused the merge for its method: "Merge commits are not allowed on this
+/// repository".
+fn refuses_method(rejection: &str) -> bool {
+    rejection.ends_with("not allowed on this repository")
+}
+
 /// GitHub rejects a merge right after the one before it, until it has worked out the PR's
 /// mergeability against the new trunk ("Base branch was modified"). It accepts it moments later.
+/// A method it refuses, it refuses each time.
 async fn merge_retrying(
     gh: &dyn GitHub,
     repo: &RepoName,
     number: PrNumber,
     head: &str,
     method: &str,
+    retries: u32,
 ) -> Result<MergeOutcome> {
     let mut tries = 0;
     loop {
         match gh.merge(repo, number, head, method).await? {
-            MergeOutcome::Rejected(_) if tries < MERGE_RETRIES => {
+            MergeOutcome::Rejected(r) if tries < retries && !refuses_method(&r) => {
                 tries += 1;
                 tokio::time::sleep(MERGE_RETRY_AFTER).await;
             }
@@ -2512,7 +2749,6 @@ async fn run_job(
     };
     // An agent in the lane would hold up every PR behind it.
     let agent = !ctx.prep.takes_agent_work(ctx, key, unit);
-    let by_author = settings.agent.runs == Runs::Local;
     let mut job = Job::start(unit.number, fix_attempts);
     if fix_attempts > 0 {
         job.fixes += unit.fixes_used(gh, repo).await?;
@@ -2619,6 +2855,7 @@ async fn run_job(
                 } else {
                     // GitHub merges a stack only when every layer's required checks passed.
                     let mut verdict = (CheckState::Passed, Vec::new());
+                    let mut reruns = Vec::new();
                     let mut silent = Vec::new();
                     for (i, head) in heads.iter().enumerate() {
                         let recheck = lane.recheck(unit.number);
@@ -2631,6 +2868,9 @@ async fn run_job(
                         match checks.verdict {
                             (CheckState::Failed, names) => {
                                 failing = i;
+                                if !ctx.prep.rerun_refused(key, unit.number, head) {
+                                    reruns = checks.reruns;
+                                }
                                 verdict = (CheckState::Failed, names);
                                 break;
                             }
@@ -2646,13 +2886,24 @@ async fn run_job(
                     let rechecking = lane
                         .recheck(unit.number)
                         .is_some_and(|(head, _)| heads.contains(&head));
+                    // A check that ran again on the recheck's new commit gets no more runs.
+                    if rechecking {
+                        reruns.clear();
+                    }
                     match verdict {
                         (CheckState::Passed, _) => Event::ChecksPassed,
-                        // The author's agent's fixes have no budget.
-                        (CheckState::Failed, _)
-                            if !agent && !rechecking && (job.can_fix() || by_author) =>
-                        {
+                        // Getting ready runs the failed jobs again, or fixes them.
+                        (CheckState::Failed, _) if !agent && !reruns.is_empty() => {
+                            Event::OnHold(Hold::PrepChecks)
+                        }
+                        (CheckState::Failed, _) if !agent && !rechecking && job.can_fix() => {
                             Event::OnHold(Hold::PrepFixing)
+                        }
+                        (CheckState::Failed, failed) if !reruns.is_empty() => {
+                            Event::ChecksRerunnable {
+                                failed,
+                                runs: reruns,
+                            }
                         }
                         (CheckState::Failed, names) => Event::ChecksFailed(names),
                         (CheckState::Pending, _) if !missing.is_empty() => {
@@ -2706,6 +2957,25 @@ async fn run_job(
                 }
                 event
             }
+            Phase::Rerunning { failed, runs, .. } => {
+                let what = failed.join(", ");
+                record_all(ctx, key, &prs, "rerunning", &what).await?;
+                let comment = format!(
+                    "Required checks failed: {what}. Running the failed jobs again once, as a failure may not be the code's."
+                );
+                comment_all(gh, repo, &prs, &comment).await?;
+                let head = &heads[failing];
+                let event = rerun_failed(gh, repo, head, runs).await?;
+                match &event {
+                    Event::ChecksRerun => published_at = Instant::now(),
+                    Event::RerunFailed(why) => {
+                        ctx.prep.note_refused_rerun(key, unit.number, head);
+                        record_all(ctx, key, &prs, "rerun-failed", why).await?;
+                    }
+                    _ => {}
+                }
+                event
+            }
             Phase::Rechecking { failed, .. } => {
                 let what = failed.join(", ");
                 record_all(ctx, key, &prs, "rechecking", &what).await?;
@@ -2741,19 +3011,22 @@ async fn run_job(
                 } else if let Some(reason) = {
                     let mut started = false;
                     let hold =
-                        review_hold(ctx, key, review, now.stacked, &reviewed, &mut started).await?;
+                        review_hold(ctx, gh, key, review, now.stacked, &reviewed, &mut started)
+                            .await?;
                     if started {
                         ctx.reviews.notify_one();
+                    }
+                    if hold.is_none() {
+                        withdraw_change_requests(gh, repo, &now.layers).await;
                     }
                     hold
                 } {
                     Event::OnHold(reason)
                 } else {
                     let top = now.top().number;
-                    let method = merge_method(gh, key, snap).await?;
                     carry_closing_issues(gh, key, snap, &now, &heads).await;
                     start_merge(ctx, key, lane, &now, head).await?;
-                    match gh.merge(repo, top, head, &method).await? {
+                    match merge_allowed(gh, settings, key, snap, top, head, 0).await? {
                         MergeOutcome::Merged { sha } => return Ok(Outcome::Merged(sha)),
                         MergeOutcome::Rejected(r) => {
                             lane.merging = None;
@@ -3038,18 +3311,20 @@ pub(crate) async fn job_spec(
     let agent = &settings.agent;
     let (provider, model) = agent.model(task.spend_task());
     // A fork PR's job gets no agent: without access, a conflict fails the job.
-    let granted = match pr.is_cross_repository {
+    let credential = match pr.is_cross_repository {
         true => None,
-        false => ctx
-            .chatgpt
-            .credential(
-                &ctx.vault,
-                Scope::Installation(key.installation_id),
-                provider,
-            )
-            .await?
-            .map(|c| ctx.proxy.grant(provider, c, REQUESTS_PER_JOB)),
+        false => {
+            ctx.chatgpt
+                .credential(
+                    &ctx.vault,
+                    Scope::Installation(key.installation_id),
+                    provider,
+                )
+                .await?
+        }
     };
+    let on_plan = matches!(credential, Some(Credential::ChatGpt { .. }));
+    let granted = credential.map(|c| ctx.proxy.grant(provider, c, REQUESTS_PER_JOB));
     let spec = JobSpec {
         repo: key.repo.to_string(),
         clone_url: clone_url(&key.repo),
@@ -3064,6 +3339,7 @@ pub(crate) async fn job_spec(
         pr_body: pr.body.clone(),
         verify: settings.verify.clone(),
         leave_conflicts: false,
+        update: Update::Rebase,
         resolver: ResolverSpec {
             provider,
             model: model.to_owned(),
@@ -3073,6 +3349,7 @@ pub(crate) async fn job_spec(
             api: granted.as_ref().map(|g| ApiAccess {
                 base_url: Api::of(provider, model).base_url(&ctx.config.job_proxy_url),
                 token: g.token.clone(),
+                on_plan,
             }),
             settings_url: (!pr.is_cross_repository).then(|| {
                 let url = ctx.config.public_url.trim_end_matches('/');
@@ -3230,7 +3507,15 @@ async fn fix_and_publish(
     });
     // Only a fix of failed checks may propose a title: the job's word for it is not enough.
     let may_retitle = matches!(task, Task::FixChecks { .. });
-    let (spec, _granted) = job_spec(ctx, gh, key, pr, settings, head, base, below, task).await?;
+    let (spec, granted) = job_spec(ctx, gh, key, pr, settings, head, base, below, task).await?;
+    if granted.is_none() {
+        let provider = spec.resolver.provider.name();
+        let mut why = format!("the workspace has no {provider} API key for the agent");
+        if let Some(url) = &spec.resolver.settings_url {
+            why.push_str(&format!(": add one in the dashboard's settings, {url}"));
+        }
+        return Ok(Event::FixFailed(why));
+    }
     let fixed = async {
         run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?;
         let _cache = ctx.caches.lock(repo).await;
@@ -3330,28 +3615,6 @@ async fn still_queued(
         && now.branch_heads(gh, &key.repo).await? == heads)
 }
 
-/// Has the agent fix what a review of `unit`'s layer `layer` sent back to its author, and pushes
-/// the fix, with the layers above it on top, for a new review to check.
-pub(crate) async fn fix_findings(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    unit: &Unit,
-    layer: usize,
-    settings: &RepoSettings,
-    findings: Vec<mergepatrol_core::Finding>,
-) -> Result<Event> {
-    let snap = GitHub::snapshot(gh, &key.repo, &settings.labels()).await?;
-    let head = &unit.layers[layer].head_ref_oid;
-    let base = unit.below(gh, key, layer).await?;
-    let task = Task::FixReview { findings };
-    let sandbox = JobSandbox { ctx, gh };
-    let event = sandbox
-        .fix_and_restack(key, &snap, unit, layer, settings, head, &base, task, true)
-        .await;
-    sandbox.published(key, event).await
-}
-
 /// Pushes an empty commit on `head`, on which CI runs anew and reads the PR as it is now. A
 /// re-run through the Actions API would read the PR as it was, and need another permission.
 async fn push_recheck(
@@ -3411,6 +3674,7 @@ async fn rebase_and_publish(
     let mut rebased: Vec<String> = heads[..from].to_vec();
     let mut moved: Vec<usize> = Vec::new();
     let mut resolved: Vec<usize> = Vec::new();
+    let mut merged: Vec<usize> = Vec::new();
     let result = rebase_layers(
         ctx,
         gh,
@@ -3424,8 +3688,7 @@ async fn rebase_and_publish(
         &heads,
         &trunk,
         &mut rebased,
-        &mut moved,
-        &mut resolved,
+        (&mut moved, &mut resolved, &mut merged),
     )
     .await;
     for i in &moved {
@@ -3433,6 +3696,10 @@ async fn rebase_and_publish(
             .await?;
     }
     if let Err(e) = result {
+        // Not the PR's failure: the caller runs it again, as for any error outside the PR.
+        if TimedOut::caused(&e) {
+            return Err(e);
+        }
         if !agent && format!("{e:#}").starts_with(LEFT_CONFLICT) {
             return Ok(Event::RebaseConflict);
         }
@@ -3467,15 +3734,21 @@ async fn rebase_and_publish(
         return Ok(Event::HeadMoved);
     }
     // Every layer, so that the update also fails if an author pushed to one left as it is: a
-    // layer's update to the head it has is its lease.
-    let moves: Vec<(&str, &str, &str)> = unit
+    // layer's update to the head it has is its lease. Only a replay needs a force-push.
+    let moves: Vec<BranchMove> = unit
         .layers
         .iter()
         .zip(heads.iter().zip(&rebased))
-        .map(|(pr, (before, after))| (pr.head_ref_name.as_str(), before.as_str(), after.as_str()))
+        .enumerate()
+        .map(|(i, (pr, (before, after)))| BranchMove {
+            branch: &pr.head_ref_name,
+            before,
+            after,
+            force: moved.contains(&i) && !merged.contains(&i),
+        })
         .collect();
     if !moved.is_empty()
-        && let Err(e) = gh.force_update_branches(&snap.id, &moves).await
+        && let Err(e) = gh.update_branches(&snap.id, &moves).await
     {
         // `updateRefs` refuses when a branch moved: an author pushed while the jobs ran.
         if unit.branch_heads(gh, &key.repo).await? != heads {
@@ -3548,12 +3821,16 @@ async fn publish_to_fork(
 
 /// The branch a rebased stack layer waits on, until the layers' branches move.
 fn restack_branch(pr: &PullRequest) -> String {
-    format!("mergepatrol/restack-{}", pr.number)
+    format!("mergeloop/restack-{}", pr.number)
 }
 
-/// Rebases each layer from `rebased.len()` up, and creates its commits on GitHub: pushes its new
-/// head to `rebased`, its index to `moved` when it changed, and to `resolved` when the agent
-/// resolved a conflict in it.
+/// Brings each layer from `rebased.len()` up to date, and creates its commits on GitHub: pushes
+/// its new head to `rebased`, its index to `moved` when it changed, to `resolved` when the agent
+/// resolved a conflict in it, and to `merged` when its base was merged into it.
+///
+/// A layer may be updated by a merge of its base, unless the repo merges PRs by rebasing them,
+/// which would replay the merge's commits, or a layer below it was rebased: a merge would then
+/// keep the commits that rebase replaced in this layer's history.
 #[allow(clippy::too_many_arguments)]
 async fn rebase_layers(
     ctx: &Ctx,
@@ -3568,10 +3845,10 @@ async fn rebase_layers(
     heads: &[String],
     trunk: &str,
     rebased: &mut Vec<String>,
-    moved: &mut Vec<usize>,
-    resolved: &mut Vec<usize>,
+    (moved, resolved, merged): (&mut Vec<usize>, &mut Vec<usize>, &mut Vec<usize>),
 ) -> Result<()> {
     let repo = &key.repo;
+    let mut may_merge = merge_method(gh, key, snap).await? != "rebase";
     for i in rebased.len()..unit.layers.len() {
         let pr = &unit.layers[i];
         let head = &heads[i];
@@ -3600,12 +3877,29 @@ async fn rebase_layers(
         let (mut spec, _granted) =
             job_spec(ctx, gh, key, pr, settings, head, &onto, below, Task::Rebase).await?;
         spec.leave_conflicts = !agent;
-        let events = run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?;
+        spec.update = match may_merge {
+            true => Update::Either,
+            false => Update::Rebase,
+        };
+        let ran = run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await;
+        let events = match ran {
+            // A replay of a long history can outlast the job: a merge does not replay it.
+            Err(e) if TimedOut::caused(&e) && spec.update == Update::Either => {
+                let why = format!("{e:#}: merging `{}` in instead", key.trunk);
+                record(ctx, key, pr.number, "merging-base", &why).await?;
+                spec.update = Update::Merge;
+                // The timed-out job revoked its token once it fetched.
+                spec.token = gh.read_token(&key.repo).await?;
+                let job_id = format!("{job_id}-merge");
+                run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?
+            }
+            ran => ran?,
+        };
         if agent_resolved(&events) {
             resolved.push(i);
         }
         let _cache = ctx.caches.lock(repo).await;
-        let local_head = check_job_output(
+        let updated = check_job_output(
             git,
             cache,
             &out,
@@ -3613,6 +3907,7 @@ async fn rebase_layers(
             &onto,
             head,
             upstream.as_deref(),
+            spec.update,
         )
         .await?;
         let publish = Publish {
@@ -3621,9 +3916,18 @@ async fn rebase_layers(
             branch: &pr.head_ref_name,
             expected_head: head,
             base: &onto,
-            local_head: &local_head,
+            local_head: &updated.head,
         };
-        let sha = create_commits(gh, git, cache, &publish).await?;
+        let sha = match updated.merged {
+            true => {
+                merged.push(i);
+                create_merge(gh, git, cache, &publish).await?
+            }
+            false => {
+                may_merge = false;
+                create_commits(gh, git, cache, &publish).await?
+            }
+        };
         rebased.push(sha.clone());
         moved.push(i);
         if i + 1 < unit.layers.len() {
@@ -3639,10 +3943,20 @@ async fn rebase_layers(
     Ok(())
 }
 
+/// A rebase job's result, as `check_job_output` found it.
+#[derive(Debug)]
+struct Updated {
+    head: String,
+    /// It is a merge of the base into the PR's head, not the PR's commits replayed.
+    merged: bool,
+}
+
 /// The job is untrusted, so its output is checked here, not believed. A rebase only replays
-/// the PR's changes, and a conflict can only be in a file the PR changed: the result may touch
-/// no file outside the PR's own. A stack layer's own changes start at `upstream`, the layer
-/// below as it was.
+/// the PR's changes, and a merge only adds the base's, and a conflict can only be in a file the
+/// PR changed: the result may touch no file outside the PR's own. A merge, which `update` must
+/// allow, has the PR's head and the base as its parents. A stack layer's own changes start at
+/// `upstream`, the layer below as it was.
+#[allow(clippy::too_many_arguments)]
 async fn check_job_output(
     git: &Git,
     cache: &Path,
@@ -3651,8 +3965,17 @@ async fn check_job_output(
     onto: &str,
     head: &str,
     upstream: Option<&str>,
-) -> Result<String> {
+    update: Update,
+) -> Result<Updated> {
     let local_head = import_job_output(git, cache, out, number).await?;
+    let parents = git.parents(cache, &local_head).await?;
+    let merged = parents.len() > 1;
+    if merged && update == Update::Rebase {
+        bail!("the job merged where it was to rebase");
+    }
+    if merged && parents != [head, onto] {
+        bail!("the job's merge is not of the base branch into the PR");
+    }
     if !git.is_ancestor(cache, onto, &local_head).await? {
         bail!("the job's result does not sit on the base branch");
     }
@@ -3677,7 +4000,10 @@ async fn check_job_output(
             outside.join(", ")
         );
     }
-    Ok(local_head)
+    Ok(Updated {
+        head: local_head,
+        merged,
+    })
 }
 
 /// A fix may change any file but CI's and the queue's config, and only on top of the PR head.
@@ -3727,7 +4053,6 @@ async fn import_job_output(
 }
 
 mod prep;
-pub(crate) use prep::Claim;
 
 #[cfg(test)]
 mod loop_tests;
@@ -3915,7 +4240,9 @@ mod tests {
         Git.create_bundle(&work, &out.join(BUNDLE_FILE), &result, &trunk)
             .await
             .unwrap();
-        check_job_output(&Git, &cache, &out, 1, &trunk, &head, None).await
+        check_job_output(&Git, &cache, &out, 1, &trunk, &head, None, Update::Rebase)
+            .await
+            .map(|u| u.head)
     }
 
     /// A fix job result that changes `files` on top of the PR head.
@@ -4062,6 +4389,75 @@ mod tests {
     #[tokio::test]
     async fn job_output_outside_the_pr_files_is_rejected() {
         let err = check(&[("a.txt", "pr\n"), ("b.txt", "sneaky\n")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("outside the PR: b.txt"), "{err}");
+    }
+
+    /// A job result that merges the trunk, or another commit, into the PR head, which changed
+    /// `a.txt`, and then changes `files`, checked as `update` allows.
+    async fn check_merge(
+        update: Update,
+        of_trunk: bool,
+        files: &[(&str, &str)],
+    ) -> Result<Updated> {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        let base = commit(&work, &[("a.txt", "1\n"), ("b.txt", "1\n")]);
+        let head = commit(&work, &[("a.txt", "pr\n")]);
+        git(&work, &["checkout", "-q", "--detach", &base]);
+        let trunk = commit(&work, &[("c.txt", "trunk\n")]);
+        let other = commit(&work, &[("d.txt", "not the trunk\n")]);
+        git(&work, &["checkout", "-q", "--detach", &head]);
+        let into = if of_trunk { &trunk } else { &other };
+        git(&work, &["merge", "-q", "--no-ff", "-m", "merge", into]);
+        if !files.is_empty() {
+            for (f, c) in files {
+                std::fs::write(work.join(f), c).unwrap();
+                git(&work, &["add", f]);
+            }
+            git(&work, &["commit", "-q", "--amend", "--no-edit"]);
+        }
+        let result = git(&work, &["rev-parse", "HEAD"]);
+
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        git(&cache, &["init", "-q", "--bare"]);
+        git(
+            &cache,
+            &[
+                "fetch",
+                "-q",
+                work.to_str().unwrap(),
+                &format!("{head}:refs/pr"),
+                &format!("{trunk}:refs/trunk"),
+            ],
+        );
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        Git.create_bundle(&work, &out.join(BUNDLE_FILE), &result, &trunk)
+            .await
+            .unwrap();
+        check_job_output(&Git, &cache, &out, 1, &trunk, &head, None, update).await
+    }
+
+    #[tokio::test]
+    async fn a_merge_of_the_base_into_the_pr_passes_where_the_job_may_merge() {
+        let ok = check_merge(Update::Either, true, &[]).await.unwrap();
+        assert!(ok.merged);
+        let resolved = check_merge(Update::Merge, true, &[("a.txt", "pr, resolved\n")]).await;
+        assert!(resolved.unwrap().merged);
+
+        let err = check_merge(Update::Rebase, true, &[]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("merged where it was to rebase"),
+            "{err}"
+        );
+        let err = check_merge(Update::Either, false, &[]).await.unwrap_err();
+        assert!(err.to_string().contains("not of the base branch"), "{err}");
+        let err = check_merge(Update::Either, true, &[("b.txt", "sneaky\n")])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("outside the PR: b.txt"), "{err}");

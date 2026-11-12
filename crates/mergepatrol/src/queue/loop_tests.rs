@@ -7,17 +7,17 @@ use std::sync::Mutex;
 
 use mergepatrol_billing::{Billing, FAIR_USE_PRS, StripeConfig};
 use mergepatrol_core::{
-    AgentSettings, Bar, CheckFailure, EntryState, Finding, Judged, Kind, LabelSpec, Labels, Lean,
-    Spend, Stage, Step, StepTimes, WorkspaceDefaults,
+    AgentSettings, Bar, CheckFailure, ConfigPath, ConfigText, EntryState, Finding, Judged, Kind,
+    LabelSpec, Labels, Lean, Spend, Stage, Step, StepTimes, WorkspaceDefaults,
 };
 use mergepatrol_executor::LocalExecutor;
 use mergepatrol_executor::proxy::Upstreams;
 use mergepatrol_github::{BranchMerge, BranchRules, Checks, HeadRepository, RepoOwner, StackRef};
 use mergepatrol_store::{
     AgentTask, BillingStore, Change, DeveloperStats, EventRecord, ExitQuery, ExitRecord, ExitStats,
-    FairUse, InboxStale, InboxStore, InboxWrite, LoginCode, PrWrite, ReadCache, RepoReads,
-    RepoState, ReviewAnswers, ReviewDone, ReviewRecord, ReviewStore, SecretRecord, Session, Slice,
-    StepStats, Subscription, Unsynced, UserInbox, ValueRead, Workspace,
+    FairUse, LoginCode, PrWrite, ReadCache, RepoReads, RepoState, ReviewAnswers, ReviewDone,
+    ReviewRecord, ReviewStore, SecretRecord, Session, Slice, StepStats, Subscription, Unsynced,
+    ValueRead, Workspace,
 };
 
 use super::*;
@@ -25,8 +25,8 @@ use crate::config::ExecutorConfig;
 
 mod getting_ready;
 
-const TRIGGER: &str = "mergepatrol";
-const FAILED: &str = "mergepatrol:failed";
+const TRIGGER: &str = "mergeloop";
+const FAILED: &str = "mergeloop:failed";
 
 fn repo() -> RepoName {
     RepoName::parse("o/r").unwrap()
@@ -69,8 +69,13 @@ struct State {
     checks: BTreeMap<String, CheckState>,
     checks_on: HashMap<String, BTreeMap<String, CheckState>>,
     comments: Vec<(PrNumber, String)>,
+    /// The PRs whose request for changes MergeLoop dismissed, in order.
+    dismissed: Vec<PrNumber>,
     /// The reviews posted on each PR: their body, and how many threads they start.
     reviews: Vec<(PrNumber, String, usize)>,
+    /// Each of those reviews' state: `COMMENTED`, `CHANGES_REQUESTED` until it is dismissed,
+    /// then `DISMISSED`.
+    review_states: Vec<String>,
     /// The review threads those started, in order: their first comment, the replies in them, and
     /// whether they are resolved.
     threads: Vec<(String, Vec<String>, bool)>,
@@ -111,12 +116,28 @@ struct State {
     merge_hangs: Option<MergeHang>,
     /// Each merged PR's merge commit.
     merge_commits: HashMap<PrNumber, String>,
+    /// The branches refuse a force-push, as a protection that blocks them does: `updateRefs`
+    /// moves them only without `force`, and only forward.
+    forbids_force: bool,
     /// Heads that need a rebase onto the trunk. Every other head is on it.
     behind: Vec<String>,
+    /// Each head's diff id, by its base and head: a restack keeps one. Unknown heads have none.
+    diff_ids: HashMap<(String, String), String>,
     /// Heads whose workflow runs wait for a maintainer's approval.
     awaiting_approval: Vec<String>,
     /// PRs that change workflow files.
     change_workflows: Vec<PrNumber>,
+    /// The checks are GitHub Actions jobs, in one workflow run per commit, which may run its
+    /// failed jobs again once.
+    actions: bool,
+    /// The commits of those workflow runs, by run id from 1.
+    workflow_runs: Vec<String>,
+    /// The commits whose failed jobs ran again.
+    reran: Vec<String>,
+    /// A failed job run again passes.
+    flaky: bool,
+    /// Why GitHub refuses to run failed jobs again, if it does.
+    rerun_refused: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +255,53 @@ impl State {
         self.branches[&self.prs[&number].head_ref_name].clone()
     }
 
+    /// The workflow run of the commit `sha`.
+    fn workflow_run(&mut self, sha: &str) -> u64 {
+        let i = match self.workflow_runs.iter().position(|w| w == sha) {
+            Some(i) => i,
+            None => {
+                self.workflow_runs.push(sha.to_owned());
+                self.workflow_runs.len() - 1
+            }
+        };
+        i as u64 + 1
+    }
+
+    /// The failed checks on `sha` that may run again, by their workflow run.
+    fn reruns(&mut self, sha: &str) -> BTreeMap<String, u64> {
+        if !self.actions || self.reran.iter().any(|r| r == sha) {
+            return BTreeMap::new();
+        }
+        let failed: Vec<String> = self
+            .checks_of(sha)
+            .into_iter()
+            .filter(|(_, state)| *state == CheckState::Failed)
+            .map(|(name, _)| name)
+            .collect();
+        let run = self.workflow_run(sha);
+        failed.into_iter().map(|name| (name, run)).collect()
+    }
+
+    /// GitHub Actions runs the failed jobs of `run` again: a flaky one passes now.
+    fn rerun(&mut self, run: u64) -> Result<()> {
+        if let Some(why) = &self.rerun_refused {
+            bail!("{why}");
+        }
+        let sha = self.workflow_runs[run as usize - 1].clone();
+        assert!(!self.reran.contains(&sha), "{sha} ran again twice");
+        self.reran.push(sha.clone());
+        if self.flaky {
+            let mut checks = self.checks_of(&sha);
+            for state in checks.values_mut() {
+                if *state == CheckState::Failed {
+                    *state = CheckState::Passed;
+                }
+            }
+            self.checks_on.insert(sha, checks);
+        }
+        Ok(())
+    }
+
     fn checks_of(&self, sha: &str) -> BTreeMap<String, CheckState> {
         let mut by_name = self.checks_on.get(sha).unwrap_or(&self.checks).clone();
         if self.broken(sha) {
@@ -284,7 +352,7 @@ impl Fake {
             .any(|m| !m.iter().any(|m| m == method))
         {
             return Ok(MergeOutcome::Rejected(format!(
-                "{method} merges are not allowed on this repository."
+                "{method} merges are not allowed on this repository"
             )));
         }
         let layers: Vec<PrNumber> = s
@@ -353,8 +421,11 @@ impl GitHub for Fake {
         1
     }
 
-    async fn config_file(&self, _: &RepoName) -> Result<Option<String>> {
-        Ok(self.state.lock().unwrap().config.clone())
+    async fn config_file(&self, _: &RepoName) -> Result<ConfigText> {
+        Ok(ConfigText {
+            at: ConfigPath::Current,
+            text: self.state.lock().unwrap().config.clone(),
+        })
     }
 
     async fn snapshot(&self, _: &RepoName, labels: &Labels) -> Result<RepoSnapshot> {
@@ -394,7 +465,9 @@ impl GitHub for Fake {
             s.outage -= 1;
             bail!("GET /pulls/{number}: 502 Bad Gateway");
         }
-        let mut pr = s.prs[&number].clone();
+        let Some(mut pr) = s.prs.get(&number).cloned() else {
+            bail!("GET /pulls/{number}: 404 Not Found");
+        };
         if let Some((old, reads)) = s.stale.get_mut(&number) {
             pr.head_ref_oid = old.clone();
             *reads -= 1;
@@ -424,6 +497,11 @@ impl GitHub for Fake {
 
     async fn behind(&self, _: &RepoName, _: &str, head: &str) -> Result<bool> {
         Ok(self.state.lock().unwrap().behind.iter().any(|h| h == head))
+    }
+
+    async fn diff_id(&self, _: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.diff_ids.get(&(base.to_owned(), head.to_owned())).cloned())
     }
 
     async fn awaiting_approval(&self, _: &RepoName, sha: &str) -> Result<bool> {
@@ -464,6 +542,7 @@ impl GitHub for Fake {
             by_name: s.checks_of(sha),
             skipped: s.skipped.iter().cloned().collect(),
             workflows_running: None,
+            reruns: s.reruns(sha),
         })
     }
 
@@ -508,6 +587,9 @@ impl GitHub for Fake {
                 details: "it broke".into(),
             })
             .collect())
+    }
+    async fn rerun_failed_jobs(&self, _: &RepoName, _: &str, run: u64) -> Result<()> {
+        self.state.lock().unwrap().rerun(run)
     }
 
     async fn merge(
@@ -627,6 +709,21 @@ impl GitHub for Fake {
         Ok(())
     }
 
+    async fn dismiss_reviews_marked(
+        &self,
+        _: &RepoName,
+        number: PrNumber,
+        _: &[&str],
+        _: &str,
+    ) -> Result<usize> {
+        self.with_mut(|s| {
+            s.dismissed.push(number);
+            let pr = s.prs.get_mut(&number).unwrap();
+            pr.review_decision = None;
+            pr.details = Default::default();
+        });
+        Ok(1)
+    }
     async fn sticky_comment(&self, _: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         if s.failing_comments > 0 {
@@ -831,12 +928,11 @@ struct Mem {
     label_heads: Mutex<HashMap<PrNumber, String>>,
     /// The agent's reviews, oldest first.
     reviews: Mutex<Vec<ReviewRecord>>,
-    /// The reviews whose findings the agent fixes first, with nothing posted yet.
-    fixing: Mutex<std::collections::HashSet<i64>>,
     /// Reading a review fails, as when the database is down.
     review_reads_fail: Mutex<bool>,
     review_settings: Mutex<Option<ReviewSettings>>,
     repo_defaults: Mutex<Option<WorkspaceDefaults>>,
+    secrets: Mutex<Vec<(Scope, String, SecretRecord)>>,
 }
 
 impl Mem {
@@ -887,14 +983,18 @@ impl Mem {
                         ..Default::default()
                     }),
                     needs_human: false,
+                    verified: None,
+                    settled: None,
                     code: Vec::new(),
                     related: Vec::new(),
+                    also_at: Vec::new(),
                 },
                 asked: false,
                 sent_back: false,
                 withdrawn: false,
                 threaded: false,
                 bar: Bar::From(80),
+                outcome: None,
             });
         }
         f(&mut r.findings[0]);
@@ -949,6 +1049,7 @@ impl ReviewStore for Mem {
         repo: &RepoName,
         pr: PrNumber,
         head: &str,
+        diff_id: Option<&str>,
     ) -> Result<ReviewRecord> {
         let mut reviews = self.reviews.lock().unwrap();
         if let Some(r) = reviews
@@ -957,6 +1058,9 @@ impl ReviewStore for Mem {
         {
             if r.status == ReviewStatus::Stale {
                 r.status = ReviewStatus::Pending;
+                if diff_id.is_some() {
+                    r.diff_id = diff_id.map(str::to_owned);
+                }
             }
             return Ok(r.clone());
         }
@@ -967,7 +1071,7 @@ impl ReviewStore for Mem {
             number: pr,
             head_sha: head.to_owned(),
             since_head: None,
-            agent_fixed: false,
+            diff_id: diff_id.map(str::to_owned),
             claim: 0,
             status: ReviewStatus::Pending,
             error: None,
@@ -979,24 +1083,44 @@ impl ReviewStore for Mem {
             answered_by: None,
             note: String::new(),
             questions: Vec::new(),
-            brief: None,
-            submitted: None,
+            waited_secs: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
         reviews.push(r.clone());
         Ok(r)
     }
+    async fn carry_unchanged(
+        &self,
+        _: u64,
+        _: &RepoName,
+        pr: PrNumber,
+        head: &str,
+        diff_id: &str,
+    ) -> Result<bool> {
+        let mut reviews = self.reviews.lock().unwrap();
+        if reviews.iter().any(|r| r.number == pr && r.head_sha == head) {
+            return Ok(false);
+        }
+        let newest = reviews.iter().rev().find(|r| r.number == pr).cloned();
+        let Some(r) = newest.filter(|r| {
+            r.status == ReviewStatus::Approved && r.diff_id.as_deref() == Some(diff_id)
+        }) else {
+            return Ok(false);
+        };
+        let id = reviews.len() as i64 + 1;
+        reviews.push(ReviewRecord {
+            id,
+            head_sha: head.to_owned(),
+            since_head: None,
+            ..r
+        });
+        Ok(true)
+    }
     async fn claim_review(&self, _: Duration) -> Result<Option<ReviewRecord>> {
         unreachable!()
     }
-    async fn finish_review(
-        &self,
-        id: i64,
-        _: i64,
-        done: &ReviewDone,
-        fixing: bool,
-    ) -> Result<bool> {
+    async fn finish_review(&self, id: i64, _: i64, done: &ReviewDone) -> Result<bool> {
         let mut reviews = self.reviews.lock().unwrap();
         let r = reviews.iter_mut().find(|r| r.id == id).unwrap();
         r.status = done.status;
@@ -1004,20 +1128,7 @@ impl ReviewStore for Mem {
         r.summary = done.summary.clone();
         r.findings = done.findings.clone();
         r.asked = done.asked.clone();
-        if fixing {
-            self.fixing.lock().unwrap().insert(id);
-        }
         Ok(true)
-    }
-    async fn rerun_review(&self, id: i64, _: i64, _: Duration) -> Result<()> {
-        let mut reviews = self.reviews.lock().unwrap();
-        reviews.iter_mut().find(|r| r.id == id).unwrap().status = ReviewStatus::Pending;
-        self.fixing.lock().unwrap().remove(&id);
-        Ok(())
-    }
-    async fn settle_review(&self, id: i64, _: i64) -> Result<()> {
-        self.fixing.lock().unwrap().remove(&id);
-        Ok(())
     }
     async fn retry_review(&self, _: i64, _: i64, _: &str, _: Duration) -> Result<()> {
         unreachable!()
@@ -1025,41 +1136,10 @@ impl ReviewStore for Mem {
     async fn stale_review(&self, id: i64, _: i64) -> Result<()> {
         let mut reviews = self.reviews.lock().unwrap();
         reviews.iter_mut().find(|r| r.id == id).unwrap().status = ReviewStatus::Stale;
-        self.fixing.lock().unwrap().remove(&id);
         Ok(())
     }
     async fn release_reviews(&self) -> Result<u64> {
         unreachable!()
-    }
-    async fn await_author(&self, id: i64, _: i64, brief: &str) -> Result<()> {
-        let mut reviews = self.reviews.lock().unwrap();
-        let r = reviews.iter_mut().find(|r| r.id == id).unwrap();
-        r.status = ReviewStatus::Author;
-        r.brief = Some(brief.to_owned());
-        Ok(())
-    }
-    async fn submit_review(
-        &self,
-        _: u64,
-        _: &RepoName,
-        pr: PrNumber,
-        head: &str,
-        review: &serde_json::Value,
-    ) -> Result<bool> {
-        let mut reviews = self.reviews.lock().unwrap();
-        let waiting = reviews
-            .iter_mut()
-            .find(|r| r.number == pr && r.head_sha == head && r.status == ReviewStatus::Author);
-        Ok(waiting.is_some_and(|r| {
-            r.status = ReviewStatus::Pending;
-            r.submitted = Some(review.clone());
-            true
-        }))
-    }
-    async fn mark_agent_fixed(&self, id: i64) -> Result<()> {
-        let mut reviews = self.reviews.lock().unwrap();
-        reviews.iter_mut().find(|r| r.id == id).unwrap().agent_fixed = true;
-        Ok(())
     }
     async fn review_queue_change(
         &self,
@@ -1110,9 +1190,6 @@ impl ReviewStore for Mem {
         }
         Ok(())
     }
-    async fn set_asked(&self, _: i64, _: &[String]) -> Result<()> {
-        unreachable!()
-    }
     async fn answer_review(&self, _: i64, _: &ReviewAnswers) -> Result<bool> {
         unreachable!()
     }
@@ -1146,8 +1223,37 @@ impl ReviewStore for Mem {
     ) -> Result<bool> {
         unreachable!()
     }
-    async fn withdraw_finding(&self, _: i64, _: &str) -> Result<Option<ReviewStatus>> {
+    async fn withdraw_finding(
+        &self,
+        _: i64,
+        _: &str,
+        _: mergepatrol_core::Outcome,
+    ) -> Result<Option<ReviewStatus>> {
         unreachable!()
+    }
+    async fn settle_findings(
+        &self,
+        id: i64,
+        outcomes: &[(String, mergepatrol_core::Outcome)],
+    ) -> Result<()> {
+        let mut reviews = self.reviews.lock().unwrap();
+        let r = reviews.iter_mut().find(|r| r.id == id).unwrap();
+        let before = r.findings.clone();
+        for (finding, outcome) in outcomes {
+            if let Some(f) = r.findings.iter_mut().find(|f| &f.finding.id == finding) {
+                f.settle(*outcome);
+            }
+        }
+        // As the store does: the PR's earlier reviews that raised it are settled with it.
+        let settled = mergepatrol_core::newly_settled(&before, &r.findings);
+        let pr = (r.repo.clone(), r.number);
+        for e in reviews
+            .iter_mut()
+            .filter(|e| e.id < id && (e.repo.clone(), e.number) == pr)
+        {
+            mergepatrol_core::carry_back(&mut e.findings, &e.answers, &settled);
+        }
+        Ok(())
     }
     async fn mark_threaded(&self, _: i64, _: &[String]) -> Result<()> {
         Ok(())
@@ -1162,6 +1268,9 @@ impl ReviewStore for Mem {
         Ok(held)
     }
     async fn reviews_since(&self, _: u64, _: u32) -> Result<Vec<ReviewRecord>> {
+        unreachable!()
+    }
+    async fn reviews_of_prs_since(&self, _: u64, _: u32) -> Result<Vec<ReviewRecord>> {
         unreachable!()
     }
     async fn review_settings(&self, _: u64) -> Result<Option<ReviewSettings>> {
@@ -1181,10 +1290,10 @@ impl ReadCache for Mem {
     async fn github_reads(&self, _: u64, _: &RepoName) -> Result<RepoReads> {
         unreachable!()
     }
-    async fn config_read(&self, _: u64, _: &RepoName) -> Result<Option<Option<String>>> {
+    async fn config_read(&self, _: u64, _: &RepoName) -> Result<Option<ConfigText>> {
         unreachable!()
     }
-    async fn save_config_read(&self, _: u64, _: &RepoName, _: i64, _: Option<&str>) -> Result<()> {
+    async fn save_config_read(&self, _: u64, _: &RepoName, _: i64, _: &ConfigText) -> Result<()> {
         unreachable!()
     }
     async fn save_repository_read(
@@ -1214,72 +1323,6 @@ impl ReadCache for Mem {
         _: i64,
         _: &serde_json::Value,
     ) -> Result<()> {
-        unreachable!()
-    }
-}
-
-/// The queue keeps no inbox.
-#[async_trait]
-impl InboxStore for Mem {
-    async fn inbox_changed(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        Ok(())
-    }
-    async fn inbox_reviewed(&self, _: u64, _: &RepoName, _: PrNumber, _: &str) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_closed(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_ready(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_stale(&self, _: Duration, _: u32) -> Result<Vec<InboxStale>> {
-        unreachable!()
-    }
-    async fn inbox_changes(&self, _: u64, _: &RepoName) -> Result<HashMap<PrNumber, i64>> {
-        unreachable!()
-    }
-    async fn save_inbox_reads(&self, _: u64, _: &RepoName, _: &[InboxWrite]) -> Result<()> {
-        unreachable!()
-    }
-    async fn save_inbox_index(&self, _: u64, _: &RepoName, _: &[InboxWrite]) -> Result<()> {
-        unreachable!()
-    }
-    async fn set_inbox_repos(&self, _: u64, _: &[RepoName]) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_open(&self, _: u64, _: &RepoName) -> Result<Option<Vec<serde_json::Value>>> {
-        unreachable!()
-    }
-    async fn inbox_repos_due(&self, _: Duration) -> Result<Vec<(u64, RepoName)>> {
-        unreachable!()
-    }
-    async fn set_inbox_teams(&self, _: u64, _: &[(String, Vec<String>)]) -> Result<()> {
-        unreachable!()
-    }
-    async fn set_inbox_member(&self, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
-        unreachable!()
-    }
-    async fn delete_inbox_team(&self, _: u64, _: &str) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox(&self, _: &str, _: &[u64], _: Duration) -> Result<UserInbox> {
-        unreachable!()
-    }
-    async fn inbox_seen(&self, _: &str, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_snooze(
-        &self,
-        _: &str,
-        _: u64,
-        _: &RepoName,
-        _: PrNumber,
-        _: Option<Duration>,
-    ) -> Result<()> {
-        unreachable!()
-    }
-    async fn prune_inbox(&self, _: Duration) -> Result<u64> {
         unreachable!()
     }
 }
@@ -1379,15 +1422,25 @@ impl Store for Mem {
     async fn merged_by_day(&self, _: u64, _: Slice<'_>, _: u32) -> Result<Vec<u64>> {
         unreachable!()
     }
-    async fn put_secret(&self, _: Scope, _: &str, _: SecretRecord) -> Result<()> {
-        unreachable!()
+    async fn put_secret(&self, scope: Scope, name: &str, record: SecretRecord) -> Result<()> {
+        let mut secrets = self.secrets.lock().unwrap();
+        secrets.retain(|(s, n, _)| (*s, n.as_str()) != (scope, name));
+        secrets.push((scope, name.to_owned(), record));
+        Ok(())
     }
-    /// None: no self-hosted App, so no webhooks unless a test sets the hosted one.
-    async fn secret(&self, _: Scope, _: &str) -> Result<Option<SecretRecord>> {
-        Ok(None)
+    /// Only what a test put: no self-hosted App, so no webhooks unless a test sets the hosted
+    /// one.
+    async fn secret(&self, scope: Scope, name: &str) -> Result<Option<SecretRecord>> {
+        let secrets = self.secrets.lock().unwrap();
+        Ok(secrets
+            .iter()
+            .find(|(s, n, _)| (*s, n.as_str()) == (scope, name))
+            .map(|(_, _, record)| record.clone()))
     }
-    async fn delete_secret(&self, _: Scope, _: &str) -> Result<()> {
-        unreachable!()
+    async fn delete_secret(&self, scope: Scope, name: &str) -> Result<()> {
+        let mut secrets = self.secrets.lock().unwrap();
+        secrets.retain(|(s, n, _)| (*s, n.as_str()) != (scope, name));
+        Ok(())
     }
     async fn secret_names(&self) -> Result<Vec<(Scope, String)>> {
         unreachable!()
@@ -1507,7 +1560,6 @@ fn ctx(store: Arc<Mem>) -> Ctx {
                 // One PR at a time, unless a test batches.
                 batch_size: 1,
                 agent: AgentSettings {
-                    runs: Default::default(),
                     provider: Default::default(),
                     model: "m".into(),
                     effort: "medium".into(),
@@ -1815,6 +1867,40 @@ async fn a_pr_merges_with_a_method_the_repos_settings_allow() {
     assert_eq!(run.kinds(1).last().unwrap(), "merged");
 }
 
+/// productstudioinc/halo#3433: an admin turned off merge commits after the queue read the repo.
+#[tokio::test(start_paused = true)]
+async fn a_pr_whose_merge_method_was_turned_off_merges_with_one_still_allowed() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    run.gh
+        .then(|s| s.repo_merge_methods = Some(vec!["squash".into()]));
+    run.tick().await;
+    assert_eq!(run.merged(), [1]);
+    assert_eq!(run.kinds(1).last().unwrap(), "merged");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_batch_whose_merge_method_was_turned_off_merges_with_one_still_allowed() {
+    let run = Run::batching(Fake::new(prs(&[1, 2])));
+    run.gh
+        .then(|s| s.repo_merge_methods = Some(vec!["squash".into()]));
+    let start = Instant::now();
+    run.tick().await;
+    assert_eq!(run.merged(), [1, 2]);
+    assert!(
+        start.elapsed() < MERGE_RETRY_AFTER,
+        "a refused method is not retried as it was"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_merge_no_method_is_allowed_for_ejects_the_pr() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    run.gh.then(|s| s.repo_merge_methods = Some(vec![]));
+    run.tick().await;
+    assert_eq!(run.merged(), [] as [PrNumber; 0]);
+    assert_eq!(run.labels(1), [FAILED]);
+}
+
 fn prep_run(setup: impl FnOnce(&mut State)) -> Run {
     Run::new(Fake::new(setup))
 }
@@ -1912,7 +1998,7 @@ async fn a_pr_the_lane_is_running_gets_no_job_off_it() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_review_fix_and_a_check_fix_take_turns() {
+async fn a_check_fix_waits_for_the_job_that_holds_its_pr() {
     let run = prep_run(failing_ci);
     let key = LaneKey {
         installation_id: 1,
@@ -2317,40 +2403,6 @@ async fn a_job_beside_the_lane_goes_by_the_refs_not_the_lagging_pr() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_review_fix_finds_the_layer_of_its_pr_and_the_stacks_budget() {
-    let run = Run::new(Fake::new(|s| {
-        s.add_stack(10, &[1, 2], &[2]);
-        s.fixes_used.insert(2, 2);
-    }));
-    let key = LaneKey {
-        installation_id: 1,
-        repo: repo(),
-        trunk: "main".into(),
-    };
-    let labeled = run.gh.with(|s| vec![s.prs[&1].clone()]);
-    let stack = units(&*run.gh, &repo(), &labeled).await.unwrap().remove(0);
-    assert_eq!((stack.number, stack.prs()), (10, vec![1, 2]));
-    let settings = &run.ctx.config.repo_defaults;
-    let to_fix = |number, head: String| {
-        let (run, key, stack) = (&run, &key, &stack);
-        async move {
-            let found = stack.to_fix(&*run.gh, key, settings, number, &head);
-            found.await.unwrap().map(|(_, layer)| layer)
-        }
-    };
-    let head = run.gh.with(|s| s.head(1));
-    assert_eq!(to_fix(1, head.clone()).await, Some(0));
-    assert_eq!(to_fix(2, run.gh.with(|s| s.head(2))).await, Some(1));
-    assert_eq!(to_fix(1, "pushed".into()).await, None);
-
-    let change = |edit: fn(&mut State)| edit(&mut run.gh.state.lock().unwrap());
-    change(|s| {
-        s.fixes_used.insert(1, 1);
-    });
-    assert_eq!(to_fix(1, head).await, None, "layers share one budget");
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_fork_pr_skips_getting_ready() {
     let run = prep_run(|s| {
         fork_pr(s);
@@ -2404,7 +2456,7 @@ async fn a_conflict_the_agent_resolved_needs_a_review_and_a_clean_rebase_keeps_i
         let (run, key, settings) = (&run, &key, &settings);
         async move {
             let heads = [(number, head, 0)];
-            review_hold(&run.ctx, key, settings, false, &heads, &mut false)
+            review_hold(&run.ctx, &*run.gh, key, settings, false, &heads, &mut false)
                 .await
                 .unwrap()
         }
@@ -2421,6 +2473,64 @@ async fn a_conflict_the_agent_resolved_needs_a_review_and_a_clean_rebase_keeps_i
         Some(&heads[1]),
         "it reads only the resolution"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_layer_restacked_onto_a_fix_below_keeps_its_approval() {
+    let run = Run::new(Fake::new(|s| {
+        s.add_stack(10, &[1, 2], &[2]);
+        for (base, head, id) in [
+            ("main", "pr-1-v0", "one"),
+            ("pr-1-v0", "pr-2-v0", "two"),
+            ("main", "pr-1-v1", "one, fixed"),
+            ("pr-1-v1", "pr-2-v1", "two"),
+            ("pr-1-v1", "pr-2-v2", "two, changed"),
+        ] {
+            s.diff_ids.insert((base.into(), head.into()), id.into());
+        }
+    }));
+    let settings = ReviewSettings {
+        enabled: true,
+        ..ReviewSettings::default()
+    };
+    let key = LaneKey {
+        installation_id: 1,
+        repo: repo(),
+        trunk: "main".into(),
+    };
+    let hold = |one: &'static str, two: &'static str| {
+        let (run, key, settings) = (&run, &key, &settings);
+        async move {
+            let heads = [(1, one, 0), (2, two, 0)];
+            review_hold(&run.ctx, &*run.gh, key, settings, true, &heads, &mut false)
+                .await
+                .unwrap()
+        }
+    };
+    let reviewing = |number| {
+        Some(Hold::Layer {
+            number,
+            hold: Box::new(Hold::Reviewing),
+        })
+    };
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, reviewing(1));
+    run.store.finish_review(1, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, reviewing(2));
+    run.store.finish_review(2, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, None);
+
+    // A fix on the layer below, and the restack it brings: only the fix is reviewed.
+    assert_eq!(hold("pr-1-v1", "pr-2-v1").await, reviewing(1));
+    run.store.finish_review(1, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v1", "pr-2-v1").await, None);
+    assert_eq!(
+        run.store.newest_review(2).0,
+        "pr-2-v1",
+        "the approval holds for it"
+    );
+
+    // A push that changes the layer's own changes is reviewed again.
+    assert_eq!(hold("pr-1-v1", "pr-2-v2").await, reviewing(2));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2465,8 +2575,8 @@ async fn with_the_review_on_a_pr_keeps_its_place_until_the_agent_or_a_human_appr
         [(1, "Held(Reviewing)".into()), (2, "Held(Reviewing)".into())]
     );
     assert_eq!(run.kinds(1), ["enqueued", "held"]);
-    // No comment for a review starting: the agent's own review says what it found.
-    assert!(run.gh.with(|s| !s.comments.iter().any(|(n, _)| *n == 1)));
+    // A review starting says only that it joined: the agent's own review says what it found.
+    assert_eq!(comments_on(&run, 1), [ENQUEUED]);
 
     run.store.finish_review(2, ReviewStatus::Asks);
     run.store.finish_review(1, ReviewStatus::Asks);
@@ -2521,11 +2631,27 @@ async fn a_pr_goes_on_once_its_author_resolves_every_comment_with_no_human() {
         f.threaded = true;
     });
     threads(1);
+    // Its review requested changes, as GitHub shows it: MergeLoop's own.
+    run.gh.with_mut(|s| {
+        let pr = s.prs.get_mut(&1).unwrap();
+        pr.review_decision = Some("CHANGES_REQUESTED".into());
+        pr.details = serde_json::from_value(serde_json::json!({
+            "url": "", "createdAt": "", "additions": 0, "deletions": 0, "changedFiles": 0,
+            "author": null, "reviewRequests": { "nodes": [] }, "commits": null,
+            "latestOpinionatedReviews": { "nodes": [
+                { "state": "CHANGES_REQUESTED", "viewerDidAuthor": true, "author": null },
+            ] },
+        }))
+        .unwrap();
+    });
     run.tick().await;
     assert_eq!(run.lane(), [(1, "Held(ReviewChanges)".into())]);
-    // The author answers it and resolves the thread: no human approves, and it merges.
+    assert!(run.gh.with(|s| s.dismissed.is_empty()));
+    // The author answers it and resolves the thread: no human approves, MergeLoop withdraws
+    // its request for changes, and it merges.
     threads(0);
     run.drain().await;
+    assert_eq!(run.gh.with(|s| s.dismissed.clone()), [1]);
     assert_eq!(run.merged(), [1]);
 }
 
@@ -3020,6 +3146,129 @@ fn failing_ci(s: &mut State) {
     s.checks.insert("ci".into(), CheckState::Failed);
 }
 
+/// `ci` fails on every commit, as a GitHub Actions job that may run again.
+fn failing_job(s: &mut State) {
+    failing_ci(s);
+    s.actions = true;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_job_runs_again_once_and_a_flaky_one_merges_with_no_fix() {
+    let run = Run::on_the_lane(Fake::new(|s| {
+        failing_job(s);
+        s.flaky = true;
+    }));
+    run.tick().await;
+    assert!(run.rebase.fixed().is_empty(), "{:?}", run.rebase.fixed());
+    assert_eq!(run.gh.with(|s| s.reran.clone()), ["pr-1-r1"]);
+    assert_eq!(
+        run.kinds(1),
+        ["enqueued", "rebasing", "published", "rerunning", "merged"]
+    );
+    let comments = run.gh.with(|s| s.comments.clone());
+    assert!(
+        comments
+            .iter()
+            .any(|(_, c)| c.contains("Running the failed jobs again once")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_that_fails_again_is_fixed_and_the_fix_runs_again_on_its_own_head() {
+    let run = Run::on_the_lane(Fake::new(failing_job));
+    run.tick().await;
+    assert_eq!(run.rebase.fixed(), [["ci"]]);
+    // The fix's head passes: only the rebased head ran again, once.
+    assert_eq!(run.gh.with(|s| s.reran.clone()), ["pr-1-r1"]);
+    let kinds = run.kinds(1);
+    assert_eq!(
+        kinds[3..],
+        ["rerunning", "fixing", "published", "merged"],
+        "{kinds:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_no_fixes_a_failed_job_runs_again_before_the_pr_is_ejected() {
+    let run = Run::on_the_lane(Fake::new(|s| {
+        failing_job(s);
+        s.fixes_used.insert(1, 3);
+    }));
+    run.tick().await;
+    assert!(run.rebase.fixed().is_empty());
+    assert_eq!(run.gh.with(|s| s.reran.len()), 1);
+    assert_eq!(run.labels(1), [FAILED]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rerun_github_refuses_goes_on_to_the_fix() {
+    let run = Run::on_the_lane(Fake::new(|s| {
+        failing_job(s);
+        s.rerun_refused = Some("the App needs `actions: write`".into());
+    }));
+    run.tick().await;
+    assert_eq!(run.rebase.fixed(), [["ci"]]);
+    let kinds = run.kinds(1);
+    assert!(kinds.iter().any(|k| k == "rerun-failed"), "{kinds:?}");
+    assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_job_runs_again_off_the_lane_before_a_fix() {
+    let run = prep_run(failing_job);
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(PrepChecks)".into())]);
+    let rerun = prep::Work::Rerun {
+        layer: 0,
+        failed: vec!["ci".into()],
+        runs: vec![1],
+    };
+    assert_eq!(run.ctx.prep.asked(), [(1, rerun)]);
+    run.ctx.prep.take(&repo());
+    run.ctx.prep.end_job(&(1, repo(), 1));
+
+    // Once it ran again, its failure is the fix's.
+    run.gh.with_mut(|s| s.reran.push(s.head(1)));
+    run.tick().await;
+    let fix = prep::Work::Fix {
+        layer: 0,
+        failed: vec!["ci".into()],
+    };
+    assert_eq!(run.ctx.prep.asked(), [(1, fix)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_no_fixes_left_a_failed_job_still_runs_again_off_the_lane() {
+    let run = prep_run(|s| {
+        failing_job(s);
+        s.fixes_used.insert(1, 3);
+    });
+    run.tick().await;
+    assert!(matches!(
+        run.ctx.prep.asked()[..],
+        [(1, prep::Work::Rerun { .. })]
+    ));
+    assert_eq!(run.labels(1), [TRIGGER], "it stays queued");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rerun_github_refused_off_the_lane_is_not_asked_again_on_that_head() {
+    let run = prep_run(failing_job);
+    let key = LaneKey {
+        installation_id: 1,
+        repo: repo(),
+        trunk: "main".into(),
+    };
+    let head = run.gh.with(|s| s.head(1));
+    run.ctx.prep.note_refused_rerun(&key, 1, &head);
+    run.tick().await;
+    assert!(matches!(
+        run.ctx.prep.asked()[..],
+        [(1, prep::Work::Fix { .. })]
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_failed_required_check_is_fixed_then_merged() {
     let run = Run::on_the_lane(Fake::new(failing_ci));
@@ -3432,6 +3681,137 @@ async fn removing_the_label_cancels_the_job() {
     assert!(run.lane().is_empty());
 }
 
+/// The comments on PR `number`, oldest first.
+fn comments_on(run: &Run, number: PrNumber) -> Vec<String> {
+    run.gh.with(|s| {
+        s.comments
+            .iter()
+            .filter(|(n, _)| *n == number)
+            .map(|(_, c)| c.clone())
+            .collect()
+    })
+}
+
+/// PR 1 held for a required review, which its comment says.
+fn held_for_review() -> Run {
+    Run::new(Fake::new(|s| {
+        s.add_pr(1);
+        s.prs.get_mut(&1).unwrap().review_decision = Some("REVIEW_REQUIRED".into());
+    }))
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_comment_of_a_cancelled_job_says_it_left_the_queue() {
+    let run = Run::on_the_lane(Fake::new(|s| s.add_pr(1)));
+    run.gh.then(|s| {
+        s.checks_on
+            .insert(s.head(1), [("ci".into(), CheckState::Pending)].into());
+        s.prs.get_mut(&1).unwrap().labels.clear();
+    });
+    run.tick().await;
+    assert_eq!(run.kinds(1).last().unwrap(), "cancelled");
+    let comment = last_comment(&run);
+    assert!(
+        comment.starts_with("Left the queue: the `mergeloop` label was removed."),
+        "{comment}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_pr_whose_label_comes_off_says_it_left_the_queue() {
+    let run = held_for_review();
+    run.tick().await;
+    assert!(last_comment(&run).starts_with("On hold: waiting for a required review"));
+    run.gh
+        .with_mut(|s| s.prs.get_mut(&1).unwrap().labels.clear());
+    run.tick().await;
+    assert_eq!(run.kinds(1).last().unwrap(), "dequeued");
+    let comment = last_comment(&run);
+    assert!(
+        comment.starts_with("Left the queue: the `mergeloop` label was removed."),
+        "{comment}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_pr_merged_outside_mergeloop_says_so() {
+    let run = held_for_review();
+    run.tick().await;
+    run.gh.with_mut(|s| {
+        s.prs.get_mut(&1).unwrap().state = "MERGED".into();
+        s.merged.push(1);
+        s.merge_commits.insert(1, "abc123".into());
+    });
+    run.tick().await;
+    assert_eq!(last_comment(&run), "Merged outside MergeLoop as abc123.");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pr_closed_while_its_job_runs_says_it_left_the_queue() {
+    let run = Run::on_the_lane(Fake::new(|s| s.add_pr(1)));
+    run.gh.then(|s| {
+        s.checks_on
+            .insert(s.head(1), [("ci".into(), CheckState::Pending)].into());
+        s.prs.get_mut(&1).unwrap().state = "CLOSED".into();
+    });
+    run.tick().await;
+    assert_eq!(run.kinds(1).last().unwrap(), "dequeued");
+    assert_eq!(last_comment(&run), "Left the queue: it was closed.");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pr_ejected_while_the_lane_syncs_keeps_the_comment_that_says_why() {
+    let run = Run::new(Fake::new(|s| {
+        fork_pr(s);
+        s.prs.get_mut(&1).unwrap().review_decision = Some("REVIEW_REQUIRED".into());
+    }));
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(ReviewRequired)".to_owned())]);
+    run.gh.with_mut(|s| s.push(1, "untrusted"));
+    run.tick().await;
+    assert_eq!(run.kinds(1).last().unwrap(), "dequeued");
+    let comments = comments_on(&run, 1);
+    assert!(
+        comments
+            .last()
+            .unwrap()
+            .contains("Dequeued: new commits were pushed"),
+        "{comments:?} {:?}",
+        run.kinds(1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pr_says_it_joined_the_queue_while_its_review_runs() {
+    let run = prep_run(|s| {
+        s.add_pr(1);
+        s.required = vec!["ci".into()];
+    });
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings {
+        enabled: true,
+        ..ReviewSettings::default()
+    });
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(Reviewing)".into())]);
+    assert_eq!(comments_on(&run, 1), [ENQUEUED]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn getting_ready_says_so_once_however_many_steps_it_takes() {
+    let run = prep_run(|s| {
+        s.add_pr(1);
+        s.required = vec!["ci".into()];
+        s.checks.insert("ci".into(), CheckState::Pending);
+    });
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(PrepChecks)".into())]);
+    run.gh
+        .with_mut(|s| s.checks.insert("ci".into(), CheckState::Failed));
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(PrepFixing)".into())]);
+    assert_eq!(comments_on(&run, 1), [GETTING_READY]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_dismissed_approval_holds_the_pr_in_its_place() {
     let run = Run::new(Fake::new(|s| {
@@ -3525,7 +3905,7 @@ async fn green_prs_are_tested_together_and_merged_without_a_rebase() {
     // The batch's branch is gone, which closes its draft PR.
     assert_eq!(
         run.gh.with(|s| s.deleted.clone()),
-        ["mergepatrol/batch-1-2-3"]
+        ["mergeloop/batch-1-2-3"]
     );
     assert_eq!(run.kinds(2), ["enqueued", "batch", "merged"]);
     assert!(run.lane().is_empty());
@@ -3635,7 +4015,7 @@ async fn a_batch_stops_at_the_first_conflict() {
 async fn the_trunk_moving_while_a_batch_is_tested_builds_it_again() {
     let run = Run::batching(Fake::new(prs(&[1, 2])));
     // The checks of both PRs are read, then the batch's.
-    const BATCH: &str = "mergepatrol/batch-1-2@t-1-2";
+    const BATCH: &str = "mergeloop/batch-1-2@t-1-2";
     run.gh.then(|_| {});
     run.gh.then(|_| {});
     run.gh.then(|s| {
@@ -3704,14 +4084,14 @@ async fn a_batch_cut_short_by_a_restart_is_built_again() {
     ]);
     lane.activate(1);
     lane.activate(2);
-    lane.batch_branch = Some("mergepatrol/batch-1-2".into());
+    lane.batch_branch = Some("mergeloop/batch-1-2".into());
     run.store.lanes.lock().unwrap().insert(key, lane);
     run.gh
         .state
         .lock()
         .unwrap()
         .branches
-        .insert("mergepatrol/batch-1-2".into(), "stale".into());
+        .insert("mergeloop/batch-1-2".into(), "stale".into());
     run.tick().await;
     assert_eq!(run.merged(), [1, 2]);
 }
@@ -3719,7 +4099,7 @@ async fn a_batch_cut_short_by_a_restart_is_built_again() {
 /// Ticks until the batch of 1 and 2 waits for its checks, then drops the tick, as a restart
 /// does.
 async fn cut_short_while_testing(run: &Run) {
-    const BATCH: &str = "mergepatrol/batch-1-2@t-1-2";
+    const BATCH: &str = "mergeloop/batch-1-2@t-1-2";
     run.gh.with_mut(|s| {
         s.checks_on
             .insert(BATCH.into(), [("ci".into(), CheckState::Pending)].into())
@@ -3737,10 +4117,7 @@ async fn a_batch_cut_short_by_a_restart_picks_up_where_it_was() {
     assert_eq!(run.merged(), [1, 2]);
     // The same branch and draft PR, which CI kept testing.
     assert_eq!(run.gh.with(|s| s.drafts.len()), 1);
-    assert_eq!(
-        run.gh.with(|s| s.deleted.clone()),
-        ["mergepatrol/batch-1-2"]
-    );
+    assert_eq!(run.gh.with(|s| s.deleted.clone()), ["mergeloop/batch-1-2"]);
     assert_eq!(
         run.kinds(1),
         ["enqueued", "batch", "batch-resumed", "merged"]
@@ -3750,7 +4127,7 @@ async fn a_batch_cut_short_by_a_restart_picks_up_where_it_was() {
 #[tokio::test(start_paused = true)]
 async fn a_batch_whose_poll_fails_picks_up_where_it_was() {
     let run = Run::batching(Fake::new(prs(&[1, 2])));
-    const BATCH: &str = "mergepatrol/batch-1-2@t-1-2";
+    const BATCH: &str = "mergeloop/batch-1-2@t-1-2";
     run.gh.with_mut(|s| {
         s.checks_on
             .insert(BATCH.into(), [("ci".into(), CheckState::Pending)].into())
@@ -3775,7 +4152,7 @@ async fn a_batch_whose_poll_fails_picks_up_where_it_was() {
 #[tokio::test(start_paused = true)]
 async fn a_batch_whose_poll_keeps_failing_stops() {
     let run = Run::batching(Fake::new(prs(&[1, 2])));
-    const BATCH: &str = "mergepatrol/batch-1-2@t-1-2";
+    const BATCH: &str = "mergeloop/batch-1-2@t-1-2";
     run.gh.with_mut(|s| {
         s.checks_on
             .insert(BATCH.into(), [("ci".into(), CheckState::Pending)].into())
@@ -3788,10 +4165,7 @@ async fn a_batch_whose_poll_keeps_failing_stops() {
     // Resumed, its poll fails past the window: the batch stops, and its PRs go back.
     run.gh.then(|s| s.failing_snapshots = 1);
     assert!(run.try_tick().await.is_err());
-    assert_eq!(
-        run.gh.with(|s| s.deleted.clone()),
-        ["mergepatrol/batch-1-2"]
-    );
+    assert_eq!(run.gh.with(|s| s.deleted.clone()), ["mergeloop/batch-1-2"]);
 }
 
 /// Ticks until the next merge, which a restart cuts short: GitHub merges it meanwhile, or not.
@@ -3929,7 +4303,7 @@ async fn a_green_stack_is_tested_in_a_batch_and_merged_at_once() {
     );
     assert_eq!(
         run.gh.with(|s| s.deleted.clone()),
-        ["mergepatrol/batch-1-10-4"]
+        ["mergeloop/batch-1-10-4"]
     );
     assert_eq!(run.kinds(2), ["enqueued", "batch", "merged"]);
     let comment = run.gh.with(|s| {
@@ -4011,7 +4385,7 @@ async fn a_batch_with_a_stack_picks_up_where_it_was_after_a_restart() {
         prs(&[1])(s);
         s.add_stack(10, &[2, 3], &[3]);
     }));
-    const BATCH: &str = "mergepatrol/batch-1-10@t-1-2-3";
+    const BATCH: &str = "mergeloop/batch-1-10@t-1-2-3";
     run.gh.with_mut(|s| {
         s.checks_on
             .insert(BATCH.into(), [("ci".into(), CheckState::Pending)].into())
@@ -4169,7 +4543,7 @@ async fn a_fork_pr_goes_by_its_pull_ref_which_the_pr_lags_behind() {
 
 /// A MergeLoop that GitHub delivers webhooks to.
 fn with_webhooks(run: &mut Run) {
-    run.ctx.config.public_url = "https://mergepatrol.example".into();
+    run.ctx.config.public_url = "https://mergeloop.example".into();
     run.ctx.hosted_app = Some(AppCredentials {
         id: 1,
         slug: "mp".into(),
@@ -4420,7 +4794,7 @@ fn billed(run: &mut Run, plans: &Arc<Plans>) {
         webhook_secret: String::new(),
         price: String::new(),
     };
-    let billing = Billing::new(plans.clone(), stripe, "https://mergepatrol.test");
+    let billing = Billing::new(plans.clone(), stripe, "https://mergeloop.test");
     run.ctx.billing = Some(Arc::new(billing));
 }
 
@@ -4448,7 +4822,7 @@ async fn a_private_repo_waits_on_hold_until_subscribed() {
     assert_eq!(run.kinds(1), ["enqueued", "held"]);
     let comment = run.gh.with(|s| s.comments.last().unwrap().1.clone());
     assert!(comment.contains("Start a free trial of 14 days"));
-    assert!(comment.contains("https://mergepatrol.test/o/settings"));
+    assert!(comment.contains("https://mergeloop.test/o/settings"));
     // Its author takes a seat already, so the subscription starts with it.
     assert_eq!(*plans.seats.lock().unwrap(), ["ada"]);
 
@@ -4703,7 +5077,7 @@ async fn while_a_pr_waits_for_checks_the_other_lanes_sync_but_not_one_a_restart_
         trunk: "hotfix".into(),
     };
     let cut_short = Lane {
-        batch_branch: Some("mergepatrol/batch-9".into()),
+        batch_branch: Some("mergeloop/batch-9".into()),
         ..Lane::default()
     };
     run.store.lanes.lock().unwrap().insert(hotfix, cut_short);
@@ -4834,3 +5208,4 @@ async fn a_stack_layer_gets_its_own_missing_check_clock() {
     assert_eq!(run.kinds(2).last().unwrap(), "ejected");
     assert!(last_comment(&run).contains("finished: sift."));
 }
+mod status_comment_regression;

@@ -337,7 +337,7 @@ async fn call(
 }
 
 async fn claim(router: &Router, who: &str) -> Value {
-    let (status, body) = call(router, who, "POST", "/builds/claim", Value::Null).await;
+    let (status, body) = call(router, who, "POST", "/builds/claim", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body
 }
@@ -424,7 +424,7 @@ async fn with_the_lane_off_every_lane_route_refuses(pool: PgPool) {
 
     let fake = json!({ "build": 1, "claim": 1 });
     for (status, body) in [
-        call(&router, "ana", "POST", "/builds/claim", Value::Null).await,
+        call(&router, "ana", "POST", "/builds/claim", json!({})).await,
         call(&router, "ana", "GET", "/builds", Value::Null).await,
         call(
             &router,
@@ -752,6 +752,49 @@ async fn only_a_signed_in_member_of_the_workspace_may_claim(pool: PgPool) {
     let res = send(&router, token).await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     assert!(hub.lock().unwrap().writes.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_daemon_holds_only_what_it_claimed_and_another_of_the_same_login_holds_none_of_it(
+    pool: PgPool,
+) {
+    let hub = shared(vec![issue(1, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let laptop = json!({ "daemon": "laptop-1" });
+    let (status, bad) = call(
+        &router,
+        "ana",
+        "POST",
+        "/builds/claim",
+        json!({ "daemon": "a b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    let (status, claimed) = call(&router, "ana", "POST", "/builds/claim", laptop.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{claimed}");
+
+    let mine = |daemon: &str| format!("/builds?mine=true&daemon={daemon}");
+    let (_, listed) = call(&router, "ana", "GET", &mine("laptop-1"), Value::Null).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["holder"], "ana", "the dashboard shows the login");
+    let (_, listed) = call(&router, "ana", "GET", &mine("desktop-1"), Value::Null).await;
+    assert_eq!(listed, json!([]));
+
+    let path = format!("/builds/{}/heartbeat", claimed["build"]);
+    for daemon in [json!("desktop-1"), Value::Null] {
+        let body = json!({ "claim": claimed["claim"], "daemon": daemon });
+        let (status, said) = call(&router, "ana", "POST", &path, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{daemon}: {said}");
+    }
+    let body = json!({ "claim": claimed["claim"], "daemon": "laptop-1" });
+    assert_eq!(
+        call(&router, "ana", "POST", &path, body).await.0,
+        StatusCode::OK
+    );
+    let desktop = json!({ "daemon": "desktop-1" });
+    let (_, none) = call(&router, "ana", "POST", "/builds/claim", desktop).await;
+    assert_eq!(none, Value::Null, "a live claim stays the laptop's");
 }
 
 #[sqlx::test(migrations = false)]
@@ -1298,6 +1341,7 @@ async fn a_token_minted_while_the_claim_is_given_back_is_revoked_and_refused(poo
                 installation_id: 1,
                 build,
                 login: "ana",
+                daemon: None,
                 claim: claim_n,
             };
             store.release_build(ana, None).await.unwrap().unwrap();
@@ -1683,6 +1727,7 @@ fn given_back_during(hub: &Shared, pool: &PgPool, prefix: &str, claimed: &Value)
             installation_id: 1,
             build,
             login: "ana",
+            daemon: None,
             claim: claim_n,
         };
         store.release_build(ana, None).await.unwrap().unwrap();

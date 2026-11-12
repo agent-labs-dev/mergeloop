@@ -83,6 +83,7 @@ impl Daemon {
             .map(|workspace| Lane {
                 client: self.client.clone(),
                 workspace,
+                daemon: folder.id().to_owned(),
             })
             .collect();
         for lane in &lanes {
@@ -105,8 +106,9 @@ impl Daemon {
     }
 }
 
-/// Gives back the builds without a PR that this login holds from a daemon that is gone: their
-/// work went with it. A build with a PR is the land loop's.
+/// Gives back the builds without a PR that this daemon holds from before it stopped: their work
+/// went with it. A build with a PR is the land loop's. Another daemon's builds, of the same login
+/// too, are not listed.
 async fn give_back_held(lane: &Lane) -> Result<()> {
     let held = match lane.held().await {
         Ok(held) => held,

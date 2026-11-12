@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! <workspace>/
-//!   daemon.lock               held while a daemon uses the folder: one at a time
+//!   daemon/lock               held while a daemon uses the folder: one at a time
+//!   daemon/id                 the daemon's name for itself, made once: its claims are its own
 //!   repos/<owner>/<name>.git  a bare clone of each repo it builds in
 //!   builds/<build>/           a git worktree per build, on the local branch `mergeloop/build-<issue>`
 //!   transcripts/<build>/      the agents' output, kept 7 days
@@ -33,6 +34,8 @@ const BRANCHES: &str = "refs/heads/mergeloop/build-";
 #[derive(Clone)]
 pub struct Folder {
     root: PathBuf,
+    /// The daemon's name for itself, kept in the folder.
+    id: String,
     clones: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
@@ -44,11 +47,13 @@ impl Folder {
         // The agents' sandboxes see the folder by its real path (`/tmp` is `/private/tmp` on
         // macOS).
         let root = root.canonicalize()?;
+        let own = root.join("daemon");
+        std::fs::create_dir_all(&own)?;
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(root.join("daemon.lock"))?;
+            .open(own.join("lock"))?;
         if lock.try_lock().is_err() {
             bail!(
                 "another mergeloop daemon is using {}: stop it, or give this one another workspace",
@@ -56,6 +61,7 @@ impl Folder {
             );
         }
         let folder = Folder {
+            id: identity(&own)?,
             root,
             clones: Arc::default(),
         };
@@ -64,6 +70,12 @@ impl Folder {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The daemon's name for itself, which its claims carry: it holds only the builds it
+    /// claimed, and another daemon, of the same login too, holds none of them.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn tmp(&self) -> PathBuf {
@@ -266,6 +278,24 @@ pub async fn rev_parse(wt: &Path, rev: &str) -> Result<String> {
         .await?
         .trim()
         .to_owned())
+}
+
+/// The name kept in `dir/id`, made the first time. Written whole or not at all.
+fn identity(dir: &Path) -> Result<String> {
+    let path = dir.join("id");
+    match std::fs::read_to_string(&path) {
+        Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_owned()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS has no random source");
+    let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = dir.join("id.tmp");
+    std::fs::write(&tmp, format!("{id}\n"))?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(id)
 }
 
 /// The folder's entries, none when it is not there.

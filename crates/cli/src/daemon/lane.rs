@@ -55,11 +55,13 @@ impl Stage {
     }
 }
 
-/// One workspace's lane.
+/// One workspace's lane, as one daemon.
 #[derive(Clone, Debug)]
 pub struct Lane {
     pub client: Client,
     pub workspace: u64,
+    /// The daemon's name for itself: its claims, and the builds it holds, are its own.
+    pub daemon: String,
 }
 
 impl Lane {
@@ -67,7 +69,10 @@ impl Lane {
     pub async fn claim(&self) -> Result<Option<Task>> {
         let answer = self
             .client
-            .json("claim_build", json!({ "workspace": self.workspace }))
+            .json(
+                "claim_build",
+                json!({ "workspace": self.workspace, "daemon": self.daemon }),
+            )
             .await?;
         if answer.is_null() {
             return Ok(None);
@@ -122,13 +127,13 @@ impl Lane {
         self.on(task, "release_build", args).await.map(drop)
     }
 
-    /// The builds this login holds in the workspace.
+    /// The builds this daemon holds in the workspace.
     pub async fn held(&self) -> Result<Vec<Held>> {
         let answer = self
             .client
             .json(
                 "list_builds",
-                json!({ "workspace": self.workspace, "mine": true }),
+                json!({ "workspace": self.workspace, "mine": true, "daemon": self.daemon }),
             )
             .await?;
         serde_json::from_value(answer.clone())
@@ -151,6 +156,7 @@ impl Lane {
         args["workspace"] = self.workspace.into();
         args["build"] = build.into();
         args["claim"] = claim.into();
+        args["daemon"] = self.daemon.as_str().into();
         self.client.json(tool, args).await
     }
 }

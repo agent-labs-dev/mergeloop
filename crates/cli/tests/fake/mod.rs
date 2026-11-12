@@ -217,7 +217,15 @@ async fn mcp(State(seen): Shared, headers: HeaderMap, Json(message): Json<Value>
             "workspaces": [{ "installation_id": 1, "account": "o" }],
         }),
         "claim_build" => seen.lane.tasks.pop_front().unwrap_or(Value::Null),
-        "list_builds" => Value::from(seen.lane.held.clone()),
+        // The held builds of the daemon that asks, as the server answers `mine` with `daemon`.
+        "list_builds" => Value::from(
+            seen.lane
+                .held
+                .iter()
+                .filter(|b| b["daemon"] == args["daemon"])
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         "heartbeat_build" => json!({ "id": args["build"], "status": "claimed" }),
         "mint_push_token" => json!({ "token": "ghs_fake", "expires_at": "2026-11-12T13:00:00Z" }),
         "open_build_pr" => {

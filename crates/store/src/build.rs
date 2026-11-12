@@ -138,6 +138,8 @@ pub struct Build {
     pub status: BuildStatus,
     /// Who holds the claim, or held it last.
     pub holder: Option<String>,
+    /// Which of `holder`'s daemons, when a daemon claimed it.
+    pub daemon: Option<String>,
     /// The claim assigned `holder` on the issue.
     pub mirrored: bool,
     /// Which taking of the build `holder` has.
@@ -171,12 +173,15 @@ pub struct Claimed {
     pub before: Option<(String, bool)>,
 }
 
-/// A call from the holder of a claim: which build, who, and which taking.
+/// A call from the holder of a claim: which build, who, from which of their daemons, and which
+/// taking.
 #[derive(Clone, Copy, Debug)]
 pub struct Holder<'a> {
     pub installation_id: u64,
     pub build: u64,
     pub login: &'a str,
+    /// `None` for a caller that is no daemon.
+    pub daemon: Option<&'a str>,
     pub claim: u64,
 }
 
@@ -269,6 +274,7 @@ pub trait BuildStore: Send + Sync {
         &self,
         installation_id: u64,
         login: &str,
+        daemon: Option<&str>,
         repos: &[RepoName],
         stale_secs: u64,
     ) -> Result<Option<Claimed>>;
@@ -301,7 +307,7 @@ pub trait BuildStore: Send + Sync {
 /// What every read of a build selects.
 macro_rules! columns {
     () => {
-        "id, installation_id, repo, issue, title, body, assignees, task, status, holder, mirrored, claim,
+        "id, installation_id, repo, issue, title, body, assignees, task, status, holder, daemon, mirrored, claim,
          stage, pr, reason, EXTRACT(EPOCH FROM now() - heartbeat_at)::BIGINT AS heard_secs"
     };
 }
@@ -313,11 +319,13 @@ macro_rules! held {
     };
 }
 
-/// Matches the build `holder` holds: `$1` workspace, `$2` build, `$3` login, `$4` claim.
+/// Matches the build `holder` holds: `$1` workspace, `$2` build, `$3` login, `$4` claim, `$5`
+/// daemon.
 macro_rules! fence {
     () => {
         concat!(
-            " installation_id = $1 AND id = $2 AND holder = $3 AND claim = $4 AND status IN ",
+            " installation_id = $1 AND id = $2 AND holder = $3 AND claim = $4",
+            " AND daemon IS NOT DISTINCT FROM $5 AND status IN ",
             held!()
         )
     };
@@ -332,6 +340,7 @@ fn fenced<'q>(
         .bind(holder.build as i64)
         .bind(holder.login)
         .bind(holder.claim as i64)
+        .bind(holder.daemon)
 }
 
 fn build(r: &sqlx::postgres::PgRow) -> Result<Build> {
@@ -347,6 +356,7 @@ fn build(r: &sqlx::postgres::PgRow) -> Result<Build> {
         task: r.get("task"),
         status: BuildStatus::parse(r.get("status"))?,
         holder: r.get("holder"),
+        daemon: r.get("daemon"),
         mirrored: r.get("mirrored"),
         claim: r.get::<i64, _>("claim") as u64,
         stage: r.get::<Option<&str>, _>("stage").and_then(Stage::parse),
@@ -675,6 +685,7 @@ impl BuildStore for PgStore {
         &self,
         installation_id: u64,
         login: &str,
+        daemon: Option<&str>,
         repos: &[RepoName],
         stale_secs: u64,
     ) -> Result<Option<Claimed>> {
@@ -694,7 +705,8 @@ impl BuildStore for PgStore {
                LIMIT 1 FOR UPDATE SKIP LOCKED
              )
              UPDATE builds b SET
-               status = CASE WHEN b.status = 'ready' THEN 'claimed' ELSE b.status END, holder = $2, claim = b.claim + 1,
+               status = CASE WHEN b.status = 'ready' THEN 'claimed' ELSE b.status END, holder = $2, daemon = $5,
+               claim = b.claim + 1,
                mirrored = CASE WHEN b.status IN ", held!(), " AND b.holder = $2 THEN b.mirrored
                  ELSE NOT ($2 = ANY(b.assignees)) END,
                stage = NULL, heartbeat_at = now(),
@@ -706,6 +718,7 @@ impl BuildStore for PgStore {
         .bind(login)
         .bind(&repos)
         .bind(stale_secs as f64)
+        .bind(daemon)
         .fetch_optional(&self.pool)
         .await?;
         let Some(r) = row else {
@@ -729,7 +742,7 @@ impl BuildStore for PgStore {
     ) -> Result<Option<Build>> {
         let row = fenced(
             concat!(
-                "UPDATE builds SET heartbeat_at = now(), stage = COALESCE($5, stage),
+                "UPDATE builds SET heartbeat_at = now(), stage = COALESCE($6, stage),
                    updated_at = now()
                  WHERE",
                 fence!(),
@@ -753,11 +766,11 @@ impl BuildStore for PgStore {
         let row = fenced(
             concat!(
                 "UPDATE builds SET
-                   status = CASE WHEN $5::TEXT IS NOT NULL THEN 'stuck'
+                   status = CASE WHEN $6::TEXT IS NOT NULL THEN 'stuck'
                      WHEN pr IS NULL THEN 'ready' ELSE status END,
-                   reason = $5, stuck_at = CASE WHEN $5::TEXT IS NOT NULL THEN now() END,
+                   reason = $6, stuck_at = CASE WHEN $6::TEXT IS NOT NULL THEN now() END,
                    claim = claim + 1,
-                   assignees = CASE WHEN $5::TEXT IS NULL AND pr IS NULL AND mirrored
+                   assignees = CASE WHEN $6::TEXT IS NULL AND pr IS NULL AND mirrored
                      THEN array_remove(assignees, holder) ELSE assignees END,
                    stage = NULL, heartbeat_at = NULL, updated_at = now()
                  WHERE",
@@ -794,6 +807,7 @@ impl BuildStore for PgStore {
         .bind(holder.build as i64)
         .bind(holder.login)
         .bind(holder.claim as i64)
+        .bind(holder.daemon)
         .fetch_one(&self.pool)
         .await?;
         Ok(held)
@@ -802,12 +816,12 @@ impl BuildStore for PgStore {
     async fn opened_pr(&self, holder: Holder<'_>, pr: u64) -> Result<Option<Build>> {
         let row = fenced(
             concat!(
-                "UPDATE builds SET pr = $5,
+                "UPDATE builds SET pr = $6,
                    status = CASE WHEN status = 'claimed' THEN 'landing' ELSE status END,
                    updated_at = now()
                  WHERE",
                 fence!(),
-                " AND (pr IS NULL OR pr = $5) RETURNING ",
+                " AND (pr IS NULL OR pr = $6) RETURNING ",
                 columns!()
             ),
             holder,
@@ -821,8 +835,8 @@ impl BuildStore for PgStore {
     async fn report_build(&self, holder: Holder<'_>, standing: Standing) -> Result<Option<Build>> {
         let row = fenced(
             concat!(
-                "UPDATE builds SET status = $5,
-                   heartbeat_at = CASE WHEN $5 = 'merged' THEN NULL ELSE heartbeat_at END,
+                "UPDATE builds SET status = $6,
+                   heartbeat_at = CASE WHEN $6 = 'merged' THEN NULL ELSE heartbeat_at END,
                    stage = NULL, updated_at = now()
                  WHERE",
                 fence!(),
@@ -879,7 +893,7 @@ mod tests {
 
     async fn claim(store: &PgStore, login: &str) -> Option<Build> {
         store
-            .claim_build(1, login, &[repo("o/r")], STALE)
+            .claim_build(1, login, None, &[repo("o/r")], STALE)
             .await
             .unwrap()
             .map(|c| c.build)
@@ -890,6 +904,7 @@ mod tests {
             installation_id: 1,
             build: b.id,
             login,
+            daemon: b.daemon.as_deref(),
             claim: b.claim,
         }
     }
@@ -1015,8 +1030,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claim(&store, "ana").await, None);
-        let none = store.claim_build(1, "ana", &[], STALE).await.unwrap();
+        let none = store.claim_build(1, "ana", None, &[], STALE).await.unwrap();
         assert_eq!(none, None);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn another_daemon_of_the_same_login_is_another_holder(pool: PgPool) {
+        let store = store(pool.clone()).await;
+        store
+            .upsert_task(1, &repo("o/r"), &issue(1, &[]))
+            .await
+            .unwrap();
+        let first = store
+            .claim_build(1, "ana", Some("laptop"), &[repo("o/r")], STALE)
+            .await
+            .unwrap()
+            .unwrap()
+            .build;
+        assert_eq!(first.daemon.as_deref(), Some("laptop"));
+        let other = Holder {
+            daemon: Some("desktop"),
+            ..held(&first, "ana")
+        };
+        assert_eq!(store.heartbeat_build(other, None).await.unwrap(), None);
+        assert_eq!(store.release_build(other, None).await.unwrap(), None);
+        let no_daemon = Holder {
+            daemon: None,
+            ..held(&first, "ana")
+        };
+        assert!(!store.holds(no_daemon).await.unwrap());
+        let fresh = store
+            .claim_build(1, "ana", Some("desktop"), &[repo("o/r")], STALE)
+            .await
+            .unwrap();
+        assert_eq!(fresh, None, "a live claim is the first daemon's");
+
+        heard_ago(&pool, first.id, STALE as i64 + 1).await;
+        let taken = store
+            .claim_build(1, "ana", Some("desktop"), &[repo("o/r")], STALE)
+            .await
+            .unwrap()
+            .unwrap()
+            .build;
+        assert_eq!(taken.daemon.as_deref(), Some("desktop"));
+        let old = held(&first, "ana");
+        assert_eq!(store.heartbeat_build(old, None).await.unwrap(), None);
+        assert!(
+            store
+                .heartbeat_build(held(&taken, "ana"), None)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -1035,7 +1100,7 @@ mod tests {
             [repo("o/r")]
         );
         let ben = store
-            .claim_build(1, "ben", &[repo("o/r")], STALE)
+            .claim_build(1, "ben", None, &[repo("o/r")], STALE)
             .await
             .unwrap()
             .unwrap();
@@ -1162,7 +1227,7 @@ mod tests {
         store.upsert_task(1, &old, &issue(1, &[])).await.unwrap();
         store.upsert_task(1, &old, &issue(2, &[])).await.unwrap();
         let ana = store
-            .claim_build(1, "ana", std::slice::from_ref(&old), STALE)
+            .claim_build(1, "ana", None, std::slice::from_ref(&old), STALE)
             .await
             .unwrap()
             .unwrap();

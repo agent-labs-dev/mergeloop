@@ -31,6 +31,9 @@ CREATE TABLE builds (
     status TEXT NOT NULL DEFAULT 'ready',
     -- The login that holds the claim, or held it last.
     holder TEXT,
+    -- Which of `holder`'s daemons holds it, as the daemon named itself when it claimed: another
+    -- daemon of the same login is another holder.
+    daemon TEXT,
     -- The claim assigned `holder` on the issue: giving it back takes that away again.
     mirrored BOOLEAN NOT NULL DEFAULT false,
     -- Which taking of the build its holder has: a call with an older one is refused.

@@ -4,4 +4,8 @@ export type ListBuilds = {
 /**
  * Only the builds the caller's login holds.
  */
-mine?: boolean, };
+mine?: boolean, 
+/**
+ * With `mine`, only those this daemon of theirs holds.
+ */
+daemon?: string, };

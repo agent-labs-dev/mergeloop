@@ -391,11 +391,15 @@ async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_build_held_from_before_without_a_pr_is_given_back_on_start() {
+async fn on_start_it_gives_back_only_the_builds_without_a_pr_that_this_daemon_holds() {
     let w = World::new().await;
+    std::fs::create_dir_all(w.workspace().join("daemon")).unwrap();
+    std::fs::write(w.workspace().join("daemon/id"), "this-one\n").unwrap();
     w.fake.seen.lock().unwrap().lane.held = vec![
-        json!({ "id": 40, "claim": 3, "pr": null }),
-        json!({ "id": 41, "claim": 2, "pr": 141 }),
+        json!({ "id": 40, "claim": 3, "pr": null, "daemon": "this-one" }),
+        json!({ "id": 41, "claim": 2, "pr": 141, "daemon": "this-one" }),
+        // The same login's other daemon, alive on another machine.
+        json!({ "id": 42, "claim": 1, "pr": null, "daemon": "another-one" }),
     ];
     let agent = w.agent("idle", "", BUILT);
 
@@ -405,7 +409,40 @@ async fn a_build_held_from_before_without_a_pr_is_given_back_on_start() {
     .await;
 
     assert_eq!(w.fake.lane(|l| l.released.clone()), [(40, None)]);
-    assert_eq!(w.fake.args_of("release_build")[0]["claim"], 3);
+    let released = &w.fake.args_of("release_build")[0];
+    assert_eq!(
+        (&released["claim"], &released["daemon"]),
+        (&json!(3), &json!("this-one"))
+    );
+    assert_eq!(w.fake.args_of("list_builds")[0]["mine"], true);
+    assert_eq!(w.fake.args_of("claim_build")[0]["daemon"], "this-one");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_names_itself_once_and_keeps_its_name() {
+    let w = World::new().await;
+    let agent = w.agent("idle", "", BUILT);
+    let claimed = |w: &World| {
+        w.fake
+            .tools()
+            .iter()
+            .filter(|t| *t == "claim_build")
+            .count()
+    };
+
+    w.run(w.config(1, &agent), |w| claimed(w) >= 1).await;
+    w.run(w.config(1, &agent), |w| claimed(w) >= 2).await;
+
+    let names: Vec<Value> = w
+        .fake
+        .args_of("claim_build")
+        .iter()
+        .map(|a| a["daemon"].clone())
+        .collect();
+    let first = names[0].as_str().expect("a claim names its daemon");
+    assert!(first.len() >= 16, "{first}");
+    assert!(names.iter().all(|n| n == first), "{names:?}");
+    assert_eq!(w.fake.args_of("list_builds")[1]["daemon"], first);
 }
 
 #[tokio::test(flavor = "multi_thread")]

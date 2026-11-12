@@ -338,7 +338,7 @@ args = []                          # more arguments for every run
 timeout_minutes = 60
 ```
 
-The workspace folder holds `repos/<owner>/<name>.git` (a clone per repo), `builds/<build>/` (a worktree per build, on its local branch), `transcripts/<build>/` (the agent's output, kept 7 days) and `tmp/`. The daemon never touches your own checkouts. A build's worktree and branch are removed when the build ends, however it ends, and on start the daemon removes whatever a crash left of builds it does not hold, and gives back the builds without a PR that your login still holds.
+The workspace folder holds `repos/<owner>/<name>.git` (a clone per repo), `builds/<build>/` (a worktree per build, on its local branch), `transcripts/<build>/` (the agent's output, kept 7 days) and `tmp/`. The daemon never touches your own checkouts. A build's worktree and branch are removed when the build ends, however it ends, and on start the daemon removes whatever a crash left of builds it does not hold, and gives back the builds without a PR that it still holds. The daemon names itself once, in `daemon/id` in its folder, and every claim carries that name: another daemon of yours, on this machine or another, holds none of its builds, and takes one only once it is given back or goes 30 minutes unheard, as anyone would.
 
 With `access = "workspace"`, the agent has full access, without prompts, inside the workspace folder, and cannot write outside it; the repo's verify commands, which the agent may have changed, run under the same rule (`sandbox-exec` on macOS, `bwrap` on Linux). The daemon passes each CLI its own confinement:
 

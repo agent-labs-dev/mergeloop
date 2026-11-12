@@ -191,6 +191,10 @@ pub struct ListBuilds {
     #[serde(default)]
     #[ts(optional)]
     pub mine: Option<bool>,
+    /// With `mine`, only those this daemon of theirs holds.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
 }
 
 pub(crate) async fn list_builds(
@@ -212,6 +216,7 @@ pub(crate) async fn list_builds(
                 b.task || b.status.held() || b.status == BuildStatus::Stuck && b.pr.is_some()
             })
             .filter(|b| !mine || (b.status.held() && b.holder.as_deref() == Some(login)))
+            .filter(|b| !mine || query.daemon.is_none() || b.daemon == query.daemon)
             .map(BuildView::from)
             .collect(),
     ))
@@ -250,20 +255,45 @@ pub struct ClaimedBuildView {
     pub pr: Option<u64>,
 }
 
+#[derive(Deserialize, Default, TS)]
+#[ts(export)]
+pub struct ClaimBuild {
+    /// Which of the caller's daemons claims: it alone holds the build, and passes the same on
+    /// every later call on it. Another daemon of the same login is another holder.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
+}
+
+/// The longest name a daemon may give itself.
+const DAEMON_MAX: usize = 64;
+
 /// Gives the caller one task in the workspace, or none.
 pub(crate) async fn claim_build(
     State(app): State<AppState>,
     caller: Caller,
     Path(id): Path<u64>,
+    body: Option<Json<ClaimBuild>>,
 ) -> Result<Json<Option<ClaimedBuildView>>, ApiError> {
     let user = caller.user()?;
     let id = user.workspace(id)?;
+    let ClaimBuild { daemon } = body.map(|Json(b)| b).unwrap_or_default();
+    let daemon = daemon.as_deref();
+    if daemon.is_some_and(|d| {
+        d.is_empty()
+            || d.len() > DAEMON_MAX
+            || !d.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return Err(ApiError::bad_request(
+            "`daemon` is up to 64 letters, digits and dashes.",
+        ));
+    }
     require_lane(&app, id).await?;
     let pushable = pushable(&app, id, user).await?;
     let login = user.login();
     let Some(claimed) = app
         .builds
-        .claim_build(id, login, &pushable, STALE_SECS)
+        .claim_build(id, login, daemon, &pushable, STALE_SECS)
         .await?
     else {
         return Ok(Json(None));
@@ -274,18 +304,25 @@ pub(crate) async fn claim_build(
         Ok(view) => Ok(Json(Some(view))),
         Err(e) => {
             // Without what it needs, the daemon cannot build it: it is a task again.
-            let holder = holder(id, build.id, login, build.claim);
+            let holder = holder(id, build.id, login, daemon, build.claim);
             app.builds.release_build(holder, None).await?;
             Err(e)
         }
     }
 }
 
-fn holder(installation_id: u64, build: u64, login: &str, claim: u64) -> Holder<'_> {
+fn holder<'a>(
+    installation_id: u64,
+    build: u64,
+    login: &'a str,
+    daemon: Option<&'a str>,
+    claim: u64,
+) -> Holder<'a> {
     Holder {
         installation_id,
         build,
         login,
+        daemon,
         claim,
     }
 }
@@ -518,6 +555,10 @@ async fn identity(app: &AppState, gh: &Installation, login: &str) -> Result<GitI
 #[ts(export)]
 pub struct HeartbeatBuild {
     pub claim: u64,
+    /// The daemon that claimed it, as `claim_build` was told.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
     #[serde(default)]
     #[ts(optional)]
     pub stage: Option<BuildStageView>,
@@ -532,7 +573,7 @@ pub(crate) async fn heartbeat_build(
     let user = caller.user()?;
     let id = user.workspace(id)?;
     require_lane(&app, id).await?;
-    let held = holder(id, build, user.login(), body.claim);
+    let held = holder(id, build, user.login(), body.daemon.as_deref(), body.claim);
     let beat = app
         .builds
         .heartbeat_build(held, body.stage.map(Into::into))
@@ -548,6 +589,10 @@ pub(crate) async fn heartbeat_build(
 #[ts(export)]
 pub struct ReleaseBuild {
     pub claim: u64,
+    /// The daemon that claimed it, as `claim_build` was told.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
     /// Marks it stuck, for this reason, which goes on the issue. Without it, the build is given
     /// back: a task again while its issue is one, and, with a PR, anyone's to take at once.
     #[serde(default)]
@@ -568,7 +613,7 @@ pub(crate) async fn release_build(
     if stuck == Some("") {
         return Err(ApiError::bad_request("Say why it is stuck."));
     }
-    let held = holder(id, build, user.login(), body.claim);
+    let held = holder(id, build, user.login(), body.daemon.as_deref(), body.claim);
     let released = app
         .builds
         .release_build(held, stuck)
@@ -617,18 +662,19 @@ fn cancelled(build: u64) -> ApiError {
     )
 }
 
-/// The live build `user` holds with `claim`, in a workspace whose lane is on.
+/// The live build `user` holds with `claim` from `daemon`, in a workspace whose lane is on.
 async fn held(
     app: &AppState,
     caller: &Caller,
     id: u64,
     build: u64,
+    daemon: Option<&str>,
     claim: u64,
 ) -> Result<(u64, Build), ApiError> {
     let user = caller.user()?;
     let id = user.workspace(id)?;
     require_lane(app, id).await?;
-    let held = holder(id, build, user.login(), claim);
+    let held = holder(id, build, user.login(), daemon, claim);
     let build = app
         .builds
         .held_build(held)
@@ -651,6 +697,10 @@ fn may_not_push(repo: &RepoName) -> ApiError {
 #[ts(export)]
 pub struct MintPushToken {
     pub claim: u64,
+    /// The daemon that claimed it, as `claim_build` was told.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
 }
 
 /// A token for the build's repo alone, that pushes and opens PRs.
@@ -672,13 +722,19 @@ pub(crate) async fn mint_push_token(
     Path((id, build)): Path<(u64, u64)>,
     Json(body): Json<MintPushToken>,
 ) -> Result<Json<PushTokenView>, ApiError> {
-    let (id, build) = held(&app, &caller, id, build, body.claim).await?;
+    let (id, build) = held(&app, &caller, id, build, body.daemon.as_deref(), body.claim).await?;
     require_heard(&build)?;
     let user = caller.user()?;
     require_push_now(&app, user, &build.repo).await?;
     let gh = installation(&app, id).await?;
     let ScopedToken { token, expires_at } = gh.push_token(&build.repo).await?;
-    let held = holder(id, build.id, user.login(), body.claim);
+    let held = holder(
+        id,
+        build.id,
+        user.login(),
+        body.daemon.as_deref(),
+        body.claim,
+    );
     still_held(&app, &gh, held, &build.repo, &token).await?;
     tracing::info!(installation = id, repo = %build.repo, issue = build.issue, login = user.login(), "minted a push token");
     Ok(Json(PushTokenView { token, expires_at }))
@@ -742,6 +798,10 @@ async fn require_push_now(
 #[ts(export)]
 pub struct OpenBuildPr {
     pub claim: u64,
+    /// The daemon that claimed it, as `claim_build` was told.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
     pub title: String,
     /// What the PR does. `Closes #<issue>` goes before it.
     pub body: String,
@@ -763,14 +823,14 @@ pub(crate) async fn open_build_pr(
     if title.is_empty() {
         return Err(ApiError::bad_request("Give the PR a title."));
     }
-    let (id, build) = held(&app, &caller, id, build, body.claim).await?;
+    let (id, build) = held(&app, &caller, id, build, body.daemon.as_deref(), body.claim).await?;
     require_heard(&build)?;
     let user = caller.user()?;
     let login = user.login();
     require_push_now(&app, user, &build.repo).await?;
     let gh = installation(&app, id).await?;
     let (settings, base) = settings(&app, &gh, id, &build.repo).await?;
-    let held = holder(id, build.id, login, body.claim);
+    let held = holder(id, build.id, login, body.daemon.as_deref(), body.claim);
     let pr = match build.pr {
         Some(pr) => still_open(&gh, &build.repo, pr).await?,
         None => {
@@ -933,6 +993,10 @@ impl From<StandingView> for Standing {
 #[ts(export)]
 pub struct ReportBuild {
     pub claim: u64,
+    /// The daemon that claimed it, as `claim_build` was told.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
     pub standing: StandingView,
 }
 
@@ -943,7 +1007,7 @@ pub(crate) async fn report_build(
     Path((id, build)): Path<(u64, u64)>,
     Json(body): Json<ReportBuild>,
 ) -> Result<Json<BuildView>, ApiError> {
-    let (id, build) = held(&app, &caller, id, build, body.claim).await?;
+    let (id, build) = held(&app, &caller, id, build, body.daemon.as_deref(), body.claim).await?;
     if build.pr.is_none() {
         return Err(ApiError::Status(
             StatusCode::CONFLICT,
@@ -967,7 +1031,7 @@ pub(crate) async fn report_build(
         ));
     }
     let login = caller.user()?.login();
-    let held = holder(id, build.id, login, body.claim);
+    let held = holder(id, build.id, login, body.daemon.as_deref(), body.claim);
     let reported = app
         .builds
         .report_build(held, standing)

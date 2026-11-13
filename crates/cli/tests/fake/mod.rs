@@ -1,5 +1,5 @@
 //! A MergeLoop server on localhost, as far as the command reaches it: the MCP client's OAuth
-//! (`crates/web/src/oauth.rs`), `/mcp` and `/auth/logout`. It keeps what it was sent, so a test
+//! with its consent page (`crates/web/src/oauth.rs`), `/mcp` and `/auth/logout`. It keeps what it was sent, so a test
 //! can say who called.
 
 #![allow(dead_code)]
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -101,6 +101,11 @@ pub struct Seen {
     /// Each one-time code: its PKCE challenge.
     codes: HashMap<String, String>,
     issued: u32,
+    /// Each registered client's name, by its id.
+    clients: HashMap<String, String>,
+    /// Each sign-in waiting on the consent page, by its request: where its answer goes, its
+    /// `state`, and its PKCE challenge.
+    asks: HashMap<String, (String, String, String)>,
 }
 
 #[derive(Clone)]
@@ -113,7 +118,9 @@ impl Server {
     pub async fn start() -> Self {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let app = Router::new()
+            .route("/oauth/register", post(register))
             .route("/oauth/authorize", get(authorize))
+            .route("/oauth/consent", post(consent))
             .route("/oauth/token", post(token))
             .route("/mcp", post(mcp))
             .route("/graphql", post(graphql))
@@ -192,8 +199,16 @@ impl Server {
 
 type Shared = State<Arc<Mutex<Seen>>>;
 
-/// As the real one: a loopback redirect, `code` with S256. GitHub's part is skipped: the user
-/// signs in at once.
+async fn register(State(seen): Shared, Json(body): Json<Value>) -> Response {
+    let mut seen = seen.lock().unwrap();
+    let id = format!("client-{}", seen.clients.len() + 1);
+    let name = body["client_name"].as_str().unwrap_or_default().to_owned();
+    seen.clients.insert(id.clone(), name);
+    (StatusCode::CREATED, Json(json!({ "client_id": id }))).into_response()
+}
+
+/// As the real one: a loopback redirect, `code` with S256, and then the consent page, which
+/// shows the client's name and its code. GitHub's part is skipped: the user signs in at once.
 async fn authorize(State(seen): Shared, Query(q): Query<HashMap<String, String>>) -> Response {
     let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
     if !redirect.starts_with("http://127.0.0.1:") {
@@ -205,11 +220,42 @@ async fn authorize(State(seen): Shared, Query(q): Query<HashMap<String, String>>
         return Redirect::to(&format!("{redirect}?error=invalid_request")).into_response();
     }
     let mut seen = seen.lock().unwrap();
+    let name = q
+        .get("client_id")
+        .and_then(|id| seen.clients.get(id))
+        .cloned()
+        .unwrap_or_default();
+    let code = match q.get("user_code") {
+        Some(code) => format!("Code: {code}. It must match the one your terminal shows."),
+        None => "No code was given.".into(),
+    };
+    let request = format!("request-{}", seen.asks.len() + 1);
+    let state = q.get("state").cloned().unwrap_or_default();
+    let challenge = q.get("code_challenge").cloned().unwrap_or_default();
+    seen.asks
+        .insert(request.clone(), (redirect, state, challenge));
+    Html(format!(
+        r#"<p>{name} asks to sign in. {code}</p><form method="post"><input type="hidden" name="request" value="{request}"></form>"#
+    ))
+    .into_response()
+}
+
+/// The page's answer: the client's code, or `access_denied`.
+async fn consent(State(seen): Shared, Form(f): Form<HashMap<String, String>>) -> Response {
+    let mut seen = seen.lock().unwrap();
+    let asked = f.get("request").and_then(|r| seen.asks.remove(r));
+    let Some((redirect, state, challenge)) = asked else {
+        return (StatusCode::FORBIDDEN, "no such request").into_response();
+    };
+    if f.get("decision").map(String::as_str) != Some("allow") {
+        return Redirect::to(&format!(
+            "{redirect}?error=access_denied&error_description=You%20denied%20the%20sign-in.&state={state}"
+        ))
+        .into_response();
+    }
     seen.issued += 1;
     let code = format!("code-{}", seen.issued);
-    let challenge = q.get("code_challenge").cloned().unwrap_or_default();
     seen.codes.insert(code.clone(), challenge);
-    let state = q.get("state").cloned().unwrap_or_default();
     Redirect::to(&format!("{redirect}?code={code}&state={state}")).into_response()
 }
 

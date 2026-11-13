@@ -291,6 +291,8 @@ claude mcp add --transport http mergeloop https://mergeloop.ai/mcp
 
 The client gets a MergeLoop session, and the GitHub token stays on the server. MergeLoop sends the sign-in back only to a loopback address, where native clients such as Claude Code, Codex and Cursor listen.
 
+Before the client gets anything, MergeLoop asks you on a page of its own: which program asks (the name it registered with, which any program can choose), what allowing it gives it (it acts as you in MergeLoop, until it goes 30 days unused), and the code the sign-in carries, if any. **Allow** sends the client its sign-in; **Deny** sends it an error. Only that page, in the browser that signed in with GitHub, can answer, once, within 5 minutes. MergeLoop never remembers a yes: any program on your machine could register under the same name.
+
 An agent without a browser, such as one in CI, passes a GitHub token instead: one from `gh auth token`, a personal access token, or a workflow's `GITHUB_TOKEN`. A fine-grained token also needs write access to issues or pull requests. MergeLoop never stores the token. It remembers its hash, in memory for 5 minutes, so calls in a row do not each ask GitHub again.
 
 Send the header `Authorization: Bearer <token>`; no OAuth flow or MergeLoop sign-in is needed. Accepted token prefixes are `ghp_`, `gho_`, `ghu_`, `ghs_` and `github_pat_`.
@@ -318,7 +320,7 @@ Each push to `main` that changes it rebuilds it, for macOS and Linux on Apple si
 
 It talks to `https://mergeloop.ai`, or `MERGELOOP_URL`, and acts as the first of: `MERGELOOP_TOKEN`, a GitHub token; the session from `mergeloop login`; the GitHub token from `gh auth token`. The `next_need` tool is the same loop, for an agent over MCP alone.
 
-`mergeloop login` signs you in to MergeLoop in the browser, through the same OAuth an MCP client uses, and keeps the session in `~/.mergeloop/session/session.json`, which only you can read. With it, `mergeloop call` reaches the tools marked **Sign-in** below, and acts as you rather than as a GitHub token. A session belongs to the server it was made on: sign in again for another `MERGELOOP_URL`. A session the server no longer takes, after 30 days unused or once GitHub stops taking your token, is an error that says to run `mergeloop login` again. `mergeloop logout` ends the session on the server and forgets it.
+`mergeloop login` signs you in to MergeLoop in the browser, through the same OAuth an MCP client uses. It prints a short code, such as `WXYZ-2345`; allow the sign-in only when the page shows the same code. It keeps the session in `~/.mergeloop/session/session.json`, which only you can read. With it, `mergeloop call` reaches the tools marked **Sign-in** below, and acts as you rather than as a GitHub token. A session belongs to the server it was made on: sign in again for another `MERGELOOP_URL`. A session the server no longer takes, after 30 days unused or once GitHub stops taking your token, is an error that says to run `mergeloop login` again. `mergeloop logout` ends the session on the server and forgets it.
 
 `mergeloop daemon` builds and lands the build lane's tasks on your machine: see [The build lane](#the-build-lane).
 
@@ -465,6 +467,8 @@ What nothing stops, in either mode:
 - **The macOS keychain.** An agent can ask it, through `security`, for what it holds, as your own programs can; a `git -c credential.helper=osxkeychain push` of a ref that exists is a network call no sandbox sees.
 - **Claude Code's temp folder.** Its shell may always write `/tmp/claude-<uid>`, which every build shares: it does not run without it.
 - **`full` access.** It lifts the confinement and the read denials alike (`--permission-mode bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`). Tools that write outside the build's folder, such as a package manager's cache in your home folder, fail under `workspace` and need it.
+
+An agent can also open your browser at a MergeLoop sign-in, as any program on your machine can. MergeLoop gives it nothing until you allow that sign-in on its page, and the page shows the code that `mergeloop login` prints, so you can tell your own sign-in from one you did not start. Allow only a sign-in you started: a yes to one you did not start gives that program a session that acts as you.
 
 The daemon prints what does not hold on your platform when it starts. The [details](#how-a-build-is-confined) below say how each part is confined.
 

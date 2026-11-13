@@ -7,10 +7,10 @@ use mergepatrol_core::Usage;
 use serde_json::Value;
 
 use crate::cli::{self, Ended};
+use crate::vote::verify_prompt;
 use crate::{
     FixRequest, Outcome, QuestionRequest, Resolution, ResolveRequest, Resolver, ReviewRequest,
     VerifyRequest, fix_prompt, gave_up, prompt, question_prompt, review_prompt,
-    vote::verify_prompt,
 };
 
 /// What the agent may use: to edit and run the repo's tools, or only to read.

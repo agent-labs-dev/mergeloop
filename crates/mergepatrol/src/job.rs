@@ -188,15 +188,21 @@ async fn run(spec: &JobSpec, dir: &Path, out: &Path, events: &mut Vec<JobEvent>)
         }
     }
     git.checkout_detached(dir, &spec.head_sha).await?;
-    let checks = checks_for(spec, dir, events).await;
-
     let resolver = resolver(&spec.resolver);
-    let resolver = resolver.as_ref();
+    let job = Job {
+        spec,
+        git,
+        resolver: resolver.as_ref(),
+        checks: checks_for(spec, dir, events).await,
+        dir,
+        out,
+    };
+    let git = &job.git;
 
     // The bundle holds the commits on top of what the orchestrator already has.
     let (exclude, done) = match &spec.task {
         Task::Rebase => {
-            update(spec, &git, resolver, &checks, dir, out, events).await?;
+            job.update(events).await?;
             let tree = |rev: &str| format!("{rev}^{{tree}}");
             if git.rev_parse(dir, &tree("HEAD")).await?
                 == git.rev_parse(dir, &tree(&spec.trunk_sha)).await?
@@ -209,19 +215,7 @@ async fn run(spec: &JobSpec, dir: &Path, out: &Path, events: &mut Vec<JobEvent>)
             (&spec.trunk_sha, "rebased")
         }
         Task::FixChecks { failures } => {
-            let names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
-            let what = names.join(", ");
-            fix(
-                spec,
-                &git,
-                resolver,
-                &checks,
-                (failures, &what),
-                dir,
-                out,
-                events,
-            )
-            .await?;
+            job.fix(failures, events).await?;
             (&spec.head_sha, "fixed")
         }
         // These return what the agent said, not code.
@@ -232,20 +226,20 @@ async fn run(spec: &JobSpec, dir: &Path, out: &Path, events: &mut Vec<JobEvent>)
             reviewed,
             depth,
         } => {
-            let earlier = (answered.as_slice(), sent_back.as_slice(), *depth);
-            let since = (since.as_deref(), reviewed.as_deref());
-            return review(
-                spec, &git, resolver, &checks, earlier, since, dir, out, events,
-            )
-            .await;
+            let earlier = Earlier {
+                answered,
+                sent_back,
+                since: since.as_deref(),
+                reviewed: reviewed.as_deref(),
+            };
+            return job.review(&earlier, *depth, events).await;
         }
         Task::Question {
             finding,
             question,
             sent_back,
         } => {
-            let q = (finding.as_ref(), question.as_str(), *sent_back);
-            return answer(spec, &git, resolver, q, dir, out, events).await;
+            return job.answer(finding, question, *sent_back, events).await;
         }
     };
 
@@ -287,207 +281,205 @@ fn resolver(spec: &ResolverSpec) -> Box<dyn Resolver> {
     }
 }
 
-/// Brings the PR up to date with `trunk_sha`, as `spec.update` asks: replays its commits, or
-/// merges the base in. A branch that keeps up by merging already resolves what a replay of its
-/// commits would conflict in again, commit by commit.
-async fn update(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    checks: &Verify,
-    dir: &Path,
-    out: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let (trunk, head) = (&spec.trunk_sha, &spec.head_sha);
-    let merge = match spec.update {
-        Update::Rebase => false,
-        Update::Merge => true,
-        Update::Either => git.has_merges(dir, trunk, head).await?,
-    };
-    if merge {
-        return merge_in(spec, git, resolver, checks, dir, out, events).await;
-    }
-    let step = git.rebase(dir, trunk, spec.upstream.as_deref()).await?;
-    if matches!(step, RebaseStep::Conflict { .. })
-        && spec.update == Update::Either
-        && git.merges_cleanly(dir, trunk, head).await?
-    {
-        git.rebase_abort(dir).await?;
-        event(
-            events,
-            "merging-base",
-            "the rebase conflicts and a merge does not: merging",
-        );
-        return merge_in(spec, git, resolver, checks, dir, out, events).await;
-    }
-    rebase(spec, git, resolver, checks, dir, out, events, step).await
+/// A job at work: the spec it runs, in its checkout `dir`, with the agent and the checks the agent
+/// runs. What it leaves the orchestrator goes in `out`, and what happened in the job's events.
+struct Job<'a> {
+    spec: &'a JobSpec,
+    git: Git,
+    resolver: &'a dyn Resolver,
+    checks: Verify,
+    dir: &'a Path,
+    out: &'a Path,
 }
 
-/// Merges `trunk_sha` into the PR head, with the agent on its conflicts, once.
-async fn merge_in(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    checks: &Verify,
-    dir: &Path,
-    out: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let base = spec.base_ref.as_deref().unwrap_or(&spec.trunk);
-    let branch = spec.head_ref.strip_prefix("refs/heads/");
-    let message = match branch {
-        Some(branch) => format!("Merge {base} into {branch}\n\n{UPDATED_BY}"),
-        None => format!("Merge {base}\n\n{UPDATED_BY}"),
-    };
-    let files = git.merge(dir, &spec.trunk_sha, &message).await?;
-    if files.is_empty() {
-        event(events, "base-merged", &spec.trunk_sha);
-        return Ok(());
-    }
-    let transcript = out
-        .join("transcripts")
-        .join(format!("merge-{}.jsonl", &spec.trunk_sha[..12]));
-    resolve(
-        spec,
-        git,
-        resolver,
-        checks,
-        dir,
-        &files,
-        Stopped::Merge,
-        &transcript,
-        events,
-    )
-    .await?;
-    git.commit_merge(
-        dir,
-        &message,
-        &format!("{RESOLVED_BY}, {}", resolver.name()),
-    )
-    .await?;
-    verify(spec, dir, events, "the resolution").await
+/// What a review goes on from, as `Task::Review` carries it: what humans answered on earlier
+/// heads, what the last review sent back, the approved head `since` (only what the queue's agent
+/// changed after it needs reading), and the head `sent_back` went back on, `reviewed`.
+#[derive(Default)]
+struct Earlier<'a> {
+    answered: &'a [Answered],
+    sent_back: &'a [SentBack],
+    since: Option<&'a str>,
+    reviewed: Option<&'a str>,
 }
 
-/// Replays the PR's commits from `step`, where `git.rebase` left off, with the agent on each
-/// commit that conflicts.
-#[allow(clippy::too_many_arguments)]
-async fn rebase(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    checks: &Verify,
-    dir: &Path,
-    out: &Path,
-    events: &mut Vec<JobEvent>,
-    mut step: RebaseStep,
-) -> Result<()> {
-    let mut resolved_any = false;
-    while let RebaseStep::Conflict { commit, files } = step {
-        let commit_message = git.commit_message(dir, &commit).await?;
+impl Job<'_> {
+    /// Brings the PR up to date with `trunk_sha`, as `spec.update` asks: replays its commits, or
+    /// merges the base in. A branch that keeps up by merging already resolves what a replay of its
+    /// commits would conflict in again, commit by commit.
+    async fn update(&self, events: &mut Vec<JobEvent>) -> Result<()> {
+        let Self {
+            spec, ref git, dir, ..
+        } = *self;
+        let (trunk, head) = (&spec.trunk_sha, &spec.head_sha);
+        let merge = match spec.update {
+            Update::Rebase => false,
+            Update::Merge => true,
+            Update::Either => git.has_merges(dir, trunk, head).await?,
+        };
+        if merge {
+            return self.merge_in(events).await;
+        }
+        let step = git.rebase(dir, trunk, spec.upstream.as_deref()).await?;
+        if matches!(step, RebaseStep::Conflict { .. })
+            && spec.update == Update::Either
+            && git.merges_cleanly(dir, trunk, head).await?
+        {
+            git.rebase_abort(dir).await?;
+            event(
+                events,
+                "merging-base",
+                "the rebase conflicts and a merge does not: merging",
+            );
+            return self.merge_in(events).await;
+        }
+        self.rebase(step, events).await
+    }
+
+    /// Merges `trunk_sha` into the PR head, with the agent on its conflicts, once.
+    async fn merge_in(&self, events: &mut Vec<JobEvent>) -> Result<()> {
+        let Self {
+            spec,
+            ref git,
+            resolver,
+            dir,
+            out,
+            ..
+        } = *self;
+        let base = spec.base_ref.as_deref().unwrap_or(&spec.trunk);
+        let branch = spec.head_ref.strip_prefix("refs/heads/");
+        let message = match branch {
+            Some(branch) => format!("Merge {base} into {branch}\n\n{UPDATED_BY}"),
+            None => format!("Merge {base}\n\n{UPDATED_BY}"),
+        };
+        let files = git.merge(dir, &spec.trunk_sha, &message).await?;
+        if files.is_empty() {
+            event(events, "base-merged", &spec.trunk_sha);
+            return Ok(());
+        }
         let transcript = out
             .join("transcripts")
-            .join(format!("{}.jsonl", &commit[..12]));
-        let stopped = Stopped::Replay {
-            commit_message: &commit_message,
-        };
-        resolve(
-            spec,
-            git,
-            resolver,
-            checks,
+            .join(format!("merge-{}.jsonl", &spec.trunk_sha[..12]));
+        self.resolve(&files, Stopped::Merge, &transcript, events)
+            .await?;
+        git.commit_merge(
             dir,
-            &files,
-            stopped,
-            &transcript,
-            events,
+            &message,
+            &format!("{RESOLVED_BY}, {}", resolver.name()),
         )
         .await?;
-        resolved_any = true;
-        step = git
-            .continue_resolution(dir, &format!("{RESOLVED_BY}, {}", resolver.name()))
-            .await?;
+        self.verify("the resolution", events).await
     }
 
-    if resolved_any {
-        verify(spec, dir, events, "the resolution").await?;
-    }
-    Ok(())
-}
-
-/// Has the agent resolve the conflict in `files`, where a rebase or merge `stopped`, and
-/// checks what it left: HEAD where it was, and no conflict markers.
-#[allow(clippy::too_many_arguments)]
-async fn resolve(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    checks: &Verify,
-    dir: &Path,
-    files: &[String],
-    stopped: Stopped<'_>,
-    transcript: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    event(events, "conflict", files.join(", "));
-    if spec.leave_conflicts {
-        bail!("{LEFT_CONFLICT} in {}", files.join(", "));
-    }
-    if spec.resolver.api.is_none() {
-        let files = files.join(", ");
-        let credential = spec.resolver.provider.credential();
-        match &spec.resolver.settings_url {
-            Some(url) => bail!(
-                "it conflicts in {files}, and the workspace has no {credential} for an agent to resolve that: add one in the dashboard's settings, {url}"
-            ),
-            None => bail!(
-                "it conflicts in {files}, and the job has no {credential} for an agent to resolve that"
-            ),
+    /// Replays the PR's commits from `step`, where `git.rebase` left off, with the agent on each
+    /// commit that conflicts.
+    async fn rebase(&self, mut step: RebaseStep, events: &mut Vec<JobEvent>) -> Result<()> {
+        let Self {
+            ref git,
+            resolver,
+            dir,
+            out,
+            ..
+        } = *self;
+        let mut resolved_any = false;
+        while let RebaseStep::Conflict { commit, files } = step {
+            let commit_message = git.commit_message(dir, &commit).await?;
+            let transcript = out
+                .join("transcripts")
+                .join(format!("{}.jsonl", &commit[..12]));
+            let stopped = Stopped::Replay {
+                commit_message: &commit_message,
+            };
+            self.resolve(&files, stopped, &transcript, events).await?;
+            resolved_any = true;
+            step = git
+                .continue_resolution(dir, &format!("{RESOLVED_BY}, {}", resolver.name()))
+                .await?;
         }
+
+        if resolved_any {
+            self.verify("the resolution", events).await?;
+        }
+        Ok(())
     }
-    let stopped_at = git.rev_parse(dir, "HEAD").await?;
-    let run = resolver
-        .resolve(ResolveRequest {
-            workdir: dir,
-            conflicted_files: files,
-            pr_title: &spec.pr_title,
-            pr_body: &spec.pr_body,
-            stopped,
-            trunk: &spec.trunk,
-            verify: checks,
-            transcript,
-        })
-        .await
-        .map_err(|e| anyhow!("the resolver failed: {e:#}"))?;
-    let done = run.outcome == Outcome::Resolved;
-    spent(
-        events,
-        &spec.resolver,
-        SpendTask::Rebase,
-        done,
-        files.join(", "),
-        &run,
-    );
-    match run.outcome {
-        Outcome::Resolved => {}
-        Outcome::GaveUp(reason) => bail!("the resolver gave up: {reason}"),
-        Outcome::Failed(why) => bail!("the resolver failed: {why}"),
-    }
-    if git.rev_parse(dir, "HEAD").await? != stopped_at {
-        bail!("the agent moved HEAD");
-    }
-    for f in files {
-        let content = tokio::fs::read_to_string(dir.join(f))
+
+    /// Has the agent resolve the conflict in `files`, where a rebase or merge `stopped`, and
+    /// checks what it left: HEAD where it was, and no conflict markers.
+    async fn resolve(
+        &self,
+        files: &[String],
+        stopped: Stopped<'_>,
+        transcript: &Path,
+        events: &mut Vec<JobEvent>,
+    ) -> Result<()> {
+        let Self {
+            spec,
+            ref git,
+            resolver,
+            ref checks,
+            dir,
+            ..
+        } = *self;
+        event(events, "conflict", files.join(", "));
+        if spec.leave_conflicts {
+            bail!("{LEFT_CONFLICT} in {}", files.join(", "));
+        }
+        if spec.resolver.api.is_none() {
+            let files = files.join(", ");
+            let credential = spec.resolver.provider.credential();
+            match &spec.resolver.settings_url {
+                Some(url) => bail!(
+                    "it conflicts in {files}, and the workspace has no {credential} for an agent to resolve that: add one in the dashboard's settings, {url}"
+                ),
+                None => bail!(
+                    "it conflicts in {files}, and the job has no {credential} for an agent to resolve that"
+                ),
+            }
+        }
+        let stopped_at = git.rev_parse(dir, "HEAD").await?;
+        let run = resolver
+            .resolve(ResolveRequest {
+                workdir: dir,
+                conflicted_files: files,
+                pr_title: &spec.pr_title,
+                pr_body: &spec.pr_body,
+                stopped,
+                trunk: &spec.trunk,
+                verify: checks,
+                transcript,
+            })
             .await
-            .unwrap_or_default();
-        if content
-            .lines()
-            .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> "))
-        {
-            bail!("conflict markers are left in {f}");
+            .map_err(|e| anyhow!("the resolver failed: {e:#}"))?;
+        let done = run.outcome == Outcome::Resolved;
+        spent(
+            events,
+            &spec.resolver,
+            SpendTask::Rebase,
+            done,
+            files.join(", "),
+            &run,
+        );
+        match run.outcome {
+            Outcome::Resolved => {}
+            Outcome::GaveUp(reason) => bail!("the resolver gave up: {reason}"),
+            Outcome::Failed(why) => bail!("the resolver failed: {why}"),
         }
+        if git.rev_parse(dir, "HEAD").await? != stopped_at {
+            bail!("the agent moved HEAD");
+        }
+        for f in files {
+            let content = tokio::fs::read_to_string(dir.join(f))
+                .await
+                .unwrap_or_default();
+            if content
+                .lines()
+                .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> "))
+            {
+                bail!("conflict markers are left in {f}");
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// How a rebase's failure starts when it stopped at a conflict, as `leave_conflicts` asks.
@@ -501,156 +493,178 @@ pub(crate) const GAVE_UP: &str = "the agent gave up";
 /// title the agent proposes: a job cannot set it.
 pub(crate) const RETITLED: &str = "the agent proposes the title: ";
 
-/// Has the agent fix the failed checks, and commits its fix on top of the PR head.
-#[allow(clippy::too_many_arguments)]
-async fn fix(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    checks: &Verify,
-    (failures, what): (&[CheckFailure], &str),
-    dir: &Path,
-    out: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let transcript = out
-        .join("transcripts")
-        .join(format!("fix-{}.jsonl", &spec.head_sha[..12]));
-    let run = resolver
-        .fix(FixRequest {
-            workdir: dir,
-            failures,
-            pr_title: &spec.pr_title,
-            pr_body: &spec.pr_body,
-            trunk: &spec.trunk,
-            verify: checks,
-            transcript: &transcript,
-        })
-        .await
-        .map_err(|e| anyhow!("the agent failed: {e:#}"))?;
-    let title = match run.outcome {
-        Outcome::Resolved => new_title(&run.text),
-        _ => None,
-    };
-    // A fix is done once it is committed: until then, any failure leaves it unfixed.
-    let fixed = match &title {
-        Some(title) => Err(anyhow!("{RETITLED}{title}")),
-        None => {
-            let subject = commit_subject(&run.text).unwrap_or_else(|| format!("Fix {what}"));
-            commit_fix(spec, git, resolver, (&run.outcome, &subject), dir, events).await
-        }
-    };
-    spent(
-        events,
-        &spec.resolver,
-        SpendTask::Fix,
-        fixed.is_ok() || title.is_some(),
-        String::new(),
-        &run,
-    );
-    fixed
-}
-
-/// Checks the agent's fix, and commits it with `subject`.
-async fn commit_fix(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    (outcome, subject): (&Outcome, &str),
-    dir: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    match outcome {
-        Outcome::Resolved => {}
-        Outcome::GaveUp(reason) => bail!("{GAVE_UP}: {reason}"),
-        Outcome::Failed(why) => bail!("the agent failed: {why}"),
-    }
-    if git.rev_parse(dir, "HEAD").await? != spec.head_sha {
-        bail!("the agent moved HEAD");
-    }
-    if !git.is_dirty(dir).await? {
-        bail!("the agent changed nothing");
-    }
-    // The fix's new files are those there before MergeLoop's own checks run, which may leave some.
-    let new = git.untracked_files(dir).await?;
-    verify(spec, dir, events, "the fix").await?;
-    let message = format!("{subject}\n\n{FIXED_BY}, {}", resolver.name());
-    git.commit(dir, &new, &message).await
-}
-
 /// How many lines of context a finding's code shows around what it is about.
 const CODE_CONTEXT: u32 = 3;
 /// The most lines of code a finding carries: a hunk can be long.
 const CODE_LINES: usize = 24;
 
-/// Has the agent review the PR, and writes what it found, each finding with its code.
-#[allow(clippy::too_many_arguments)]
-async fn review(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    checks: &Verify,
-    (answered, sent_back, depth): (&[Answered], &[SentBack], Depth),
-    (since, reviewed): (Option<&str>, Option<&str>),
-    dir: &Path,
-    out: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let base = git.merge_base(dir, &spec.trunk_sha, &spec.head_sha).await?;
-    let queue_commits = queue_commits(git, dir, &spec.head_sha, &base, since).await?;
-    let reviewed = since_reviewed(git, dir, spec, &base, reviewed).await?;
-    event(events, "reviewing", reviewing(&base, &spec.head_sha, depth));
-    let bench = Bench {
-        git,
-        dir,
-        head: &spec.head_sha,
-    };
-    let review_in = |workdir: PathBuf, name: String| {
+impl Job<'_> {
+    /// Has the agent fix the failed checks, and commits its fix on top of the PR head.
+    async fn fix(&self, failures: &[CheckFailure], events: &mut Vec<JobEvent>) -> Result<()> {
+        let Self {
+            spec,
+            resolver,
+            ref checks,
+            dir,
+            out,
+            ..
+        } = *self;
         let transcript = out
             .join("transcripts")
-            .join(format!("{name}-{}.jsonl", &spec.head_sha[..12]));
-        let (base, scope) = (base.as_str(), Scope::of(&queue_commits, reviewed));
-        async move {
-            let req = ReviewRequest {
-                workdir: &workdir,
-                base,
+            .join(format!("fix-{}.jsonl", &spec.head_sha[..12]));
+        let run = resolver
+            .fix(FixRequest {
+                workdir: dir,
+                failures,
                 pr_title: &spec.pr_title,
                 pr_body: &spec.pr_body,
                 trunk: &spec.trunk,
-                below: spec.base_ref.as_deref(),
-                answered,
-                sent_back,
-                scope,
-                depth,
                 verify: checks,
                 transcript: &transcript,
-            };
-            reviewed_by(git, resolver, req, &spec.head_sha).await
-        }
-    };
-    let ran = bench.reviewers(depth.reviewers(), review_in).await?;
-    let mut output = merged(&spec.resolver, ran, events)?;
-    let panel = (spec, resolver, base.as_str());
-    check_findings(panel, &bench, out, depth, &mut output.findings, events).await?;
-    tokio::fs::write(out.join(REVIEW_FILE), serde_json::to_vec_pretty(&output)?).await?;
-    Ok(())
-}
+            })
+            .await
+            .map_err(|e| anyhow!("the agent failed: {e:#}"))?;
+        let title = match run.outcome {
+            Outcome::Resolved => new_title(&run.text),
+            _ => None,
+        };
+        // A fix is done once it is committed: until then, any failure leaves it unfixed.
+        let fixed = match &title {
+            Some(title) => Err(anyhow!("{RETITLED}{title}")),
+            None => {
+                let subject = commit_subject(&run.text).unwrap_or_else(|| {
+                    let names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
+                    format!("Fix {}", names.join(", "))
+                });
+                self.commit_fix(&run.outcome, &subject, events).await
+            }
+        };
+        spent(
+            events,
+            &spec.resolver,
+            SpendTask::Fix,
+            fixed.is_ok() || title.is_some(),
+            String::new(),
+            &run,
+        );
+        fixed
+    }
 
-/// Backs what the agent found with what MergeLoop saw itself: the code at each place, each
-/// change's evidence run on the head, and a panel's votes on a change without any, of a kind
-/// `depth` votes on.
-async fn check_findings(
-    panel: (&JobSpec, &dyn Resolver, &str),
-    bench: &Bench<'_>,
-    out: &Path,
-    depth: Depth,
-    findings: &mut [Finding],
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let Bench { git, dir, head } = *bench;
-    with_code(git, dir, panel.2, head, findings).await?;
-    check_evidence(head, git, dir, findings, events).await?;
-    verify_findings(panel, bench, out, depth, findings, events).await
+    /// Checks the agent's fix, and commits it with `subject`.
+    async fn commit_fix(
+        &self,
+        outcome: &Outcome,
+        subject: &str,
+        events: &mut Vec<JobEvent>,
+    ) -> Result<()> {
+        let Self {
+            spec,
+            ref git,
+            resolver,
+            dir,
+            ..
+        } = *self;
+        match outcome {
+            Outcome::Resolved => {}
+            Outcome::GaveUp(reason) => bail!("{GAVE_UP}: {reason}"),
+            Outcome::Failed(why) => bail!("the agent failed: {why}"),
+        }
+        if git.rev_parse(dir, "HEAD").await? != spec.head_sha {
+            bail!("the agent moved HEAD");
+        }
+        if !git.is_dirty(dir).await? {
+            bail!("the agent changed nothing");
+        }
+        // The fix's new files are those there before MergeLoop's own checks run, which may leave some.
+        let new = git.untracked_files(dir).await?;
+        self.verify("the fix", events).await?;
+        let message = format!("{subject}\n\n{FIXED_BY}, {}", resolver.name());
+        git.commit(dir, &new, &message).await
+    }
+
+    /// Has the agent review the PR, and writes what it found, each finding with its code.
+    async fn review(
+        &self,
+        earlier: &Earlier<'_>,
+        depth: Depth,
+        events: &mut Vec<JobEvent>,
+    ) -> Result<()> {
+        let Self {
+            spec,
+            ref git,
+            resolver,
+            ref checks,
+            dir,
+            out,
+            ..
+        } = *self;
+        let Earlier {
+            answered,
+            sent_back,
+            since,
+            reviewed,
+        } = *earlier;
+        let base = git.merge_base(dir, &spec.trunk_sha, &spec.head_sha).await?;
+        let queue_commits = queue_commits(git, dir, &spec.head_sha, &base, since).await?;
+        let reviewed = since_reviewed(git, dir, spec, &base, reviewed).await?;
+        event(events, "reviewing", reviewing(&base, &spec.head_sha, depth));
+        let bench = self.bench();
+        let review_in = |workdir: PathBuf, name: String| {
+            let transcript = out
+                .join("transcripts")
+                .join(format!("{name}-{}.jsonl", &spec.head_sha[..12]));
+            let (base, scope) = (base.as_str(), Scope::of(&queue_commits, reviewed));
+            async move {
+                let req = ReviewRequest {
+                    workdir: &workdir,
+                    base,
+                    pr_title: &spec.pr_title,
+                    pr_body: &spec.pr_body,
+                    trunk: &spec.trunk,
+                    below: spec.base_ref.as_deref(),
+                    answered,
+                    sent_back,
+                    scope,
+                    depth,
+                    verify: checks,
+                    transcript: &transcript,
+                };
+                reviewed_by(git, resolver, req, &spec.head_sha).await
+            }
+        };
+        let ran = bench.reviewers(depth.reviewers(), review_in).await?;
+        let mut output = merged(&spec.resolver, ran, events)?;
+        self.check_findings(&base, depth, &mut output.findings, events)
+            .await?;
+        tokio::fs::write(out.join(REVIEW_FILE), serde_json::to_vec_pretty(&output)?).await?;
+        Ok(())
+    }
+
+    /// Backs what the agent found with what MergeLoop saw itself: the code at each place, each
+    /// change's evidence run on the head, and a panel's votes on a change without any, of a kind
+    /// `depth` votes on.
+    async fn check_findings(
+        &self,
+        base: &str,
+        depth: Depth,
+        findings: &mut [Finding],
+        events: &mut Vec<JobEvent>,
+    ) -> Result<()> {
+        let Self { ref git, dir, .. } = *self;
+        let head = &self.spec.head_sha;
+        with_code(git, dir, base, head, findings).await?;
+        check_evidence(head, git, dir, findings, events).await?;
+        self.verify_findings(base, depth, findings, events).await
+    }
+
+    /// Where a panel's agents sit: in worktrees of the PR's head, off the job's checkout.
+    fn bench(&self) -> Bench<'_> {
+        Bench {
+            git: &self.git,
+            dir: self.dir,
+            head: &self.spec.head_sha,
+        }
+    }
 }
 
 /// What the review reads, and how hard it looks: `abc..def at deep: 3 reviewers`.
@@ -794,50 +808,58 @@ async fn on_head<'a>(
     Ok(git.is_ancestor(dir, at, head).await?.then_some(at))
 }
 
-/// Has the agent answer a human's question about a finding, and writes the answer.
-#[allow(clippy::too_many_arguments)]
-async fn answer(
-    spec: &JobSpec,
-    git: &Git,
-    resolver: &dyn Resolver,
-    (finding, question, sent_back): (&Finding, &str, bool),
-    dir: &Path,
-    out: &Path,
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let base = git.merge_base(dir, &spec.trunk_sha, &spec.head_sha).await?;
-    let transcript = out
-        .join("transcripts")
-        .join(format!("question-{}.jsonl", &spec.head_sha[..12]));
-    let run = resolver
-        .question(QuestionRequest {
-            workdir: dir,
-            base: &base,
-            pr_title: &spec.pr_title,
-            finding,
-            question,
-            sent_back,
-            transcript: &transcript,
-        })
-        .await
-        .map_err(|e| anyhow!("the agent failed: {e:#}"))?;
-    let done = run.outcome == Outcome::Resolved && !run.text.trim().is_empty();
-    spent(
-        events,
-        &spec.resolver,
-        SpendTask::Review,
-        done,
-        String::new(),
-        &run,
-    );
-    match &run.outcome {
-        Outcome::Failed(why) => bail!("the agent failed: {why}"),
-        Outcome::GaveUp(why) => bail!("the agent gave up: {why}"),
-        Outcome::Resolved if !done => bail!("the agent answered nothing"),
-        Outcome::Resolved => {}
+impl Job<'_> {
+    /// Has the agent answer a question about a finding, and writes the answer. `sent_back`: the
+    /// finding went back to the author, and this is their reply, which it may withdraw on.
+    async fn answer(
+        &self,
+        finding: &Finding,
+        question: &str,
+        sent_back: bool,
+        events: &mut Vec<JobEvent>,
+    ) -> Result<()> {
+        let Self {
+            spec,
+            ref git,
+            resolver,
+            dir,
+            out,
+            ..
+        } = *self;
+        let base = git.merge_base(dir, &spec.trunk_sha, &spec.head_sha).await?;
+        let transcript = out
+            .join("transcripts")
+            .join(format!("question-{}.jsonl", &spec.head_sha[..12]));
+        let run = resolver
+            .question(QuestionRequest {
+                workdir: dir,
+                base: &base,
+                pr_title: &spec.pr_title,
+                finding,
+                question,
+                sent_back,
+                transcript: &transcript,
+            })
+            .await
+            .map_err(|e| anyhow!("the agent failed: {e:#}"))?;
+        let done = run.outcome == Outcome::Resolved && !run.text.trim().is_empty();
+        spent(
+            events,
+            &spec.resolver,
+            SpendTask::Review,
+            done,
+            String::new(),
+            &run,
+        );
+        match &run.outcome {
+            Outcome::Failed(why) => bail!("the agent failed: {why}"),
+            Outcome::GaveUp(why) => bail!("the agent gave up: {why}"),
+            Outcome::Resolved if !done => bail!("the agent answered nothing"),
+            Outcome::Resolved => {}
+        }
+        tokio::fs::write(out.join(ANSWER_FILE), run.text.trim()).await?;
+        Ok(())
     }
-    tokio::fs::write(out.join(ANSWER_FILE), run.text.trim()).await?;
-    Ok(())
 }
 
 /// The most findings a review keeps, so its summary fits GitHub.
@@ -1106,64 +1128,72 @@ impl Bench<'_> {
     }
 }
 
-/// Has a panel of fresh agents check each finding that only the reviewer's word shows, and keeps
-/// their votes: what the reviewer wrote of votes counts for nothing.
-async fn verify_findings(
-    (spec, resolver, base): (&JobSpec, &dyn Resolver, &str),
-    bench: &Bench<'_>,
-    out: &Path,
-    depth: Depth,
-    findings: &mut [Finding],
-    events: &mut Vec<JobEvent>,
-) -> Result<()> {
-    let panel = Panel::FINDING;
-    for f in findings.iter_mut() {
-        f.verified = None;
-        if !f.wants_votes(depth) {
-            continue;
-        }
-        let claim = claim(f);
-        let id = f.id.as_str();
-        let runs = bench
-            .seat(panel.seats, |seat, workdir| {
-                let transcript = out
-                    .join("transcripts")
-                    .join(format!("verify-{id}-{seat}-{}.jsonl", &spec.head_sha[..12]));
-                let claim = claim.as_str();
-                async move {
-                    let req = VerifyRequest {
-                        workdir: &workdir,
-                        base,
-                        pr_title: &spec.pr_title,
-                        claim,
-                        transcript: &transcript,
-                    };
-                    resolver.verify(req).await
-                }
-            })
-            .await?;
-        let votes = runs.into_iter().map(|run| match run {
-            Err(e) => abstain(format!("the agent failed: {e:#}")),
-            Ok(run) => {
-                let vote = cast(&run);
-                let done = vote.verdict != Verdict::Abstained;
-                spent(
-                    events,
-                    &spec.resolver,
-                    SpendTask::Review,
-                    done,
-                    String::new(),
-                    &run,
-                );
-                vote
+impl Job<'_> {
+    /// Has a panel of fresh agents check each finding that only the reviewer's word shows, and keeps
+    /// their votes: what the reviewer wrote of votes counts for nothing.
+    async fn verify_findings(
+        &self,
+        base: &str,
+        depth: Depth,
+        findings: &mut [Finding],
+        events: &mut Vec<JobEvent>,
+    ) -> Result<()> {
+        let Self {
+            spec,
+            resolver,
+            out,
+            ..
+        } = *self;
+        let bench = self.bench();
+        let panel = Panel::FINDING;
+        for f in findings.iter_mut() {
+            f.verified = None;
+            if !f.wants_votes(depth) {
+                continue;
             }
-        });
-        let verified = panel.verdict(votes.collect());
-        let held = format!("{}: {} of {} hold", f.id, verified.holds(), panel.seats);
-        event(events, "verified", held);
-        f.verified = Some(verified);
+            let claim = claim(f);
+            let id = f.id.as_str();
+            let runs = bench
+                .seat(panel.seats, |seat, workdir| {
+                    let transcript = out
+                        .join("transcripts")
+                        .join(format!("verify-{id}-{seat}-{}.jsonl", &spec.head_sha[..12]));
+                    let claim = claim.as_str();
+                    async move {
+                        let req = VerifyRequest {
+                            workdir: &workdir,
+                            base,
+                            pr_title: &spec.pr_title,
+                            claim,
+                            transcript: &transcript,
+                        };
+                        resolver.verify(req).await
+                    }
+                })
+                .await?;
+            let votes = runs.into_iter().map(|run| match run {
+                Err(e) => abstain(format!("the agent failed: {e:#}")),
+                Ok(run) => {
+                    let vote = cast(&run);
+                    let done = vote.verdict != Verdict::Abstained;
+                    spent(
+                        events,
+                        &spec.resolver,
+                        SpendTask::Review,
+                        done,
+                        String::new(),
+                        &run,
+                    );
+                    vote
+                }
+            });
+            let verified = panel.verdict(votes.collect());
+            let held = format!("{}: {} of {} hold", f.id, verified.holds(), panel.seats);
+            event(events, "verified", held);
+            f.verified = Some(verified);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// A verifier's vote, from how its run ended: one that broke or gave up abstains.
@@ -1256,19 +1286,21 @@ async fn run_command(dir: &Path, cmd: &str) -> Result<Ran> {
     })
 }
 
-/// Runs the repo's verify commands, which must pass after `what` the agent did.
-async fn verify(spec: &JobSpec, dir: &Path, events: &mut Vec<JobEvent>, what: &str) -> Result<()> {
-    for cmd in &spec.verify {
-        event(events, "verify", cmd.as_str());
-        let ran = run_command(dir, cmd).await?;
-        if ran.timed_out {
-            bail!("`{cmd}` timed out");
+impl Job<'_> {
+    /// Runs the repo's verify commands, which must pass after `what` the agent did.
+    async fn verify(&self, what: &str, events: &mut Vec<JobEvent>) -> Result<()> {
+        for cmd in &self.spec.verify {
+            event(events, "verify", cmd.as_str());
+            let ran = run_command(self.dir, cmd).await?;
+            if ran.timed_out {
+                bail!("`{cmd}` timed out");
+            }
+            if !ran.passed {
+                bail!("`{cmd}` failed after {what}:\n```\n{}\n```", ran.tail);
+            }
         }
-        if !ran.passed {
-            bail!("`{cmd}` failed after {what}:\n```\n{}\n```", ran.tail);
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1488,23 +1520,19 @@ mod tests {
             ],
             seen: Default::default(),
         };
-        let bench = Bench {
-            git: &Git,
-            dir: &dir,
-            head: &head,
-        };
         let mut events = Vec::new();
         let out = tmp.path().join("out");
-        verify_findings(
-            (&spec, &panelist, "base"),
-            &bench,
-            &out,
-            Depth::Standard,
-            &mut findings,
-            &mut events,
-        )
-        .await
-        .unwrap();
+        let job = Job {
+            spec: &spec,
+            git: Git,
+            resolver: &panelist,
+            checks: Verify::None,
+            dir: &dir,
+            out: &out,
+        };
+        job.verify_findings("base", Depth::Standard, &mut findings, &mut events)
+            .await
+            .unwrap();
 
         let seen = panelist.seen.into_inner().unwrap();
         assert_eq!(seen.len(), 3, "only the security change is checked");
@@ -1672,19 +1700,17 @@ mod tests {
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
         let mut events = Vec::new();
-        review(
-            &spec,
-            &Git,
-            &reviewers,
-            &Verify::None,
-            (&[], &[], Depth::Deep),
-            (None, None),
-            &dir,
-            &out,
-            &mut events,
-        )
-        .await
-        .unwrap();
+        let job = Job {
+            spec: &spec,
+            git: Git,
+            resolver: &reviewers,
+            checks: Verify::None,
+            dir: &dir,
+            out: &out,
+        };
+        job.review(&Earlier::default(), Depth::Deep, &mut events)
+            .await
+            .unwrap();
 
         let seen = reviewers.seen.into_inner().unwrap();
         assert_eq!(seen.len(), 3, "three reviewers");

@@ -10,6 +10,7 @@ mod chatgpt;
 mod claude;
 mod cli;
 mod codex;
+mod group;
 mod keys;
 mod local;
 mod review;
@@ -22,6 +23,7 @@ pub use chatgpt::testing;
 pub use chatgpt::{ChatGptAuth, ChatGptLogin, DeviceLogin};
 pub use claude::ClaudeResolver;
 pub use codex::CodexResolver;
+pub use group::Group;
 pub use keys::{KeyCheck, check_api_key};
 pub use local::{Access, Env, LocalAgent, Room, Vendor};
 pub use review::{

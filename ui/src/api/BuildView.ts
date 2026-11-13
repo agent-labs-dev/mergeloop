@@ -2,7 +2,7 @@
 import type { BuildStageView } from "./BuildStageView";
 import type { BuildStatusView } from "./BuildStatusView";
 
-export type BuildView = { id: bigint, repo: string, issue: bigint, title: string, status: BuildStatusView, 
+export type BuildView = { id: number, repo: string, issue: number, title: string, status: BuildStatusView, 
 /**
  * The login that holds the claim, or held it last.
  */
@@ -10,11 +10,11 @@ holder: string | null,
 /**
  * Which taking of the build `holder` has: its calls on the build pass it.
  */
-claim: bigint, stage: BuildStageView | null, 
+claim: number, stage: BuildStageView | null, 
 /**
  * Seconds since its holder was last heard from.
  */
-heard_secs: bigint | null, pr: bigint | null, 
+heard_secs: number | null, pr: number | null, 
 /**
  * Why it is stuck.
  */

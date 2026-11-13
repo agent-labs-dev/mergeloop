@@ -149,18 +149,23 @@ impl From<BuildStageView> for Stage {
 #[derive(Serialize, TS)]
 #[ts(export)]
 pub struct BuildView {
+    #[ts(type = "number")]
     pub id: u64,
     pub repo: String,
+    #[ts(type = "number")]
     pub issue: u64,
     pub title: String,
     pub status: BuildStatusView,
     /// The login that holds the claim, or held it last.
     pub holder: Option<String>,
     /// Which taking of the build `holder` has: its calls on the build pass it.
+    #[ts(type = "number")]
     pub claim: u64,
     pub stage: Option<BuildStageView>,
     /// Seconds since its holder was last heard from.
+    #[ts(type = "number | null")]
     pub heard_secs: Option<u64>,
+    #[ts(type = "number | null")]
     pub pr: Option<u64>,
     /// Why it is stuck.
     pub reason: Option<String>,

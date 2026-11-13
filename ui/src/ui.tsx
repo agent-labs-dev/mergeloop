@@ -180,6 +180,46 @@ export function Status({
   );
 }
 
+/** A badge's tint for each kind of state: one look for "in progress", "held" and so on across the
+ * pages. */
+export const tints = {
+  blue: "bg-blue-50 text-blue-700 ring-blue-600/20 dark:bg-blue-400/10 dark:text-blue-300 dark:ring-blue-400/30",
+  grey: "bg-sunken text-fg-2 ring-neutral-500/20",
+  amber:
+    "bg-amber-50 text-amber-800 ring-amber-600/20 dark:bg-amber-400/10 dark:text-amber-300 dark:ring-amber-400/30",
+  red: "bg-red-50 text-red-700 ring-red-600/20 dark:bg-red-400/10 dark:text-red-300 dark:ring-red-400/30",
+  green:
+    "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/30",
+};
+
+/** A small label in a tint: a row's state. */
+export function Badge({ style, children }: { style: string; children: ReactNode }) {
+  return (
+    <span
+      className={`whitespace-nowrap rounded-md px-1.5 py-0.5 text-xs font-medium ring-1 ring-inset ${style}`}
+    >
+      {children}
+    </span>
+  );
+}
+
+/** A band over a list. */
+export function ListHead({ title, note, count }: { title: string; note: string; count: number }) {
+  return (
+    <p className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-xs text-muted">
+      <span>
+        <span className="font-medium text-fg-2">{title}</span> · {note}
+      </span>
+      <span className="tabular-nums">{count}</span>
+    </p>
+  );
+}
+
+/** What a list says with nothing in it. */
+export function Empty({ children }: { children: ReactNode }) {
+  return <p className="px-4 py-3 text-xs text-faint">{children}</p>;
+}
+
 /** "42s", "12m", "3.4h", "2.1d". */
 export function duration(secs: number) {
   if (secs < 60) return `${Math.round(secs)}s`;

@@ -88,6 +88,7 @@ function NoWorkspace({ session, app }: { session: SessionView; app: AppView }) {
 
 const tabs = [
   ["Queue", "/$account/queue"],
+  ["Builds", "/$account/builds"],
   ["History", "/$account/history"],
   ["Settings", "/$account/settings"],
 ] as const;

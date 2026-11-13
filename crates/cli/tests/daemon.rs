@@ -149,6 +149,15 @@ impl World {
             .unwrap();
     }
 
+    /// How many times the daemon asked for a task.
+    fn claims(&self) -> usize {
+        self.fake
+            .tools()
+            .iter()
+            .filter(|t| *t == "claim_build")
+            .count()
+    }
+
     /// Makes the workspace folder the daemon's, as its first start does: its name in
     /// `daemon/id`. A test that puts things in the folder before a run marks it first.
     fn mark(&self) {
@@ -1283,8 +1292,11 @@ async fn a_pr_refused_for_an_unheard_claim_is_opened_after_a_heartbeat() {
     );
     let agent = w.agent("my-agent", "echo built > feature.txt", BUILT);
 
-    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
-        .await;
+    // Once the PR is opened: its slot claims again, so the build is not given back on stop.
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| l.ended() == 1) && w.claims() >= 2
+    })
+    .await;
 
     let tools = w.fake.lane_tools();
     assert!(
@@ -1735,8 +1747,9 @@ async fn a_pr_github_would_not_label_yet_is_opened_on_a_later_call() {
     );
     let agent = w.lander();
 
+    // Once the PR is opened: its slot claims again, so the build is not given back on stop.
     w.run(w.config(1, &agent), |w| {
-        w.fake.lane(|l| l.opened.len() == 1)
+        w.fake.lane(|l| l.opened.len() == 1) && w.claims() >= 2
     })
     .await;
 

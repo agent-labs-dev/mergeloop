@@ -229,8 +229,11 @@ function BuildLane({ workspace }: { workspace: number }) {
             </>
           ) : (
             <>
-              <span className="font-medium">Off.</span> No daemon gets a task or a token, and every
-              build stops where it is. Builds in progress or stuck are kept for when it is on again.
+              <span className="font-medium">Off.</span> No daemon gets a new task, and the lane's
+              calls are refused. A daemon stops a build when it next hears from MergeLoop, which can
+              take up to 5 minutes, and throws away the build's work it has not pushed. The build's
+              record is kept: once the lane is on again, it is a task again and built anew, or, when
+              it has a PR, landed again. A PR already open stays in the queue and can still merge.
             </>
           )}
         </p>

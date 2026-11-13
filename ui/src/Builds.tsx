@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect } from "react";
 import { fetchBuildSettings, fetchBuilds } from "./api";
 import type { BuildView } from "./api/BuildView";
 import { Badge, duration, Empty, ListHead, primary, RepoIcon, tints } from "./ui";
@@ -60,9 +60,11 @@ const LISTS: { title: string; note: string; empty: string; holds: BuildView["sta
 export function Builds({ workspace }: { workspace: number }) {
   const { repo } = useSearch({ from: "/$account/builds" });
   const navigate = useNavigate({ from: "/$account/builds" });
+  // Read as often as the builds: someone may turn the lane off or on meanwhile.
   const settings = useQuery({
     queryKey: ["build-settings", workspace],
     queryFn: () => fetchBuildSettings(workspace),
+    refetchInterval: 5000,
   });
   const on = settings.data?.enabled === true;
   const builds = useQuery({
@@ -71,10 +73,16 @@ export function Builds({ workspace }: { workspace: number }) {
     enabled: on,
     refetchInterval: 5000,
   });
+  // The builds refused: the lane may have been turned off since the settings were read.
+  const { refetch } = settings;
+  const refused = builds.isError;
+  useEffect(() => {
+    if (refused) void refetch();
+  }, [refused, refetch]);
 
-  if (settings.isError || builds.isError)
-    return <p className="p-6 text-bad">Could not load the builds.</p>;
   if (settings.data && !on) return <Start off />;
+  if (settings.isError || (builds.isError && !settings.isFetching))
+    return <p className="p-6 text-bad">Could not load the builds.</p>;
   if (!builds.data) return null;
   if (builds.data.length === 0) return <Start off={false} />;
 

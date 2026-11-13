@@ -13,4 +13,6 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 enum_glob_use = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"
 wildcard_imports = "warn"

@@ -1,6 +1,8 @@
 //! The `mergeloop` binary, run as a user runs it, against a fake server: which credential it
 //! sends, and what it says when the server refuses it.
 
+#![cfg(test)]
+
 mod fake;
 
 use std::path::Path;

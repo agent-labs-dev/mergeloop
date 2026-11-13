@@ -1,6 +1,8 @@
 //! `mergeloop login` and `logout` against a fake server, with a request to the sign-in link in
 //! place of the browser.
 
+#![cfg(test)]
+
 mod fake;
 
 use std::path::{Path, PathBuf};

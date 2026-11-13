@@ -1,6 +1,8 @@
 //! The skill MergeLoop installs tells agents how a reply to a finding ends: every verdict the
 //! reviewer may give.
 
+#![cfg(test)]
+
 use mergepatrol_resolver::{INTENDED, STANDS, WITHDRAWN};
 
 const SKILL: &str = include_str!("../src/skill.md");

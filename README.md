@@ -537,7 +537,7 @@ An agent and what it runs never act as you on GitHub or MergeLoop: a reply or a 
 
 - **The builder, the reviewer and every `verify` command** get no token.
 - **An agent working a need on the PR** gets a token for the build's repo that only reads it and its PRs (`contents: read`, `pull_requests: read`), as `GH_TOKEN`, `GITHUB_TOKEN` and `MERGELOOP_TOKEN`, so `gh` and `mergeloop call` read as the App's bot. It reads what anyone who can comment on the PR wrote, so it holds nothing that can write.
-- **The token that pushes** (`contents: write`, `pull_requests: write`, for that one repo, for GitHub's hour) stays in the daemon, for its own git and its replies and resolves. The daemon asks for it with `mint_build_token` and the `push` scope; MergeLoop mints it only while you hold the build and GitHub says, asked afresh, that you may push.
+- **The token that pushes** (`contents: write`, `pull_requests: write`, for that one repo, for GitHub's hour) stays in the daemon, for its own git and its replies and resolves. The daemon asks for it with `mint_build_token` and the `push` scope; MergeLoop mints it only while you hold the build and GitHub says, asked afresh, that you may push. It does not carry GitHub's `workflows` permission, so a build cannot change the files under `.github/workflows`: GitHub refuses the push, and the build is stuck with that refusal as its reason. An issue that changes CI is one for a person.
 
 ### The workspace folder, and how it is cleaned
 

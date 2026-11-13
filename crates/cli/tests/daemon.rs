@@ -1760,6 +1760,26 @@ async fn a_pr_github_would_not_label_yet_is_opened_on_a_later_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_fails_while_the_pr_is_opened_is_asked_again_and_the_build_is_kept() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    // As often as any call is asked again: more than a few times.
+    for _ in 0..5 {
+        w.fake.refuse("open_build_pr", "", 500, "Internal error.");
+    }
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| l.opened.len() == 1) && w.claims() >= 2
+    })
+    .await;
+
+    assert_eq!(w.fake.args_of("open_build_pr").len(), 6);
+    let released = w.fake.lane(|l| l.released.clone());
+    assert!(released.is_empty(), "{released:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn transcripts_older_than_seven_days_are_removed_and_no_other_folder_is() {
     let w = World::new().await;
     w.mark();

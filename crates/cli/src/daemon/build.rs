@@ -19,10 +19,7 @@ use super::env;
 use super::folder::{Checkout, Folder};
 use super::lane::{Lane, Scope, Stage, Task};
 use super::verify;
-use crate::client::{Refusal, Refused, needs_sign_in, refusal, unanswered};
-
-/// How many times `open_build_pr` is called again when it says to.
-const OPEN_RETRIES: u32 = 3;
+use crate::client::{Refusal, needs_sign_in, refusal, unanswered};
 
 /// The most times the reviewer reads a build's change. Findings left after the last make the
 /// build stuck.
@@ -486,7 +483,8 @@ impl Builder {
     }
 
     /// Has the server open the build's PR, or finish labeling and assigning the one it has:
-    /// called again while the server says to.
+    /// called again while the server says to, or fails to answer, with a heartbeat between. The
+    /// branch is pushed by now, so only a refusal ends the build.
     pub(super) async fn open(
         &self,
         lane: &Lane,
@@ -494,17 +492,13 @@ impl Builder {
         title: &str,
         body: &str,
     ) -> Result<u64> {
-        let mut tries = 0;
+        let said = |e: &anyhow::Error| say(task, &format!("{e:#}: calling again"));
         loop {
             match heard(lane, task, || lane.open_pr(task, title, body)).await {
-                Err(e) if tries < OPEN_RETRIES && call_again(&e) => {
-                    tries += 1;
-                    say(task, &format!("{e:#}: calling again"));
-                    tokio::time::sleep(self.pause).await;
-                    self.beat(lane, task, task.stage()).await?;
-                }
-                opened => return opened,
+                Ok(pr) => return Ok(pr),
+                Err(e) => super::lane::again(self.pause, e, &said).await?,
             }
+            self.beat(lane, task, task.stage()).await?;
         }
     }
 }
@@ -529,12 +523,6 @@ pub(super) async fn push(
         return Err(e);
     }
     Ok(true)
-}
-
-/// Whether the server says to call again: GitHub refused part of it, or limits for now.
-fn call_again(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<Refused>()
-        .is_some_and(|r| matches!(r.status, Some(502 | 503)))
 }
 
 /// What the server must hear of how the work ended.

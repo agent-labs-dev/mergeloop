@@ -28,6 +28,26 @@ Agent runs are priced from `PRICES` in `crates/core/src/price.rs`. A test fails 
 
 The tests marked `#[ignore]` need Docker images, or a real Anthropic API key. Each one says how to run it.
 
+## Rust style
+
+We follow [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html) where it fits. The lints in `[workspace.lints]` in the root `Cargo.toml` enforce what we adopted, and CI fails on any of them.
+
+Two rules have no lint yet, so we keep them by convention:
+
+- One module per `use` statement: `use a::b::{X, Y}`, not `use a::{X, b::Y}`.
+- `expect("why")` over `unwrap()` outside tests.
+
+We leave these parts of the guide out on purpose. Don't raise them in review:
+
+- Small crates, a flat layout, and no code in non-leaf modules. These exist for Chromium's build graph. Our crates are fine as they are; split a big file when work touches it anyway.
+- Avoiding `Rc` and `Arc`. Shared state under tokio and axum needs `Arc`.
+- Generics over `dyn Trait`. The guide means it for libraries; our `dyn` traits are test seams in application code.
+- `#[non_exhaustive]`. We are one team in one workspace, and it forces wildcard arms that hide new variants.
+- `missing_docs`, and `#[must_use]` on every candidate. Both are too noisy for internal crates, with over 1000 and 170 hits. Document what a reader needs.
+- rustfmt's `imports_granularity`, `hex_literal_case` and `format_macro_matchers`. They need nightly, and we build on stable. The guide's `max_width` of 100 is already the default.
+- Taste rules no tool checks, such as qualifying function calls by module, importing traits locally, or how much to lean on inference. Review judges these, within the limit `REVIEW.md` sets on style findings.
+- Rules only for Chrome and Fuchsia, such as those on async, test frameworks and sync primitives.
+
 ## Pull requests
 
 Title PRs as [Conventional Commits](https://www.conventionalcommits.org/): `feat: ...`, `fix(deploy): ...`. A maintainer merges them through MergeLoop's own queue.

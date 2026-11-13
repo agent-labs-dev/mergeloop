@@ -50,6 +50,8 @@ pub struct Lane {
     pub threads: Vec<(String, bool)>,
     /// Each call to GitHub's GraphQL: its bearer, query and variables.
     pub graphql: Vec<(String, String, Value)>,
+    /// GraphQL calls GitHub refuses: those whose query has the text, so many more times.
+    pub graphql_refusals: Vec<(String, u32)>,
 }
 
 impl Lane {
@@ -349,14 +351,31 @@ async fn graphql(State(seen): Shared, headers: HeaderMap, Json(body): Json<Value
     seen.lane
         .graphql
         .push((bearer(&headers), query.clone(), vars.clone()));
+    let refused = seen
+        .lane
+        .graphql_refusals
+        .iter_mut()
+        .find(|(text, times)| *times > 0 && query.contains(text.as_str()));
+    if let Some((_, times)) = refused {
+        *times -= 1;
+        let errors =
+            json!([{ "type": "FORBIDDEN", "message": "Resource not accessible by integration" }]);
+        return Json(json!({ "data": null, "errors": errors })).into_response();
+    }
     let data = if query.contains("reviewThreads") {
-        let nodes: Vec<Value> = seen
-            .lane
-            .threads
+        // 100 a page, as GitHub's most; a page's cursor is the index it starts at.
+        let from: usize = vars["after"].as_str().map_or(0, |a| a.parse().unwrap());
+        let threads = &seen.lane.threads;
+        let nodes: Vec<Value> = threads
             .iter()
+            .skip(from)
+            .take(100)
             .map(|(id, resolved)| json!({ "id": id, "isResolved": resolved }))
             .collect();
-        json!({ "repository": { "pullRequest": { "reviewThreads": { "nodes": nodes } } } })
+        let next = from + 100 < threads.len();
+        let info =
+            json!({ "hasNextPage": next, "endCursor": next.then(|| (from + 100).to_string()) });
+        json!({ "repository": { "pullRequest": { "reviewThreads": { "nodes": nodes, "pageInfo": info } } } })
     } else if query.contains("resolveReviewThread") {
         let id = vars["thread"].as_str().unwrap_or_default();
         for thread in seen.lane.threads.iter_mut().filter(|t| t.0 == id) {

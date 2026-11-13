@@ -5,9 +5,13 @@
 //! names. A PR that waits, on the queue or on a human, holds no slot and has no room: all its
 //! work is on GitHub, and the daemon keeps only its transcripts.
 
-use anyhow::{Result, bail};
+use std::collections::HashSet;
+
+use anyhow::{Context, Result, bail};
 use mergepatrol_git::Git;
-use mergepatrol_resolver::{VerifyFailed, commit_subject, failed_note, thread_answers};
+use mergepatrol_resolver::{
+    ThreadAnswers, VerifyFailed, commit_subject, failed_note, thread_answers,
+};
 use serde_json::Value;
 use tokio::sync::watch;
 
@@ -22,6 +26,13 @@ use crate::land::{self, Pr};
 /// The agent runs one PR's needs may take before its build is released as stuck: a need that
 /// comes back after each of the agent's runs would run it for good.
 pub const ROUNDS: u32 = 10;
+
+/// How many times the daemon posts a need's answer before the build is stuck: GitHub may refuse
+/// for a moment.
+const ANSWER_TRIES: u32 = 3;
+
+/// What the next run on a need is told when the last one left it as it was.
+const UNCHANGED: &str = "Your last run on this need changed no file and answered no thread, so the need is as it was. Do what it asks this time, or answer it as this brief says.";
 
 /// What a need asks of the daemon.
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +63,8 @@ enum Next {
     Ended(Work),
     /// Waits for a newer need.
     Seen,
+    /// Asks for the need as it is now, at once.
+    Again,
     /// Asks for the same need again, after a pause.
     Later,
 }
@@ -64,6 +77,25 @@ struct Landing {
     rounds: u32,
     /// What the server was told last: nothing yet, as a build taken up again may be either.
     standing: Option<Standing>,
+    /// The need the agent's last run left as it was.
+    unchanged: Option<String>,
+}
+
+/// What working a need came to.
+enum Worked {
+    /// Something went to GitHub: a push or an answer, or someone else's push. The next need
+    /// says what is left.
+    Changed,
+    /// Nothing did: the need is as it was.
+    Unchanged,
+    Stuck(String),
+}
+
+/// What of a need's answer went through: a try after a refusal posts only the rest.
+#[derive(Default)]
+struct Posted {
+    replied: HashSet<String>,
+    resolved: HashSet<String>,
 }
 
 impl Builder {
@@ -107,6 +139,7 @@ impl Builder {
             ejected: 0,
             rounds: 0,
             standing: None,
+            unchanged: None,
         };
         loop {
             let need = match land::next(&lane.client, &pr, &mut at.after).await {
@@ -124,6 +157,7 @@ impl Builder {
             match self.on_need(lane, task, number, &need, &mut at).await? {
                 Next::Ended(work) => return Ok(work),
                 Next::Seen => at.after = need["id"].as_str().map(str::to_owned),
+                Next::Again => at.after = None,
                 Next::Later => tokio::time::sleep(self.pause).await,
             }
         }
@@ -160,16 +194,32 @@ impl Builder {
                 self.stand(lane, task, at, Standing::Waiting).await?;
                 say(task, &format!("PR #{number} waits on a human: {brief}"));
             }
-            Act::Work if at.rounds >= ROUNDS => {
-                return stuck(format!(
-                    "PR #{number} still needs its author after {ROUNDS} runs of the agent: {brief}"
-                ));
-            }
             Act::Work => {
+                let id = need["id"].as_str();
+                let unchanged = id.is_some() && at.unchanged.as_deref() == id;
+                if at.rounds >= ROUNDS {
+                    let left = match unchanged {
+                        true => ", and the last left it as it was",
+                        false => "",
+                    };
+                    return stuck(format!(
+                        "PR #{number} still needs its author after {ROUNDS} runs of the agent{left}: {brief}"
+                    ));
+                }
                 at.rounds += 1;
                 self.stand(lane, task, at, Standing::Landing).await?;
-                if let Some(why) = self.work_need(lane, task, number, need, at.rounds).await? {
-                    return stuck(why);
+                let run = (at.rounds, unchanged);
+                match self.work_need(lane, task, number, need, run).await? {
+                    Worked::Stuck(why) => return stuck(why),
+                    Worked::Changed => at.unchanged = None,
+                    Worked::Unchanged => {
+                        say(
+                            task,
+                            &format!("PR #{number}: the agent's run left it as it was"),
+                        );
+                        at.unchanged = id.map(str::to_owned);
+                        return Ok(Next::Again);
+                    }
                 }
             }
             Act::Later => {
@@ -195,18 +245,18 @@ impl Builder {
         Ok(())
     }
 
-    /// Works one need in a slot, in a room made for it and removed after. `Some` with why the
-    /// build is stuck.
+    /// Works one need in a slot, in a room made for it and removed after. `run` is which run
+    /// on the PR this is, and whether the last left this need as it was.
     async fn work_need(
         &self,
         lane: &Lane,
         task: &Task,
         number: u64,
         need: &Value,
-        round: u32,
-    ) -> Result<Option<String>> {
+        run: (u32, bool),
+    ) -> Result<Worked> {
         let _slot = self.slots.clone().acquire_owned().await?;
-        let worked = self.worked(lane, task, number, need, round).await;
+        let worked = self.worked(lane, task, number, need, run).await;
         self.clean_up(task).await;
         worked
     }
@@ -217,8 +267,8 @@ impl Builder {
         task: &Task,
         number: u64,
         need: &Value,
-        round: u32,
-    ) -> Result<Option<String>> {
+        (round, unchanged): (u32, bool),
+    ) -> Result<Worked> {
         lane.heartbeat(task, task.stage()).await?;
         let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         let checkout = self.folder.checkout_pr(task, &token, &self.access).await?;
@@ -232,16 +282,22 @@ impl Builder {
             &format!("PR #{number} needs {needs}: the agent works it"),
         );
         let brief = need["brief"].as_str().unwrap_or_default();
-        let prompt = |failed: Option<&VerifyFailed>| match failed {
-            None => brief.to_owned(),
-            Some(f) => format!("{brief}\n\n{}", failed_note(f)),
+        let prompt = |failed: Option<&VerifyFailed>| {
+            let mut prompt = brief.to_owned();
+            if unchanged {
+                prompt = format!("{prompt}\n\n{UNCHANGED}");
+            }
+            match failed {
+                None => prompt,
+                Some(f) => format!("{prompt}\n\n{}", failed_note(f)),
+            }
         };
         let read = heard(lane, task, || lane.mint(task, Scope::Read)).await?;
         let env = env::bot(&checkout.room, &read, lane.client.server().url());
         let step = format!("need-{round}");
         let run = match self.change(task, &checkout, prompt, &env, &step).await? {
             Ok(run) => run,
-            Err(why) => return Ok(Some(why)),
+            Err(why) => return Ok(Worked::Stuck(why)),
         };
         // Ticket 07's review of the change goes here, before anything is pushed.
         let Some(pushed) = self
@@ -257,11 +313,18 @@ impl Builder {
                     task.branch
                 ),
             );
-            return Ok(None);
+            return Ok(Worked::Changed);
         };
-        self.answer(lane, task, number, &run.text, pushed.as_deref())
-            .await?;
-        Ok(None)
+        Ok(
+            match self
+                .answer(lane, task, number, &run.text, pushed.as_deref())
+                .await?
+            {
+                Err(why) => Worked::Stuck(why),
+                Ok(answered) if answered || pushed.is_some() => Worked::Changed,
+                Ok(_) => Worked::Unchanged,
+            },
+        )
     }
 
     /// Commits the agent's change on the PR's head as the App's bot, with the developer as
@@ -296,9 +359,10 @@ impl Builder {
         Ok(Some(Some(head)))
     }
 
-    /// Posts the agent's replies on the PR's threads as the App's bot, with a fresh token,
-    /// naming the commit pushed, then resolves the threads it named. Only the PR's own threads; what fails is said and
-    /// skipped: the next need says what is left.
+    /// Posts the agent's replies on the PR's threads as the App's bot, naming the commit pushed,
+    /// then resolves the threads it named: only the PR's own threads. A refusal is tried again,
+    /// heartbeating, without posting twice what went through. `Ok(true)` when anything was
+    /// posted; `Err` with what GitHub refused when it still did after `ANSWER_TRIES`.
     async fn answer(
         &self,
         lane: &Lane,
@@ -306,29 +370,58 @@ impl Builder {
         number: u64,
         text: &str,
         pushed: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Result<bool, String>> {
         let answers = thread_answers(text);
         if answers.replies.is_empty() && answers.resolve.is_empty() {
-            return Ok(());
+            return Ok(Ok(false));
         }
-        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
-        let bot = Bot {
-            http: &self.http,
-            api: &self.github,
-            token: &token,
-        };
-        let threads = match bot.threads(&task.repo, number).await {
-            Ok(threads) => threads,
-            Err(e) => {
-                say(
-                    task,
-                    &format!("could not read PR #{number}'s threads: {e:#}"),
-                );
-                return Ok(());
+        let mut posted = Posted::default();
+        for tried in 1.. {
+            let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
+            let bot = Bot {
+                http: &self.http,
+                api: &self.github,
+                token: &token,
+            };
+            let refused = match self
+                .post(&bot, task, number, &answers, pushed, &mut posted)
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => e,
+            };
+            if tried >= ANSWER_TRIES {
+                return Ok(Err(format!(
+                    "GitHub refused the daemon's answer on PR #{number} {ANSWER_TRIES} times: {refused:#}"
+                )));
             }
-        };
+            say(task, &format!("{refused:#}: trying again"));
+            tokio::time::sleep(self.pause).await;
+            lane.heartbeat(task, task.stage()).await?;
+        }
+        Ok(Ok(!posted.replied.is_empty() || !posted.resolved.is_empty()))
+    }
+
+    /// One try at posting what of `answers` is not in `posted` yet, noting there what went
+    /// through.
+    async fn post(
+        &self,
+        bot: &Bot<'_>,
+        task: &Task,
+        number: u64,
+        answers: &ThreadAnswers,
+        pushed: Option<&str>,
+        posted: &mut Posted,
+    ) -> Result<()> {
+        let threads = bot
+            .threads(&task.repo, number)
+            .await
+            .with_context(|| format!("could not read PR #{number}'s threads"))?;
         let open = |thread: &str| threads.iter().find(|(id, _)| id == thread).map(|t| !t.1);
         for (thread, reply) in &answers.replies {
+            if posted.replied.contains(thread) {
+                continue;
+            }
             if open(thread).is_none() {
                 say(
                     task,
@@ -340,14 +433,19 @@ impl Builder {
                 Some(sha) => format!("{reply}\n\nPushed in {}.", &sha[..sha.len().min(7)]),
                 None => reply.clone(),
             };
-            if let Err(e) = bot.reply(thread, &body).await {
-                say(task, &format!("could not reply in {thread}: {e:#}"));
-            }
+            bot.reply(thread, &body)
+                .await
+                .with_context(|| format!("could not reply in {thread}"))?;
+            posted.replied.insert(thread.clone());
         }
-        for thread in answers.resolve.iter().filter(|t| open(t) == Some(true)) {
-            if let Err(e) = bot.resolve(thread).await {
-                say(task, &format!("could not resolve {thread}: {e:#}"));
+        for thread in &answers.resolve {
+            if posted.resolved.contains(thread) || open(thread) != Some(true) {
+                continue;
             }
+            bot.resolve(thread)
+                .await
+                .with_context(|| format!("could not resolve {thread}"))?;
+            posted.resolved.insert(thread.clone());
         }
         Ok(())
     }

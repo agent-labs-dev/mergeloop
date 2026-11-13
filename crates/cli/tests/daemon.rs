@@ -1456,3 +1456,142 @@ async fn transcripts_older_than_seven_days_are_removed() {
 
     assert_eq!(w.transcripts(), ["2"]);
 }
+
+/// The threads the daemon replied in, one entry per reply posted, in order.
+fn replies(w: &World) -> Vec<String> {
+    let graphql = w.fake.lane(|l| l.graphql.clone());
+    graphql
+        .iter()
+        .filter(|(_, q, _)| q.contains("addPullRequestReviewThreadReply"))
+        .map(|(.., vars)| vars["thread"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// How many times the daemon asked GitHub to resolve a thread.
+fn resolves(w: &World) -> usize {
+    let graphql = w.fake.lane(|l| l.graphql.clone());
+    graphql
+        .iter()
+        .filter(|(_, q, _)| q.contains("resolveReviewThread"))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_github_refuses_is_tried_again_without_the_agent_and_posted_once() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    {
+        let mut seen = w.fake.seen.lock().unwrap();
+        seen.lane.threads = vec![("T1".into(), false)];
+        seen.lane.graphql_refusals = vec![("resolveReviewThread".into(), 1)];
+    }
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert_eq!(w.runs(), 1, "the agent ran once");
+    assert_eq!(replies(&w), ["T1"], "its reply went through once");
+    assert_eq!(resolves(&w), 2, "the refused resolve was asked again");
+    assert_eq!(w.fake.lane(|l| l.threads.clone()), [("T1".into(), true)]);
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_github_keeps_refusing_releases_the_build_as_stuck_saying_why() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake
+        .script(105, vec![fake::need("threads", "t1", THREADS)]);
+    {
+        let mut seen = w.fake.seen.lock().unwrap();
+        seen.lane.threads = vec![("T1".into(), false)];
+        seen.lane.graphql_refusals = vec![("addPullRequestReviewThreadReply".into(), u32::MAX)];
+    }
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| !l.released.is_empty())
+    })
+    .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(
+        why.contains("Resource not accessible by integration"),
+        "{why}"
+    );
+    assert_eq!(w.runs(), 1, "the agent ran once");
+    assert_eq!(replies(&w).len(), 3, "asked three times");
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_leaves_its_need_as_it_was_is_counted_and_told_and_ends_stuck() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        (0..11)
+            .map(|_| fake::need("threads", "t1", THREADS))
+            .collect(),
+    );
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    let told = w.root().join("told");
+    let body = format!(
+        "case \"$prompt\" in *'as it was'*) echo told >> '{}';; esac",
+        told.display()
+    );
+    let agent = w.agent("idle", &body, "Nothing to change here.");
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| !l.released.is_empty())
+    })
+    .await;
+
+    assert_eq!(w.runs(), 10, "the cap on runs");
+    let told = std::fs::read_to_string(told).unwrap_or_default();
+    assert_eq!(told.lines().count(), 9, "each run after the first is told");
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("as it was"), "{why}");
+    assert!(replies(&w).is_empty());
+    assert!(w.pushed("mergeloop/build-12").unwrap()[0] == "first");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_past_the_first_page_is_answered() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    w.fake.seen.lock().unwrap().lane.threads = (0..150).map(|n| (format!("T{n}"), false)).collect();
+    let answer = w.output(
+        "late",
+        "MERGELOOP_REPLY: T140 Done.\nMERGELOOP_RESOLVE: T140\nMERGELOOP_COMMIT: Do it",
+    );
+    let body = format!(
+        "echo done >> feature.txt; cat '{}'; exit 0",
+        answer.display()
+    );
+    let agent = w.agent("late-agent", &body, "unused");
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert_eq!(replies(&w), ["T140"]);
+    let threads = w.fake.lane(|l| l.threads.clone());
+    assert!(threads.iter().any(|t| *t == ("T140".into(), true)));
+}

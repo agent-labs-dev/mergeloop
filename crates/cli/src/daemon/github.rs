@@ -14,22 +14,31 @@ pub struct Bot<'a> {
 }
 
 impl Bot<'_> {
-    /// The ids of the PR's review threads, and whether each is resolved.
+    /// The ids of the PR's review threads, and whether each is resolved: every page of them.
     pub async fn threads(&self, repo: &str, pr: u64) -> Result<Vec<(String, bool)>> {
         let (owner, name) = repo.split_once('/').context("a repo is owner/name")?;
-        let data = self
-            .graphql(
-                "query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100) { nodes { id isResolved } } } } }",
-                json!({ "owner": owner, "name": name, "pr": pr }),
-            )
-            .await?;
-        let nodes = &data["repository"]["pullRequest"]["reviewThreads"]["nodes"];
-        Ok(nodes
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|n| Some((n["id"].as_str()?.to_owned(), n["isResolved"] == true)))
-            .collect())
+        let mut threads = Vec::new();
+        let mut after = Value::Null;
+        loop {
+            let data = self
+                .graphql(
+                    "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100, after: $after) { nodes { id isResolved } pageInfo { hasNextPage endCursor } } } } }",
+                    json!({ "owner": owner, "name": name, "pr": pr, "after": after }),
+                )
+                .await?;
+            let page = &data["repository"]["pullRequest"]["reviewThreads"];
+            let nodes = page["nodes"].as_array().into_iter().flatten();
+            threads.extend(
+                nodes.filter_map(|n| Some((n["id"].as_str()?.to_owned(), n["isResolved"] == true))),
+            );
+            if page["pageInfo"]["hasNextPage"] != true {
+                return Ok(threads);
+            }
+            after = page["pageInfo"]["endCursor"].clone();
+            if !after.is_string() {
+                bail!("GitHub said PR #{pr} has more review threads, but not where they start");
+            }
+        }
     }
 
     pub async fn reply(&self, thread: &str, body: &str) -> Result<()> {

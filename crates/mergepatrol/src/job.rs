@@ -631,26 +631,24 @@ async fn review(
     let ran = bench.reviewers(depth.reviewers(), review_in).await?;
     let mut output = merged(&spec.resolver, ran, events)?;
     let panel = (spec, resolver, base.as_str());
-    check_findings(panel, &bench, out, depth, &mut output.findings, events).await?;
+    check_findings(panel, &bench, out, &mut output.findings, events).await?;
     tokio::fs::write(out.join(REVIEW_FILE), serde_json::to_vec_pretty(&output)?).await?;
     Ok(())
 }
 
 /// Backs what the agent found with what MergeLoop saw itself: the code at each place, each
-/// change's evidence run on the head, and a panel's votes on a change without any, of a kind
-/// `depth` votes on.
+/// change's evidence run on the head, and a panel's votes on a security change without any.
 async fn check_findings(
     panel: (&JobSpec, &dyn Resolver, &str),
     bench: &Bench<'_>,
     out: &Path,
-    depth: Depth,
     findings: &mut [Finding],
     events: &mut Vec<JobEvent>,
 ) -> Result<()> {
     let Bench { git, dir, head } = *bench;
     with_code(git, dir, panel.2, head, findings).await?;
     check_evidence(head, git, dir, findings, events).await?;
-    verify_findings(panel, bench, out, depth, findings, events).await
+    verify_findings(panel, bench, out, findings, events).await
 }
 
 /// What the review reads, and how hard it looks: `abc..def at deep: 3 reviewers`.
@@ -1116,20 +1114,19 @@ impl Bench<'_> {
     }
 }
 
-/// Has a panel of fresh agents check each finding that only the reviewer's word shows, and keeps
-/// their votes: what the reviewer wrote of votes counts for nothing.
+/// Has a panel of fresh agents check each security finding that only the reviewer's word shows,
+/// and keeps their votes: what the reviewer wrote of votes counts for nothing.
 async fn verify_findings(
     (spec, resolver, base): (&JobSpec, &dyn Resolver, &str),
     bench: &Bench<'_>,
     out: &Path,
-    depth: Depth,
     findings: &mut [Finding],
     events: &mut Vec<JobEvent>,
 ) -> Result<()> {
     let panel = Panel::FINDING;
     for f in findings.iter_mut() {
         f.verified = None;
-        if !f.wants_votes(depth) {
+        if !f.wants_votes() {
             continue;
         }
         let claim = claim(f);
@@ -1522,7 +1519,6 @@ mod tests {
             (&spec, &panelist, "base"),
             &bench,
             &out,
-            Depth::Standard,
             &mut findings,
             &mut events,
         )
@@ -1661,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_deep_review_merges_fresh_reviewers_findings_and_a_panel_votes_on_the_unshown() {
+    async fn a_deep_review_replays_evidence_and_does_not_vote_on_unproven_non_security_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("repo");
         std::fs::create_dir(&dir).unwrap();
@@ -1725,12 +1721,18 @@ mod tests {
         assert_eq!(off.id, "f1");
         assert!(off.evidence.as_ref().unwrap().failed, "{off:?}");
         assert!(off.verified.is_none());
-        // A change of any kind that nothing ran shows goes to the panel.
+        let settings = mergepatrol_core::ReviewSettings {
+            depth: Depth::Deep,
+            ..Default::default()
+        };
+        assert_eq!(settings.route(off), mergepatrol_core::Route::Author);
+        // The panel would agree, but agreement cannot replace a replayed failure.
         let null = &output.findings[1];
         assert_eq!(null.id, "f2");
-        assert!(null.verified.as_ref().unwrap().upheld());
-        assert_eq!(reviewers.votes.into_inner().unwrap(), 3);
-        // Each run's spend: two reviewers that reviewed, one that did not, three votes.
+        assert!(null.verified.is_none());
+        assert_eq!(settings.route(null), mergepatrol_core::Route::Cleared);
+        assert_eq!(reviewers.votes.into_inner().unwrap(), 0);
+        // Each run's spend: two reviewers that reviewed, one that did not, no votes.
         let kinds: Vec<&str> = events
             .iter()
             .filter(|e| e.kind.ends_with("reviewed"))
@@ -1738,7 +1740,7 @@ mod tests {
             .collect();
         assert_eq!(
             kinds.iter().filter(|k| **k == "reviewed").count(),
-            5,
+            2,
             "{events:?}"
         );
         assert_eq!(kinds.iter().filter(|k| **k == "unreviewed").count(), 1);

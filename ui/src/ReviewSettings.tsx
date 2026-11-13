@@ -35,7 +35,7 @@ const DEPTHS: [Depth, string, string][] = [
   [
     "deep",
     "Deep",
-    "Three reviewers at once, and a panel of three votes on each change no failing test shows. Spends several times Standard: for code where a missed bug costs more.",
+    "Three reviewers at once, with the same evidence requirement as Standard. Security and human decisions keep their exceptions. Spends several times Standard: for code where a missed bug costs more.",
   ],
 ];
 const depthName = (d: Depth) => DEPTHS.find(([v]) => v === d)?.[1] ?? d;

@@ -3,7 +3,7 @@
 //! labels only. `LIVE_TOKEN=$(gh auth token) LIVE_REPO=owner/name LIVE_PR=1 \
 //! cargo test -p mergepatrol-github --test labels_live -- --ignored`
 
-use mergepatrol_github::setup::{add_labels_as, remove_label_as};
+use mergepatrol_github::AsUser;
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
@@ -37,7 +37,8 @@ async fn a_user_labels_a_pr_and_takes_the_labels_off() {
     // A space and a colon, as a repo's own trigger label may have: the path must encode them.
     let [trigger, priority] = ["live test", "live test:priority"];
 
-    add_labels_as(&token, &repo, pr, &[trigger, priority])
+    let user = AsUser::new(token.clone()).unwrap();
+    user.add_labels(&repo, pr, &[trigger, priority])
         .await
         .unwrap();
     let on = labels(&token, &repo, pr).await;
@@ -47,10 +48,10 @@ async fn a_user_labels_a_pr_and_takes_the_labels_off() {
     );
 
     for label in [trigger, priority] {
-        remove_label_as(&token, &repo, pr, label).await.unwrap();
+        user.remove_label(&repo, pr, label).await.unwrap();
     }
     let off = labels(&token, &repo, pr).await;
     assert!(!off.iter().any(|l| l.starts_with(trigger)), "{off:?}");
     // Gone already: no error.
-    remove_label_as(&token, &repo, pr, trigger).await.unwrap();
+    user.remove_label(&repo, pr, trigger).await.unwrap();
 }

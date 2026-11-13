@@ -413,28 +413,6 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// Adds labels to a PR as the user, so GitHub checks that they may: it takes triage access.
-/// `Refused` when they lack it.
-pub async fn add_labels_as(token: &str, repo: &str, number: u64, labels: &[&str]) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/issues/{number}/labels");
-    let req = client()?.post(url).json(&json!({ "labels": labels }));
-    user_write(token, req).await?.error_for_status()?;
-    Ok(())
-}
-
-/// Removes a label from a PR as the user. A label the PR does not have is no error.
-pub async fn remove_label_as(token: &str, repo: &str, number: u64, label: &str) -> Result<()> {
-    let mut url = Url::parse(&format!("{API}/repos/{repo}/issues/{number}/labels"))?;
-    url.path_segments_mut()
-        .map_err(|()| anyhow::anyhow!("not a base URL"))?
-        .push(label);
-    let res = user_write(token, client()?.delete(url)).await?;
-    if res.status() != reqwest::StatusCode::NOT_FOUND {
-        res.error_for_status()?;
-    }
-    Ok(())
-}
-
 /// What a review says of a PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -508,6 +486,30 @@ impl AsUser {
     /// user: no.
     pub async fn can_admin(&self, repo: &str) -> Result<bool> {
         self.has_permission(repo, "admin").await
+    }
+
+    /// Adds labels to a PR as the user, so GitHub checks that they may: it takes triage access.
+    /// `Refused` when they lack it.
+    pub async fn add_labels(&self, repo: &str, number: u64, labels: &[&str]) -> Result<()> {
+        let url = format!("{}/repos/{repo}/issues/{number}/labels", self.api);
+        let req = self.http.post(url).timeout(TIMEOUT);
+        user_write(&self.token, req.json(&json!({ "labels": labels })))
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Removes a label from a PR as the user. A label the PR does not have is no error.
+    pub async fn remove_label(&self, repo: &str, number: u64, label: &str) -> Result<()> {
+        let mut url = Url::parse(&format!("{}/repos/{repo}/issues/{number}/labels", self.api))?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("not a base URL"))?
+            .push(label);
+        let res = user_write(&self.token, self.http.delete(url).timeout(TIMEOUT)).await?;
+        if res.status() != reqwest::StatusCode::NOT_FOUND {
+            res.error_for_status()?;
+        }
+        Ok(())
     }
 
     /// Whether GitHub gives the token's user `permission` on the repo, as `/repos/{repo}` says.

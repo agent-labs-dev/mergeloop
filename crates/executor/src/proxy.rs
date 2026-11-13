@@ -2,7 +2,7 @@
 //! job gets a token instead, which this proxy swaps for the credential while the job runs.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
 use mergepatrol_core::Provider;
+use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 
@@ -182,7 +183,7 @@ impl ApiProxy {
         requests: u32,
     ) -> Granted {
         let token = crate::remote::random_token();
-        self.grants.lock().unwrap().insert(
+        self.grants.lock().insert(
             token.clone(),
             Grant {
                 provider,
@@ -198,7 +199,7 @@ impl ApiProxy {
 
     /// The provider and credential behind `token`, counting one request.
     fn take(&self, token: &str) -> Option<(Provider, Credential)> {
-        let mut grants = self.grants.lock().unwrap();
+        let mut grants = self.grants.lock();
         let grant = grants.get_mut(token)?;
         if grant.requests_left == 0 {
             return None;
@@ -216,7 +217,7 @@ pub struct Granted {
 
 impl Drop for Granted {
     fn drop(&mut self) {
-        self.proxy.grants.lock().unwrap().remove(&self.token);
+        self.proxy.grants.lock().remove(&self.token);
     }
 }
 

@@ -20,7 +20,7 @@ mod ui;
 mod v1;
 mod webhook;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -31,6 +31,7 @@ use mergepatrol_core::RepoSettings;
 use mergepatrol_github::{AppCredentials, GitHub};
 use mergepatrol_resolver::ChatGptAuth;
 use mergepatrol_store::{BuildStore, GITHUB_APP, Scope, Store, Vault};
+use parking_lot::Mutex;
 use secrecy::ExposeSecret;
 
 pub use api::*;
@@ -267,10 +268,7 @@ mod tests {
 
     impl Wake for Woken {
         fn wake(&self, installation: u64, repo: mergepatrol_core::RepoName) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((installation, repo.to_string()));
+            self.0.lock().push((installation, repo.to_string()));
         }
     }
 
@@ -1638,7 +1636,7 @@ mod tests {
             deliver(&router, DELIVERY, &signature).await,
             StatusCode::NO_CONTENT
         );
-        assert_eq!(*woken.0.lock().unwrap(), [(7, "o/r".to_owned())]);
+        assert_eq!(*woken.0.lock(), [(7, "o/r".to_owned())]);
     }
 
     #[sqlx::test(migrations = false)]
@@ -1655,7 +1653,7 @@ mod tests {
             deliver(&router, &body, &signature).await,
             StatusCode::NO_CONTENT
         );
-        assert_eq!(*woken.0.lock().unwrap(), [(7, "o/r".to_owned())]);
+        assert_eq!(*woken.0.lock(), [(7, "o/r".to_owned())]);
     }
 
     #[sqlx::test(migrations = false)]
@@ -1673,7 +1671,7 @@ mod tests {
             deliver(&router, body, &signature).await,
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(*woken.0.lock().unwrap(), [(7, "o/r".to_owned())]);
+        assert_eq!(*woken.0.lock(), [(7, "o/r".to_owned())]);
     }
 
     #[sqlx::test(migrations = false)]
@@ -1743,7 +1741,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(3, 1), (4, 1)]
         );
-        assert_eq!(*woken.0.lock().unwrap(), [(7, "o/r".to_string())]);
+        assert_eq!(*woken.0.lock(), [(7, "o/r".to_string())]);
     }
 
     #[sqlx::test(migrations = false)]
@@ -1877,7 +1875,7 @@ mod tests {
             deliver(&router, DELIVERY, "").await,
             StatusCode::UNAUTHORIZED
         );
-        assert!(woken.0.lock().unwrap().is_empty());
+        assert!(woken.0.lock().is_empty());
     }
 
     #[sqlx::test(migrations = false)]
@@ -1889,7 +1887,7 @@ mod tests {
             deliver(&router, DELIVERY, &signature).await,
             StatusCode::NOT_FOUND
         );
-        assert!(woken.0.lock().unwrap().is_empty());
+        assert!(woken.0.lock().is_empty());
     }
 
     #[sqlx::test(migrations = false)]
@@ -2466,10 +2464,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let heard = calls.clone();
         let github = fake::github(move |call| {
-            heard
-                .lock()
-                .unwrap()
-                .push(format!("{} {}", call.token, call.path));
+            heard.lock().push(format!("{} {}", call.token, call.path));
             let permissions = |admin: bool| {
                 (
                     200,
@@ -2499,7 +2494,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
         assert_eq!(text_of(res).await, "You need admin access to o/r for this.");
         assert_eq!(set("ghp_admin").await.status(), StatusCode::NO_CONTENT);
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock();
         assert!(
             calls.contains(&"ghp_admin /repos/o/r".to_owned()),
             "{calls:?}"

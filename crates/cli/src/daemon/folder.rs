@@ -32,12 +32,13 @@
 use std::collections::HashMap;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_git::{Git, Tree};
 use mergepatrol_resolver::{Access, Room};
+use parking_lot::Mutex;
 
 use super::groups::Groups;
 use super::lane::Task;
@@ -145,7 +146,7 @@ impl Folder {
     }
 
     fn clone_lock(&self, clone: &Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.clones.lock().unwrap();
+        let mut locks = self.clones.lock();
         locks.entry(clone.to_owned()).or_default().clone()
     }
 

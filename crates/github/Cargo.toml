@@ -11,6 +11,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 getrandom = "0.4.3"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 mergepatrol-core = { version = "0.1.0", path = "../core" }
+parking_lot = { version = "0.12.5", optional = true }
 reqwest = { version = "0.13.5", features = ["form", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -20,9 +21,10 @@ tracing = "0.1.44"
 
 [features]
 # A scripted GitHub on localhost, for the tests of the crates that use this one.
-testing = ["tokio/io-util", "tokio/net"]
+testing = ["dep:parking_lot", "tokio/io-util", "tokio/net"]
 
 [dev-dependencies]
+parking_lot = "0.12.5"
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt"] }
 
 [lints]

@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -828,8 +828,14 @@ async fn revoke_token_at(api: &str, token: &str) -> Result<()> {
 
 fn api_headers() -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
-    h.insert("accept", "application/vnd.github+json".parse().unwrap());
-    h.insert("x-github-api-version", "2022-11-28".parse().unwrap());
+    h.insert(
+        "accept",
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    h.insert(
+        "x-github-api-version",
+        HeaderValue::from_static("2022-11-28"),
+    );
     h
 }
 
@@ -837,9 +843,10 @@ fn api_headers() -> reqwest::header::HeaderMap {
 /// function says.
 #[cfg(any(test, feature = "testing"))]
 pub mod fake {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
+    use parking_lot::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -876,20 +883,32 @@ pub mod fake {
         responses: Vec<Scripted>,
         keep: fn(&str) -> String,
     ) -> (Installation, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let api = format!("http://{}", listener.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port on localhost");
+        let api = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("a bound listener has an address")
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
         tokio::spawn(async move {
             for (status, headers, body) in responses {
-                let (mut conn, _) = listener.accept().await.unwrap();
+                let (mut conn, _) = listener
+                    .accept()
+                    .await
+                    .expect("the fake accepts a connection");
                 let request = read_request(&mut conn).await;
-                seen.lock().unwrap().push(keep(&request));
+                seen.lock().push(keep(&request));
                 let response = format!(
                     "HTTP/1.1 {status} Scripted\r\ncontent-length: {}\r\nconnection: close\r\n{headers}\r\n{body}",
                     body.len()
                 );
-                conn.write_all(response.as_bytes()).await.unwrap();
+                conn.write_all(response.as_bytes())
+                    .await
+                    .expect("the client reads the response");
             }
         });
         (installation(api), requests)
@@ -935,12 +954,22 @@ pub mod fake {
 
     /// Answers each request to its address, which it returns, as `answer` says.
     async fn listen(answer: impl Fn(Call) -> (u16, String) + Send + Sync + 'static) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let api = format!("http://{}", listener.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port on localhost");
+        let api = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("a bound listener has an address")
+        );
         let answer = Arc::new(answer);
         tokio::spawn(async move {
             loop {
-                let (mut conn, _) = listener.accept().await.unwrap();
+                let (mut conn, _) = listener
+                    .accept()
+                    .await
+                    .expect("the fake accepts a connection");
                 let answer = answer.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut conn).await;
@@ -965,7 +994,9 @@ pub mod fake {
                         "HTTP/1.1 {status} Answered\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    conn.write_all(response.as_bytes()).await.unwrap();
+                    conn.write_all(response.as_bytes())
+                        .await
+                        .expect("the client reads the response");
                 });
             }
         });
@@ -1000,7 +1031,10 @@ pub mod fake {
         let mut buf = Vec::new();
         let mut chunk = [0; 4096];
         loop {
-            let n = conn.read(&mut chunk).await.unwrap();
+            let n = conn
+                .read(&mut chunk)
+                .await
+                .expect("the client sends a request");
             buf.extend_from_slice(&chunk[..n]);
             let text = String::from_utf8_lossy(&buf).into_owned();
             if let Some(end) = text.find("\r\n\r\n") {
@@ -1009,7 +1043,11 @@ pub mod fake {
                     .find_map(|l| {
                         l.to_ascii_lowercase()
                             .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse().unwrap())
+                            .map(|v| {
+                                v.trim()
+                                    .parse()
+                                    .expect("reqwest sends a numeric content-length")
+                            })
                     })
                     .unwrap_or(0);
                 if n == 0 || buf.len() >= end + 4 + length {
@@ -1097,7 +1135,7 @@ mod tests {
         .await;
         let v: Value = gh.graphql("ok", "{ ok }", json!({})).await.unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1113,7 +1151,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.downcast_ref::<RateLimited>().unwrap().remaining() > MAX_RATE_LIMIT_WAIT);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1145,7 +1183,7 @@ mod tests {
             gh.current_name(&old).await.unwrap(),
             RepoName::parse("o/new")
         );
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(requests[1].starts_with("GET /repositories/1 "));
         assert!(
             requests[1]
@@ -1210,7 +1248,7 @@ mod tests {
             fake::serve(vec![(502, "", "bad gateway"), (200, "", r#"{"ok":true}"#)]).await;
         let v: Value = gh.rest(Method::GET, "/x", None).await.unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(*requests.lock().unwrap(), ["GET /x HTTP/1.1"; 2]);
+        assert_eq!(*requests.lock(), ["GET /x HTTP/1.1"; 2]);
     }
 
     #[tokio::test]
@@ -1234,7 +1272,7 @@ mod tests {
             .rest(Method::POST, "/y", Some(json!({ "a": 1 })))
             .await
             .unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1242,7 +1280,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![(404, "", r#"{"message":"Not Found"}"#)]).await;
         let res = gh.request(Method::GET, "/z", None).await.unwrap();
         assert_eq!(res.status, StatusCode::NOT_FOUND);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1259,7 +1297,7 @@ mod tests {
         assert!(!seen[0].delivered() && seen[1].delivered());
         gh.app.redeliver(12).await.unwrap();
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /app/hook/deliveries?per_page=100 HTTP/1.1",
                 "POST /app/hook/deliveries/12/attempts HTTP/1.1",
@@ -1281,10 +1319,7 @@ mod tests {
     async fn a_token_revokes_itself() {
         let (gh, requests) = fake::serve(vec![(204, "", "")]).await;
         revoke_token_at(&gh.app.api, "t").await.unwrap();
-        assert_eq!(
-            *requests.lock().unwrap(),
-            ["DELETE /installation/token HTTP/1.1"]
-        );
+        assert_eq!(*requests.lock(), ["DELETE /installation/token HTTP/1.1"]);
     }
 
     #[tokio::test]

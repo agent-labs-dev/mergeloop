@@ -109,6 +109,11 @@ struct Tokens {
 }
 
 impl ChatGptAuth {
+    /// Sign-ins at `issuer`.
+    ///
+    /// # Panics
+    ///
+    /// If the TLS backend fails to start, as `reqwest::Client::new` does.
     pub fn new(issuer: &str) -> Self {
         Self {
             issuer: issuer.trim_end_matches('/').to_owned(),
@@ -255,12 +260,13 @@ fn now() -> u64 {
 /// A stand-in for OpenAI's sign-in, for tests here and in the crates that use it.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use axum::Router;
     use axum::extract::{Form, Json};
     use axum::http::StatusCode;
     use axum::routing::post;
+    use parking_lot::Mutex;
     use serde_json::{Value, json};
 
     use base64::Engine;
@@ -288,6 +294,10 @@ pub mod testing {
 
     /// OpenAI's sign-in: the user enters the code on the second poll. A login it issues expires
     /// in a minute, a renewed one in ten days.
+    ///
+    /// # Panics
+    ///
+    /// If no port on localhost is free.
     pub async fn issuer() -> Issuer {
         let grants = Arc::<Mutex<Vec<_>>>::default();
         let seen = Arc::clone(&grants);
@@ -304,7 +314,7 @@ pub mod testing {
                 "/api/accounts/deviceauth/token",
                 post(move |Json(body): Json<Value>| async move {
                     assert_eq!(body["device_auth_id"], "dev");
-                    let mut polls = polls.lock().unwrap();
+                    let mut polls = polls.lock();
                     *polls += 1;
                     match *polls {
                         1 => (StatusCode::FORBIDDEN, Json(json!({}))),
@@ -319,7 +329,7 @@ pub mod testing {
                 "/oauth/token",
                 post(move |Form(form): Form<Vec<(String, String)>>| async move {
                     let refresh = form.iter().any(|(k, v)| k == "grant_type" && v == "refresh_token");
-                    seen.lock().unwrap().push(form);
+                    seen.lock().push(form);
                     Json(match refresh {
                         // A refresh leaves out the ID token.
                         true => json!({ "access_token": access(now() + 10 * 24 * 60 * 60), "refresh_token": "r2" }),
@@ -331,8 +341,15 @@ pub mod testing {
                     })
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port on localhost");
+        let url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("a bound listener has an address")
+        );
         tokio::spawn(axum::serve(listener, app).into_future());
         Issuer { url, grants }
     }
@@ -359,7 +376,7 @@ mod tests {
         assert_eq!(login.account_id, "acct");
         assert_eq!(login.email.as_deref(), Some("me@example.com"));
         assert!(login.expires_within(Duration::from_secs(3600)));
-        let exchange = grants.lock().unwrap()[0].clone();
+        let exchange = grants.lock()[0].clone();
         for pair in [
             ("grant_type", "authorization_code"),
             ("code", "code"),
@@ -378,7 +395,7 @@ mod tests {
         assert_eq!(renewed.refresh_token, "r2");
         assert_eq!(renewed.account_id, "acct");
         assert_eq!(renewed.email.as_deref(), Some("me@example.com"));
-        assert!(grants.lock().unwrap()[1].contains(&("refresh_token".into(), "r1".into())));
+        assert!(grants.lock()[1].contains(&("refresh_token".into(), "r1".into())));
     }
 
     #[tokio::test]

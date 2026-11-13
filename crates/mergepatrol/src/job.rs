@@ -57,7 +57,8 @@ pub async fn main_serve(port: u16) -> Result<()> {
 /// Serves `POST /start`, with the link as the body, until it gets one.
 async fn receive_link(listener: tokio::net::TcpListener) -> Result<String> {
     use axum::http::StatusCode;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let tx = Arc::new(Mutex::new(Some(tx)));
     let app = axum::Router::new().route(
@@ -66,7 +67,7 @@ async fn receive_link(listener: tokio::net::TcpListener) -> Result<String> {
             if link.is_empty() {
                 return StatusCode::BAD_REQUEST;
             }
-            match tx.lock().unwrap().take() {
+            match tx.lock().take() {
                 Some(tx) => {
                     let _ = tx.send(link);
                     StatusCode::NO_CONTENT

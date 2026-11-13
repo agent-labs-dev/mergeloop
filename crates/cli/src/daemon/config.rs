@@ -39,7 +39,15 @@ Config file (~/.mergeloop/daemon.toml, or --config FILE; no file means these def
   model = \"\"                 Default: the CLI's own
   effort = \"\"                Default: the CLI's own
   args = []                  More arguments for every run
-  timeout_minutes = 60       The longest one agent run may take";
+  timeout_minutes = 60       The longest one agent run may take
+
+  [reviewer]                 The agent that reviews each build before it is pushed, with
+                             the builder's settings above, read-only
+  enabled = true             false: no review
+  agent = \"<the other>\"      Default: the other agent when its CLI is on PATH, else (or
+                             when command is set) the builder's
+  command = \"<agent>\"        Default: the agent's name, or, for the builder's own agent,
+                             the builder's command and args";
 
 /// What a build may not read by default: the MergeLoop session, and where credentials live in
 /// a home folder. The agent CLIs read their own login themselves, outside their sandboxes, so
@@ -86,6 +94,8 @@ pub struct Config {
     /// What a build may not read in `workspace` access.
     pub deny_read: Vec<PathBuf>,
     pub builder: LocalAgent,
+    /// Reviews each build's change before it is pushed. `None` turns the review off.
+    pub reviewer: Option<LocalAgent>,
 }
 
 impl Config {
@@ -109,6 +119,11 @@ impl Config {
     }
 
     pub fn parse(text: &str, home: &Path) -> Result<Self> {
+        Self::read(text, home, &on_path)
+    }
+
+    /// `parse`, where `installed` says whether a program of that name is on `PATH`.
+    fn read(text: &str, home: &Path, installed: &dyn Fn(&str) -> bool) -> Result<Self> {
         // toml's error names the line and column.
         let file: File = toml::from_str(text)?;
         if file.slots == 0 {
@@ -140,26 +155,85 @@ impl Config {
                 );
             }
         }
-        let b = file.builder;
-        if b.timeout_minutes == 0 {
-            bail!("builder.timeout_minutes must be at least 1");
-        }
-        let blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let builder = file.builder.agent("builder", None)?;
+        let reviewer = match file.reviewer.enabled {
+            true => Some(file.reviewer.agent(&builder, installed)?),
+            false => None,
+        };
         Ok(Config {
             slots: file.slots,
             workspace,
             access: file.access,
             deny_read,
-            builder: LocalAgent {
-                vendor: b.agent,
-                command: blank(b.command).unwrap_or_else(|| b.agent.name().to_owned()),
-                model: blank(b.model),
-                effort: blank(b.effort),
-                args: b.args,
-                timeout: Duration::from_secs(60 * b.timeout_minutes),
-                max_turns: MAX_TURNS,
-            },
+            builder,
+            reviewer,
         })
+    }
+}
+
+/// Whether a program named `name` is in a folder on `PATH`.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+fn blank(v: Option<String>) -> Option<String> {
+    v.filter(|v| !v.trim().is_empty())
+}
+
+impl AgentFile {
+    /// The agent of section `section`. `command` is its default command and args, when not
+    /// the agent's name and none.
+    fn agent(self, section: &str, command: Option<(&str, &[String])>) -> Result<LocalAgent> {
+        if self.timeout_minutes == 0 {
+            bail!("{section}.timeout_minutes must be at least 1");
+        }
+        let (command, args) = match (blank(self.command), command) {
+            (Some(c), _) => (c, self.args),
+            (None, Some((c, args))) if self.args.is_empty() => (c.to_owned(), args.to_vec()),
+            (None, _) => (self.agent.name().to_owned(), self.args),
+        };
+        Ok(LocalAgent {
+            vendor: self.agent,
+            command,
+            model: blank(self.model),
+            effort: blank(self.effort),
+            args,
+            timeout: Duration::from_secs(60 * self.timeout_minutes),
+            max_turns: MAX_TURNS,
+        })
+    }
+}
+
+impl ReviewerFile {
+    /// The reviewer: by default the other vendor's CLI when it is installed, a fresh look by
+    /// another model; else the builder's own CLI.
+    fn agent(self, builder: &LocalAgent, installed: &dyn Fn(&str) -> bool) -> Result<LocalAgent> {
+        let other = match builder.vendor {
+            Vendor::Claude => Vendor::Codex,
+            Vendor::Codex => Vendor::Claude,
+        };
+        let vendor = match self.agent {
+            Some(vendor) => vendor,
+            None if self.command.is_none() && installed(other.name()) => other,
+            None => builder.vendor,
+        };
+        let same =
+            (vendor == builder.vendor).then_some((builder.command.as_str(), &builder.args[..]));
+        AgentFile {
+            agent: vendor,
+            command: self.command,
+            model: self.model,
+            effort: self.effort,
+            args: self.args,
+            timeout_minutes: self.timeout_minutes,
+        }
+        .agent("reviewer", same)
     }
 }
 
@@ -179,6 +253,7 @@ struct File {
     access: AccessMode,
     deny_read: Option<Vec<String>>,
     builder: AgentFile,
+    reviewer: ReviewerFile,
 }
 
 impl Default for File {
@@ -189,6 +264,7 @@ impl Default for File {
             access: AccessMode::Workspace,
             deny_read: None,
             builder: AgentFile::default(),
+            reviewer: ReviewerFile::default(),
         }
     }
 }
@@ -218,6 +294,35 @@ impl Default for AgentFile {
     }
 }
 
+/// `[reviewer]`: an `AgentFile` whose agent has no fixed default, and that can be turned off.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct ReviewerFile {
+    enabled: bool,
+    #[serde(default, with = "vendor::optional")]
+    agent: Option<Vendor>,
+    command: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    args: Vec<String>,
+    timeout_minutes: u64,
+}
+
+impl Default for ReviewerFile {
+    fn default() -> Self {
+        let b = AgentFile::default();
+        ReviewerFile {
+            enabled: true,
+            agent: None,
+            command: b.command,
+            model: b.model,
+            effort: b.effort,
+            args: b.args,
+            timeout_minutes: b.timeout_minutes,
+        }
+    }
+}
+
 mod vendor {
     use mergepatrol_resolver::Vendor;
     use serde::{Deserialize, Deserializer, de::Error};
@@ -229,6 +334,15 @@ mod vendor {
             other => Err(D::Error::custom(format!(
                 "unknown agent `{other}`, expected `claude` or `codex`"
             ))),
+        }
+    }
+
+    pub mod optional {
+        use mergepatrol_resolver::Vendor;
+        use serde::Deserializer;
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vendor>, D::Error> {
+            super::deserialize(d).map(Some)
         }
     }
 }
@@ -318,6 +432,52 @@ timeout_minutes = 5
             (config.builder.vendor, config.builder.command.as_str()),
             (Vendor::Claude, "mclaude")
         );
+    }
+
+    fn reviewer(text: &str, installed: &[&str]) -> Option<LocalAgent> {
+        Config::read(text, &home(), &|name| installed.contains(&name))
+            .unwrap()
+            .reviewer
+    }
+
+    #[test]
+    fn the_reviewer_is_the_other_agent_when_its_cli_is_installed_else_the_builders() {
+        let r = reviewer("", &["claude", "codex"]).unwrap();
+        assert_eq!((r.vendor, r.command.as_str()), (Vendor::Codex, "codex"));
+        let codex = "[builder]\nagent = \"codex\"\n";
+        let r = reviewer(codex, &["claude", "codex"]).unwrap();
+        assert_eq!((r.vendor, r.command.as_str()), (Vendor::Claude, "claude"));
+
+        let mclaude = "[builder]\ncommand = \"mclaude\"\nargs = [\"--strict-mcp-config\"]\n";
+        let r = reviewer(mclaude, &["mclaude"]).unwrap();
+        assert_eq!((r.vendor, r.command.as_str()), (Vendor::Claude, "mclaude"));
+        assert_eq!(r.args, ["--strict-mcp-config"]);
+        assert_eq!(r.model, None);
+    }
+
+    #[test]
+    fn the_reviewer_section_names_its_agent_or_turns_it_off() {
+        let text = "[builder]\ncommand = \"mclaude\"\n\n[reviewer]\ncommand = \"mclaude\"\nmodel = \"haiku\"\neffort = \"low\"\nargs = [\"-x\"]\ntimeout_minutes = 5\n";
+        let r = reviewer(text, &["codex"]).unwrap();
+        assert_eq!((r.vendor, r.command.as_str()), (Vendor::Claude, "mclaude"));
+        assert_eq!(
+            (r.model.as_deref(), r.effort.as_deref()),
+            (Some("haiku"), Some("low"))
+        );
+        assert_eq!(
+            (r.args.as_slice(), r.timeout),
+            (&["-x".to_owned()][..], Duration::from_secs(300))
+        );
+        let r = reviewer("[reviewer]\nagent = \"codex\"\n", &[]).unwrap();
+        assert_eq!((r.vendor, r.command.as_str()), (Vendor::Codex, "codex"));
+        assert!(reviewer("[reviewer]\nenabled = false\n", &["codex"]).is_none());
+        for bad in [
+            "[reviewer]\ntimeout_minutes = 0\n",
+            "[reviewer]\nagent = \"x\"\n",
+            "[reviewer]\nmodle = \"x\"\n",
+        ] {
+            assert!(Config::read(bad, &home(), &|_| true).is_err(), "{bad}");
+        }
     }
 
     #[test]

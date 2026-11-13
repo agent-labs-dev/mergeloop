@@ -9,8 +9,9 @@ use std::time::Duration;
 use anyhow::Result;
 use mergepatrol_git::Git;
 use mergepatrol_resolver::{
-    Access, BuildRequest, Env, LocalAgent, Outcome, Resolution, VerifyFailed, build_description,
-    build_prompt, commit_subject,
+    Access, BuildFinding, BuildRequest, BuildReview, Env, LocalAgent, Outcome, Resolution, Room,
+    VerifyFailed, build_description, build_prompt, commit_subject, review_build_findings,
+    review_build_prompt,
 };
 use tokio::sync::{Semaphore, watch};
 
@@ -23,6 +24,10 @@ use crate::client::{Refusal, Refused, needs_sign_in, refusal};
 /// How many times `open_build_pr` is called again when it says to.
 const OPEN_RETRIES: u32 = 3;
 
+/// The most times the reviewer reads a build's change. Findings left after the last make the
+/// build stuck.
+pub(super) const REVIEW_ROUNDS: u32 = 3;
+
 /// The longest reason a stuck build gives: it goes on the issue as a comment.
 const REASON_MAX: usize = 3000;
 
@@ -31,6 +36,8 @@ const REASON_MAX: usize = 3000;
 pub struct Builder {
     pub folder: Folder,
     pub agent: LocalAgent,
+    /// Reads each build's change before it is pushed, when set.
+    pub reviewer: Option<LocalAgent>,
     pub access: Access,
     /// How often a build tells the server it is alive. The server lets 30 minutes pass.
     pub heartbeat_every: Duration,
@@ -93,9 +100,10 @@ impl Builder {
         task: &Task,
         stop: watch::Receiver<bool>,
     ) -> Result<Ended> {
+        let (stage, staged) = watch::channel(Stage::Building);
         let work = tokio::select! {
-            work = self.work(lane, task) => work,
-            e = heartbeats(lane, task, self.heartbeat_every) => Err(e),
+            work = self.work(lane, task, &stage) => work,
+            e = heartbeats(lane, task, || *staged.borrow(), self.heartbeat_every) => Err(e),
             () = stopped(stop) => Err(Stopped.into()),
         };
         let ended = settle(lane, task, work).await;
@@ -107,7 +115,7 @@ impl Builder {
     /// so, and cleaned up. An error only when the sign-in is no good.
     pub async fn failed(&self, lane: &Lane, task: &Task, why: &str) -> Result<()> {
         let doing = match task.stage() {
-            Stage::Building => "building it",
+            Stage::Building | Stage::Reviewing => "building it",
             Stage::Landing => "landing its PR",
         };
         let why = format!("The daemon failed while {doing}: {why}");
@@ -131,7 +139,7 @@ impl Builder {
             .await;
     }
 
-    async fn work(&self, lane: &Lane, task: &Task) -> Result<Work> {
+    async fn work(&self, lane: &Lane, task: &Task, stage: &watch::Sender<Stage>) -> Result<Work> {
         lane.heartbeat(task, Stage::Building).await?;
         let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         let checkout = self.folder.checkout(task, &token, &self.access).await?;
@@ -143,24 +151,113 @@ impl Builder {
             task,
             &format!("building in {}", checkout.room.tree.display()),
         );
-        let prompt = |failed: Option<&VerifyFailed>| {
-            build_prompt(&BuildRequest {
-                repo: &task.repo,
-                issue: task.issue,
-                title: &task.title,
-                body: &task.body,
-                verify: &task.verify,
-                failed,
-                findings: &[],
-            })
-        };
         let env = env::nobody(&checkout.room);
-        let run = match self.change(task, &checkout, prompt, &env, "build").await? {
-            Ok(run) => run,
-            Err(why) => return Ok(Work::Stuck(why)),
+        let mut findings: Vec<BuildFinding> = vec![];
+        let mut built: Option<Resolution> = None;
+        let mut fixed = 0;
+        let mut round = 1;
+        let reviewed = loop {
+            let prompt = |failed: Option<&VerifyFailed>| {
+                build_prompt(&BuildRequest {
+                    repo: &task.repo,
+                    issue: task.issue,
+                    title: &task.title,
+                    body: &task.body,
+                    verify: &task.verify,
+                    failed,
+                    findings: &findings,
+                })
+            };
+            let step = match round {
+                1 => "build".to_owned(),
+                n => format!("build-{n}"),
+            };
+            let run = match self.change(task, &checkout, prompt, &env, &step).await? {
+                Ok(run) => run,
+                Err(why) => return Ok(Work::Stuck(why)),
+            };
+            // The first run built the issue: its subject and description say what the PR is.
+            let run = match built {
+                Some(first) if commit_subject(&first.text).is_some() => first,
+                _ => run,
+            };
+            let Some(head) = commit(task, &checkout, &base, &run).await? else {
+                return Ok(Work::Stuck("The agent changed nothing.".into()));
+            };
+            built = Some(run);
+            let Some(reviewer) = &self.reviewer else {
+                break None;
+            };
+            stage.send_replace(Stage::Reviewing);
+            lane.heartbeat(task, Stage::Reviewing).await?;
+            let review = self
+                .review(task, reviewer, &checkout, &base, &head, round)
+                .await?;
+            stage.send_replace(Stage::Building);
+            findings = match review {
+                Ok(findings) => findings,
+                Err(why) => return Ok(Work::Stuck(why)),
+            };
+            if findings.is_empty() {
+                break Some(Reviewed {
+                    by: reviewer.clone(),
+                    rounds: round,
+                    fixed,
+                });
+            }
+            say(
+                task,
+                &format!("the reviewer asks for {} change(s)", findings.len()),
+            );
+            if round == REVIEW_ROUNDS {
+                return Ok(Work::Stuck(unreviewed(&findings)));
+            }
+            fixed += findings.len();
+            lane.heartbeat(task, Stage::Building).await?;
+            round += 1;
         };
-        // Ticket 07's review of the change goes here, before anything is pushed.
-        self.publish(lane, task, &checkout, &base, &run).await
+        let built = built.expect("a round ran");
+        self.publish(lane, task, &checkout, &built, reviewed.as_ref())
+            .await
+    }
+
+    /// What the reviewer asks of the change at `head`, in a fresh session of its own that can
+    /// read the build's tree but not write it. `Err` with why the build is stuck when it did not
+    /// review, or when the tree is not as it was: then nothing it did is pushed.
+    async fn review(
+        &self,
+        task: &Task,
+        reviewer: &LocalAgent,
+        checkout: &Checkout,
+        base: &str,
+        head: &str,
+        round: u32,
+    ) -> Result<Result<Vec<BuildFinding>, String>> {
+        let room = self.folder.review_room(task.build).await?;
+        let prompt = review_build_prompt(&BuildReview {
+            repo: &task.repo,
+            issue: task.issue,
+            title: &task.title,
+            body: &task.body,
+            tree: &checkout.room.tree,
+            base,
+            verify: &task.verify,
+        });
+        let env = env::nobody(&room);
+        let step = format!("review-{round}");
+        let run = self
+            .run_agent(task, reviewer, &room, &prompt, &env, &step)
+            .await?;
+        let tree = &checkout.tree;
+        if !Git.tree_clean(tree).await? || Git.tree_head(tree).await? != head {
+            return Ok(Err(
+                "The reviewer changed the build's worktree, which it may not, so the build \
+                 pushed nothing."
+                    .into(),
+            ));
+        }
+        Ok(review_build_findings(&run.outcome, &run.text)
+            .map_err(|e| format!("The reviewer did not review the change: {e:#}")))
     }
 
     /// The agent's change, which the verify commands pass: the agent's last run that names its
@@ -176,7 +273,7 @@ impl Builder {
     ) -> Result<Result<Resolution, String>> {
         let room = &checkout.room;
         let run = self
-            .run_agent(task, checkout, &prompt(None), env, step)
+            .run_agent(task, &self.agent, room, &prompt(None), env, step)
             .await?;
         if let Some(why) = stuck_by(&run.outcome) {
             return Ok(Err(why));
@@ -203,7 +300,8 @@ impl Builder {
         let fix = self
             .run_agent(
                 task,
-                checkout,
+                &self.agent,
+                room,
                 &prompt(Some(&failed)),
                 env,
                 &format!("{step}-fix"),
@@ -229,7 +327,8 @@ impl Builder {
     async fn run_agent(
         &self,
         task: &Task,
-        checkout: &Checkout,
+        agent: &LocalAgent,
+        room: &Room,
         prompt: &str,
         env: &Env,
         step: &str,
@@ -240,24 +339,13 @@ impl Builder {
             .join(format!("{step}.jsonl"));
         let groups = self.folder.groups();
         let spawned = |pid| groups.track(task.build, pid);
-        let run = self
-            .agent
-            .run(
-                &checkout.room,
-                prompt,
-                &self.access,
-                env,
-                &transcript,
-                spawned,
-            )
+        let run = agent
+            .run(room, prompt, &self.access, env, &transcript, spawned)
             .await;
         // What the agent left running ends with its run.
         groups.stop(task.build).await?;
         let run = run?;
-        say(
-            task,
-            &format!("the agent's {step} run ended: {:?}", run.outcome),
-        );
+        say(task, &format!("the {step} run ended: {:?}", run.outcome));
         Ok(run)
     }
 }
@@ -271,28 +359,88 @@ pub(super) fn stuck_by(outcome: &Outcome) -> Option<String> {
     }
 }
 
+/// How the local review went, for the PR.
+pub(super) struct Reviewed {
+    by: LocalAgent,
+    /// The reviews read, the last of which found nothing.
+    rounds: u32,
+    /// The findings the builder fixed in the rounds before.
+    fixed: usize,
+}
+
+/// The PR body's section on the local review.
+fn reviewed_section(r: &Reviewed) -> String {
+    let model =
+        r.by.model
+            .as_deref()
+            .map(|m| format!(", {m}"))
+            .unwrap_or_default();
+    let went = match (r.rounds, r.fixed) {
+        (1, _) => "It found nothing to change.".to_owned(),
+        (n, fixed) => format!(
+            "It took {n} rounds: the builder fixed {fixed} finding(s), and the last round found \
+             nothing."
+        ),
+    };
+    format!(
+        "### Local review\n\nBefore this PR opened, a fresh session of `{}` ({}{model}) read the \
+         change against the issue, read-only, for bugs, parts of the issue left undone, risky \
+         code without tests, and breaks of the repo's conventions. {went}",
+        r.by.command,
+        r.by.vendor.name()
+    )
+}
+
+/// Why a build whose reviewer still asks for changes after the last round is stuck.
+fn unreviewed(findings: &[BuildFinding]) -> String {
+    let listed: String = findings
+        .iter()
+        .map(|f| format!("\n- `{}:{}`: {}", f.file, f.line, f.finding.trim()))
+        .collect();
+    format!(
+        "The reviewer still asked for changes after {REVIEW_ROUNDS} rounds, so the build pushed \
+         nothing:{listed}"
+    )
+}
+
+/// Commits the change as the App's bot, with the developer as co-author, on `base`: the
+/// tree's commit, or `None` when there is no change. Safe to repeat: each time it is one commit
+/// on `base`.
+async fn commit(
+    task: &Task,
+    checkout: &Checkout,
+    base: &str,
+    run: &Resolution,
+) -> Result<Option<String>> {
+    let (bot, dev) = (&task.author, &task.co_author);
+    let message = format!(
+        "{}\n\nCo-authored-by: {} <{}>\n",
+        subject(task, run),
+        dev.name,
+        dev.email
+    );
+    let author = (bot.name.as_str(), bot.email.as_str());
+    if !Git.squash(&checkout.tree, base, &message, author).await? {
+        return Ok(None);
+    }
+    Ok(Some(Git.tree_head(&checkout.tree).await?))
+}
+
+fn subject(task: &Task, run: &Resolution) -> String {
+    commit_subject(&run.text).unwrap_or_else(|| format!("Build #{}: {}", task.issue, task.title))
+}
+
 impl Builder {
-    /// Commits the change as the App's bot, pushes it with a fresh token (the first may be near
-    /// the end of its hour), and has the server open the PR.
+    /// Pushes the committed change with a fresh token (the first may be near the end of its
+    /// hour), and has the server open the PR.
     async fn publish(
         &self,
         lane: &Lane,
         task: &Task,
         checkout: &Checkout,
-        base: &str,
         run: &Resolution,
+        reviewed: Option<&Reviewed>,
     ) -> Result<Work> {
-        let subject = commit_subject(&run.text)
-            .unwrap_or_else(|| format!("Build #{}: {}", task.issue, task.title));
-        let (bot, dev) = (&task.author, &task.co_author);
-        let message = format!(
-            "{subject}\n\nCo-authored-by: {} <{}>\n",
-            dev.name, dev.email
-        );
-        let author = (bot.name.as_str(), bot.email.as_str());
-        if !Git.squash(&checkout.tree, base, &message, author).await? {
-            return Ok(Work::Stuck("The agent changed nothing.".into()));
-        }
         let head = Git.tree_head(&checkout.tree).await?;
         let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         if !push(task, checkout, &token, &head).await? {
@@ -303,7 +451,13 @@ impl Builder {
             )));
         }
         say(task, &format!("pushed {}", task.branch));
-        let description = build_description(&run.text);
+        let subject = subject(task, run);
+        let mut description = build_description(&run.text);
+        if let Some(reviewed) = reviewed {
+            description = format!("{description}\n\n{}", reviewed_section(reviewed))
+                .trim()
+                .to_owned();
+        }
         let mut tries = 0;
         let pr = loop {
             match heard(lane, task, || lane.open_pr(task, &subject, &description)).await {
@@ -440,11 +594,17 @@ pub(super) async fn heard<T, F: std::future::Future<Output = Result<T>>>(
     }
 }
 
-/// Heartbeats the build every `every`, until a heartbeat fails: that error.
-pub(super) async fn heartbeats(lane: &Lane, task: &Task, every: Duration) -> anyhow::Error {
+/// Heartbeats the build every `every`, saying the stage `stage` gives, until a heartbeat fails:
+/// that error.
+pub(super) async fn heartbeats(
+    lane: &Lane,
+    task: &Task,
+    stage: impl Fn() -> Stage,
+    every: Duration,
+) -> anyhow::Error {
     loop {
         tokio::time::sleep(every).await;
-        if let Err(e) = lane.heartbeat(task, task.stage()).await {
+        if let Err(e) = lane.heartbeat(task, stage()).await {
             return e;
         }
     }

@@ -82,7 +82,25 @@ impl Daemon {
             },
             self.config.workspace.display()
         );
-        for caveat in access.caveats(agent.vendor) {
+        let reviewer = self.config.reviewer.as_ref();
+        match reviewer {
+            Some(r) => eprintln!(
+                "mergeloop: daemon: reviewer `{}` ({}), read-only",
+                r.command,
+                r.vendor.name()
+            ),
+            None => eprintln!("mergeloop: daemon: no review before a build is pushed"),
+        }
+        let mut caveats = access.caveats(agent.vendor);
+        for caveat in reviewer
+            .map(|r| access.caveats(r.vendor))
+            .unwrap_or_default()
+        {
+            if !caveats.contains(&caveat) {
+                caveats.push(caveat);
+            }
+        }
+        for caveat in caveats {
             eprintln!("mergeloop: daemon: note: {caveat}");
         }
         let (folder, _lock) = Folder::open(&self.config.workspace)?;
@@ -109,6 +127,7 @@ impl Daemon {
         }
         let builder = Builder {
             agent: self.config.builder.clone(),
+            reviewer: self.config.reviewer.clone(),
             access,
             folder,
             heartbeat_every: self.heartbeat_every,

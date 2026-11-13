@@ -9,6 +9,8 @@
 //!   builds/<build>/           the build's room: all that the build may write
 //!     tree/                   its git worktree, on the local branch `mergeloop/build-<issue>`
 //!     tmp/                    its TMPDIR
+//!   reviews/<build>/          the reviewer's room, made empty for each review: all that the
+//!     tmp/                    reviewer may write, and its TMPDIR. It reads the build's tree
 //!   transcripts/<build>/      the agents' output, kept 7 days
 //! ```
 //!
@@ -111,6 +113,23 @@ impl Folder {
         }
     }
 
+    /// A reviewer's room, made empty: its own folder, holding its temp folder, and the one place
+    /// it may write. It reads the build's tree from there. It is outside the build's room, so
+    /// nothing the builder wrote is in a folder around it, where a CLI looks for instructions.
+    pub async fn review_room(&self, build: u64) -> Result<Room> {
+        let root = self.reviews(build);
+        remove_dir(&root).await?;
+        tokio::fs::create_dir_all(&root).await?;
+        Ok(Room {
+            tree: root.clone(),
+            root,
+        })
+    }
+
+    fn reviews(&self, build: u64) -> PathBuf {
+        self.root.join("reviews").join(build.to_string())
+    }
+
     pub fn transcripts(&self, build: u64) -> PathBuf {
         self.root.join("transcripts").join(build.to_string())
     }
@@ -186,6 +205,7 @@ impl Folder {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
+        remove_dir(&self.reviews(task.build)).await?;
         self.remove_locked(&clone, &self.room(task.build).root, &task.branch)
             .await
     }
@@ -211,7 +231,8 @@ impl Folder {
     /// left half made, and the transcripts older than `TRANSCRIPTS_KEPT`. Heals each clone a
     /// killed git left locked. Run it before any build starts.
     pub async fn reconcile(&self, keep: &[u64]) -> Result<()> {
-        for dir in list(&self.root.join("builds"))? {
+        let rooms = list(&self.root.join("builds"))?;
+        for dir in rooms.into_iter().chain(list(&self.root.join("reviews"))?) {
             let held = dir
                 .file_name()
                 .and_then(|n| n.to_str())

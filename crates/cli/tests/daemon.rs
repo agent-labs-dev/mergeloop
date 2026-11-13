@@ -13,6 +13,9 @@ use mergeloop_cli::daemon::lane::Task;
 use mergeloop_cli::session::{self, Secret};
 use serde_json::{Value, json};
 
+/// A test's daemon reviews nothing unless it says so: the real `codex` may be on `PATH`.
+const NO_REVIEW: &str = "\n[reviewer]\nenabled = false\n";
+
 const BOT: (&str, &str) = ("mp[bot]", "1+mp[bot]@users.noreply.github.com");
 const DEV: (&str, &str) = ("Ana", "ana@example.com");
 
@@ -103,7 +106,7 @@ impl World {
 
     fn config(&self, slots: usize, command: &Path) -> Config {
         let text = format!(
-            "slots = {slots}\nworkspace = \"{}\"\naccess = \"full\"\n\n[builder]\ncommand = \"{}\"\n",
+            "slots = {slots}\nworkspace = \"{}\"\naccess = \"full\"\n\n[builder]\ncommand = \"{}\"\n{NO_REVIEW}",
             self.workspace().display(),
             command.display()
         );
@@ -117,7 +120,7 @@ impl World {
             .map(|p| format!("\"{}\"", p.display()))
             .collect();
         let text = format!(
-            "workspace = \"{}\"\naccess = \"workspace\"\ndeny_read = [{}]\n\n[builder]\ncommand = \"{}\"\n",
+            "workspace = \"{}\"\naccess = \"workspace\"\ndeny_read = [{}]\n\n[builder]\ncommand = \"{}\"\n{NO_REVIEW}",
             self.workspace().display(),
             paths.join(", "),
             command.display()
@@ -885,8 +888,14 @@ fn mergeloop(w: &World, home: &Path, args: &[&str]) -> tokio::process::Command {
 async fn the_command_runs_the_agent_the_config_names_and_stops_on_ctrl_c() {
     let w = World::new().await;
     w.fake.add_task(w.task(1, 7, &[]));
-    // Found on PATH by the name the config gives it: no `claude` anywhere.
-    w.agent("my-agent", "echo built > feature.txt", BUILT);
+    // Found on PATH by the name the config gives it: no `claude` anywhere. With no `codex` on
+    // PATH either, it reviews too, in a fresh run.
+    let none = w.output("none", NOTHING);
+    let body = format!(
+        "case \"$prompt\" in 'You are reviewing'*) cat '{}'; exit 0;; esac\necho built > feature.txt",
+        none.display()
+    );
+    w.agent("my-agent", &body, BUILT);
     let home = w.root().join("home");
     let _ = w.client();
     std::fs::write(
@@ -924,8 +933,9 @@ async fn the_command_runs_the_agent_the_config_names_and_stops_on_ctrl_c() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(stderr.contains("builder `my-agent`"), "{stderr}");
+    assert!(stderr.contains("reviewer `my-agent` (claude)"), "{stderr}");
     assert!(stderr.contains("opened PR #101"), "{stderr}");
-    assert_eq!(w.runs(), 1);
+    assert_eq!(w.runs(), 2, "it built, then reviewed");
     assert!(w.pushed("mergeloop/build-7").is_some());
     assert_eq!(w.left(), (vec![], vec![]));
 }
@@ -951,6 +961,8 @@ async fn daemon_help_shows_every_setting_with_its_default() {
         "effort = ",
         "args = []",
         "timeout_minutes = 60",
+        "[reviewer]",
+        "enabled = true",
     ] {
         assert!(help.contains(said), "{said}: {help}");
     }
@@ -1731,4 +1743,299 @@ async fn a_pr_closed_while_it_waits_on_a_human_ends_its_build_as_stuck() {
     let why = released[0].1.as_deref().expect("released as stuck");
     assert!(why.contains("A person closed PR #105"), "{why}");
     assert_eq!(w.fake.lane(|l| l.reports.clone()), [(5, "waiting".into())]);
+}
+
+/// A reviewer's answer when the change needs nothing.
+const NOTHING: &str = "{\"findings\": []}";
+
+fn finding(file: &str, line: u32, what: &str) -> String {
+    json!({ "findings": [{ "file": file, "line": line, "finding": what }] }).to_string()
+}
+
+impl World {
+    /// A fake reviewer at `bin/<name>`: a Claude CLI whose `n`th run answers `answers[n]`, or
+    /// the last. Each run notes its cwd in `reviews`, its prompt in `review-prompts`, and the
+    /// tokens it holds in `notes`, then runs `body`.
+    fn reviewer(&self, name: &str, answers: &[&str], body: &str) -> PathBuf {
+        let outs: Vec<PathBuf> = answers
+            .iter()
+            .enumerate()
+            .map(|(i, a)| self.output(&format!("{name}-{i}"), a))
+            .collect();
+        let pick: String = outs
+            .iter()
+            .enumerate()
+            .map(|(i, out)| format!("{i}) out='{}';;\n", out.display()))
+            .collect();
+        let last = outs.last().unwrap().display();
+        let (reviews, prompts) = (
+            self.root().join("reviews"),
+            self.root().join("review-prompts"),
+        );
+        let script = self.root().join("bin").join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprompt=\"$2\"\nn=$(wc -l < '{reviews}' 2>/dev/null || echo 0)\nn=$((n))\n\
+                 echo \"$PWD\" >> '{reviews}'\nprintf '%s\\n---\\n' \"$prompt\" >> '{prompts}'\n{tokens}\n{body}\n\
+                 case $n in\n{pick}*) out='{last}';;\nesac\ncat \"$out\"\n",
+                reviews = reviews.display(),
+                prompts = prompts.display(),
+                tokens = which_tokens(&self.root().join("notes"), "reviewer"),
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The folders the reviewer ran in, one a run.
+    fn reviews(&self) -> Vec<String> {
+        let reviews = std::fs::read_to_string(self.root().join("reviews")).unwrap_or_default();
+        reviews.lines().map(str::to_owned).collect()
+    }
+
+    /// `config`, with `reviewer` as the reviewer's command, in `access`.
+    fn reviewed(&self, builder: &Path, reviewer: &Path, access: &str) -> Config {
+        let text = format!(
+            "workspace = \"{}\"\naccess = \"{access}\"\ndeny_read = []\n\n[builder]\ncommand = \"{}\"\n\n[reviewer]\ncommand = \"{}\"\n",
+            self.workspace().display(),
+            builder.display(),
+            reviewer.display()
+        );
+        Config::parse(&text, self.root()).unwrap()
+    }
+
+    /// A fake builder that notes each prompt it is given in `prompts`, and builds.
+    fn noting_builder(&self) -> PathBuf {
+        let prompts = self.root().join("prompts");
+        let body = format!(
+            "printf '%s\\n---\\n' \"$prompt\" >> '{}'\necho \"built $(($(wc -l < '{}')))\" > feature.txt",
+            prompts.display(),
+            self.root().join("runs").display()
+        );
+        self.agent("builder", &body, BUILT)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finding_goes_back_to_the_builder_and_once_the_reviewer_asks_nothing_the_pr_opens() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &["test -f feature.txt"]));
+    let builder = w.noting_builder();
+    let one = finding("feature.txt", 1, "Say what was built.");
+    let reviewer = w.reviewer("reviewer", &[&one, NOTHING], "");
+
+    w.run(w.reviewed(&builder, &reviewer, "full"), |w| {
+        w.fake.lane(|l| l.ended() == 1)
+    })
+    .await;
+
+    assert_eq!(
+        (w.runs(), w.reviews().len()),
+        (2, 2),
+        "built twice, reviewed twice"
+    );
+    let prompts = std::fs::read_to_string(w.root().join("prompts")).unwrap();
+    let second = prompts.split("\n---\n").nth(1).unwrap();
+    assert!(
+        second.contains("- `feature.txt:1`: Say what was built."),
+        "{second}"
+    );
+    let tree = w.workspace().canonicalize().unwrap().join("builds/1/tree");
+    let room = w.workspace().canonicalize().unwrap().join("reviews/1");
+    assert!(
+        w.reviews().iter().all(|r| *r == room.display().to_string()),
+        "{:?}",
+        w.reviews()
+    );
+    let asked = std::fs::read_to_string(w.root().join("review-prompts")).unwrap();
+    assert!(
+        asked.contains(&format!("git -C {}", tree.display())),
+        "{asked}"
+    );
+    let notes = std::fs::read_to_string(w.root().join("notes")).unwrap();
+    assert_eq!(
+        notes.lines().collect::<Vec<_>>(),
+        ["reviewer none", "reviewer none"]
+    );
+
+    // What it pushed is the second build, as one commit, and the PR says how the review went.
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-7:feature.txt"]),
+        "built 2\n"
+    );
+    assert_eq!(
+        git(&w.remote(), &["rev-parse", "mergeloop/build-7~1"]),
+        git(&w.remote(), &["rev-parse", "main"]),
+    );
+    let (_, title, body) = w.fake.lane(|l| l.opened[0].clone());
+    assert_eq!(title, "Add the feature");
+    assert!(body.starts_with("Adds the feature."), "{body}");
+    assert!(body.contains("### Local review"), "{body}");
+    assert!(
+        body.contains("It took 2 rounds: the builder fixed 1 finding(s)"),
+        "{body}"
+    );
+    let stages: Vec<Value> = w
+        .fake
+        .args_of("heartbeat_build")
+        .into_iter()
+        .map(|a| a["stage"].clone())
+        .collect();
+    assert!(stages.contains(&json!("reviewing")), "{stages:?}");
+    assert_eq!(w.left(), (vec![], vec![]));
+    assert!(!w.workspace().join("reviews/1").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn findings_left_after_three_rounds_release_the_build_as_stuck_with_them_and_push_nothing() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    let builder = w.noting_builder();
+    let always = finding("feature.txt", 1, "Still wrong.");
+    let reviewer = w.reviewer("reviewer", &[&always], "");
+
+    w.run(w.reviewed(&builder, &reviewer, "full"), |w| {
+        w.fake.lane(|l| l.ended() == 1)
+    })
+    .await;
+
+    assert_eq!((w.runs(), w.reviews().len()), (3, 3));
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("after 3 rounds"), "{why}");
+    assert!(why.contains("- `feature.txt:1`: Still wrong."), "{why}");
+    assert!(w.pushed("mergeloop/build-7").is_none());
+    assert!(w.fake.lane(|l| l.opened.is_empty()));
+    assert_eq!(w.left(), (vec![], vec![]));
+    assert!(!w.workspace().join("reviews/1").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reviewer_that_does_not_answer_with_its_findings_makes_the_build_stuck() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    let builder = w.noting_builder();
+    let reviewer = w.reviewer("reviewer", &["Looks good to me."], "");
+
+    w.run(w.reviewed(&builder, &reviewer, "full"), |w| {
+        w.fake.lane(|l| l.ended() == 1)
+    })
+    .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(
+        why.contains("The reviewer did not review the change"),
+        "{why}"
+    );
+    assert!(w.pushed("mergeloop/build-7").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reviewer_that_changes_the_worktree_makes_the_build_stuck_and_none_of_it_is_pushed() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    let builder = w.noting_builder();
+    // In full access nothing confines it: the daemon's check of the tree is what holds.
+    let tree = w.workspace().join("builds/1/tree");
+    let writes = format!("echo reviewer > '{}/feature.txt'", tree.display());
+    let reviewer = w.reviewer("reviewer", &[NOTHING], &writes);
+
+    w.run(w.reviewed(&builder, &reviewer, "full"), |w| {
+        w.fake.lane(|l| l.ended() == 1)
+    })
+    .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(
+        why.contains("The reviewer changed the build's worktree"),
+        "{why}"
+    );
+    assert!(w.pushed("mergeloop/build-7").is_none());
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn in_workspace_access_the_reviewer_cannot_write_the_worktree_and_the_pr_opens() {
+    if !sandboxed().await {
+        return;
+    }
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    let builder = w.noting_builder();
+    // The fake holds itself to what a CLI's sandbox gives a run in workspace access: writes in
+    // its working folder and the room `--add-dir` names, and nowhere else.
+    let tree = w.root().canonicalize().unwrap().join("ws/builds/1/tree");
+    // It notes what it tried in `tried`, the one file outside them it may write.
+    let tried = w.root().canonicalize().unwrap().join("tried");
+    std::fs::write(&tried, "").unwrap();
+    let attempt = format!(
+        "echo reviewer >> '{tree}/feature.txt' && echo wrote >> '{tried}' || echo refused >> '{tried}'; \
+         echo own > \"$PWD/scratch\" && echo own >> '{tried}'",
+        tree = tree.display(),
+        tried = tried.display()
+    );
+    let confine = if cfg!(target_os = "macos") {
+        format!(
+            "room=$(cat_add_dir \"$@\")\nsandbox-exec -p \"(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \\\"$PWD\\\") (subpath \\\"$room\\\") (literal \\\"/dev/null\\\") (literal \\\"{tried}\\\"))\" sh -c \"{}\"",
+            attempt.replace('"', "\\\"").replace('$', "\\$"),
+            tried = tried.display(),
+        )
+    } else {
+        format!(
+            "room=$(cat_add_dir \"$@\")\nbwrap --ro-bind / / --dev /dev --bind \"$PWD\" \"$PWD\" --bind \"$room\" \"$room\" --bind '{tried}' '{tried}' sh -c \"{}\"",
+            attempt.replace('"', "\\\"").replace('$', "\\$"),
+            tried = tried.display(),
+        )
+    };
+    let body = format!(
+        "cat_add_dir() {{ while [ $# -gt 0 ]; do [ \"$1\" = --add-dir ] && {{ echo \"$2\"; return; }}; shift; done; echo \"$PWD\"; }}\n{confine}"
+    );
+    let reviewer = w.reviewer("reviewer", &[NOTHING], &body);
+
+    w.run(w.reviewed(&builder, &reviewer, "workspace"), |w| {
+        w.fake.lane(|l| l.ended() == 1)
+    })
+    .await;
+
+    let tried = std::fs::read_to_string(&tried).unwrap();
+    assert_eq!(
+        tried.lines().collect::<Vec<_>>(),
+        ["refused", "own"],
+        "{tried}"
+    );
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1, "the tree check passed");
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-7:feature.txt"]),
+        "built 1\n"
+    );
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_turned_off_in_the_config_never_runs() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    let builder = w.noting_builder();
+    let reviewer = w.reviewer("reviewer", &[NOTHING], "");
+    let text = format!(
+        "workspace = \"{}\"\naccess = \"full\"\n\n[builder]\ncommand = \"{}\"\n\n[reviewer]\nenabled = false\ncommand = \"{}\"\n",
+        w.workspace().display(),
+        builder.display(),
+        reviewer.display()
+    );
+
+    w.run(Config::parse(&text, w.root()).unwrap(), |w| {
+        w.fake.lane(|l| l.ended() == 1)
+    })
+    .await;
+
+    assert_eq!((w.runs(), w.reviews().len()), (1, 0));
+    let (_, _, body) = w.fake.lane(|l| l.opened[0].clone());
+    assert!(!body.contains("Local review"), "{body}");
 }

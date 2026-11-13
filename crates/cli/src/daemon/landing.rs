@@ -110,7 +110,7 @@ impl Builder {
     ) -> Result<Ended> {
         let work = tokio::select! {
             work = self.landing(lane, task) => work,
-            e = heartbeats(lane, task, self.heartbeat_every) => Err(e),
+            e = heartbeats(lane, task, || task.stage(), self.heartbeat_every) => Err(e),
             () = stopped(stop) => Err(Stopped.into()),
         };
         let ended = match work {
@@ -331,7 +331,7 @@ impl Builder {
             Ok(run) => run,
             Err(why) => return Ok(Worked::Stuck(why)),
         };
-        // Ticket 07's review of the change goes here, before anything is pushed.
+        // No local review: MergeLoop's own review reads what this pushes to the PR.
         let Some(pushed) = self
             .publish_need(lane, task, &checkout, &base, &run.text, number)
             .await?

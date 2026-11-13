@@ -55,6 +55,8 @@ pub struct Identity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Building,
+    /// The reviewer reads the build's change.
+    Reviewing,
     /// Its PR is open: the land loop has it, and the heartbeat names no stage.
     Landing,
 }
@@ -63,6 +65,7 @@ impl Stage {
     fn name(self) -> Option<&'static str> {
         match self {
             Stage::Building => Some("building"),
+            Stage::Reviewing => Some("reviewing"),
             Stage::Landing => None,
         }
     }

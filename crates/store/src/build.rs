@@ -902,6 +902,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
+    use crate::Store;
 
     const STALE: u64 = 1800;
 
@@ -1355,6 +1356,34 @@ mod tests {
             ..held(&pr, "ana")
         };
         assert_eq!(store.opened_pr(ben, 40).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_built_pr_is_its_holders_and_passes_to_whoever_takes_it_over(pool: PgPool) {
+        let store = store(pool.clone()).await;
+        let pr = landing(&store).await;
+        // A build with no PR yet, in the same repo, and one of another repo.
+        for (r, n) in [("o/r", 2), ("o/other", 3)] {
+            store
+                .upsert_task(1, &repo(r), &issue(n, &[]))
+                .await
+                .unwrap();
+        }
+        claim(&store, "cy").await.unwrap();
+        let r = repo("o/r");
+        assert_eq!(
+            store.builders(1, &r).await.unwrap(),
+            [(40, "ana".to_owned())]
+        );
+        assert!(store.builders(2, &r).await.unwrap().is_empty());
+
+        heard_ago(&pool, pr.id, STALE as i64 + 1).await;
+        let ben = claim(&store, "ben").await.unwrap();
+        assert_eq!(ben.pr, Some(40));
+        assert_eq!(
+            store.builders(1, &r).await.unwrap(),
+            [(40, "ben".to_owned())]
+        );
     }
 
     #[sqlx::test(migrations = false)]

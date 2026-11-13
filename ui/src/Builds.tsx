@@ -42,7 +42,7 @@ const LISTS: { title: string; note: string; empty: string; holds: BuildView["sta
   },
   {
     title: "Stuck",
-    note: "put the label on again to retry",
+    note: "take the label off and on again to retry",
     empty: "No builds stuck",
     holds: ["stuck"],
   },

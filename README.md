@@ -279,7 +279,7 @@ When the file does not parse, the queue pauses, and **Settings** shows why, unti
 
 MergeLoop serves an MCP server at `/mcp`, so a coding agent can do anything the dashboard does: queue a PR, take it out, read where it is and what it needs next, read the agent's review and the queue's history, change a repo's settings. Reviews, approvals and comments happen on GitHub, with `gh`. Every call acts as a GitHub user or bot: MergeLoop puts the labels on, comments, and reviews with their token, so GitHub checks they may.
 
-A tool that refuses answers `isError: true` with the reason as text, and `_meta.status`, the HTTP status its route answered. A refusal a client must act on also names its kind in `_meta.refusal`: `lane_off` (the build lane is off), `lost` (you no longer hold the build), `cancelled` (its issue stopped being a task: give it back), `unheard` (heartbeat it, then ask again), `may_not_push` (give it back), `merged` (its PR merged: report it merged).
+A tool that refuses answers `isError: true` with the reason as text, and `_meta.status`, the HTTP status its route answered. A refusal a client must act on also names its kind in `_meta.refusal`: `lane_off` (the build lane is off), `lost` (you no longer hold the build), `cancelled` (its issue stopped being a task: give it back), `unheard` (heartbeat it, then ask again), `may_not_push` (give it back), `merged` (its PR merged: report it merged), `closed` (a person closed its PR without merging it: release it as stuck).
 
 The hosted endpoint is `https://mergeloop.ai/mcp`. It uses sessionless streamable HTTP: each POST carries one JSON-RPC message, with JSON responses to requests. GET returns `405 Method Not Allowed`. Use the endpoint directly: following a redirect from the old host can break POST requests.
 
@@ -318,48 +318,7 @@ It talks to `https://mergeloop.ai`, or `MERGELOOP_URL`, and acts as the first of
 
 `mergeloop login` signs you in to MergeLoop in the browser, through the same OAuth an MCP client uses, and keeps the session in `~/.mergeloop/session/session.json`, which only you can read. With it, `mergeloop call` reaches the tools marked **Sign-in** below, and acts as you rather than as a GitHub token. A session belongs to the server it was made on: sign in again for another `MERGELOOP_URL`. A session the server no longer takes, after 30 days unused or once GitHub stops taking your token, is an error that says to run `mergeloop login` again. `mergeloop logout` ends the session on the server and forgets it.
 
-#### `mergeloop daemon`: the build lane
-
-Signed in with `mergeloop login`, `mergeloop daemon` builds the build lane's tasks (issues labeled with the repo's label, in workspaces with the lane on) of every workspace you belong to, until Ctrl-C. While it has a free slot it claims a task and builds it in its own clone of the repo and a fresh worktree: an agent CLI on this machine, signed in with your own login (never a workspace key), builds the issue; the repo's `verify` commands must pass, and the agent gets one more run to fix them if they fail; the daemon commits the change as the App's bot with you as `Co-authored-by`, pushes `mergeloop/build-<issue>` with a token the server mints for that one repo, and has the server open the PR. Before it pushes, a second agent reviews the change (see below). It never pushes over the branch if it changed on GitHub while the build ran: that build is stuck, saying so. When the agent gives up, verify still fails, or anything else ends a build, the build is released as stuck with the reason, which goes on the issue. Ctrl-C gives back the builds that have no PR yet.
-
-Between verify and the push, a reviewer reads the change against the issue: a fresh session of the other agent CLI (Codex for a Claude builder, Claude for a Codex one) when it is on your `PATH`, else of the builder's own. It answers with findings, each at a file and line, or with none. Findings go back to the builder as a new run in the same worktree, verify runs again, and the reviewer reads the change again: at most 3 reviews. Findings left after the third release the build as stuck, with them, and nothing is pushed; so does a reviewer that does not answer with its findings. The PR body says who reviewed it and in how many rounds. A change made later for a need on the PR is not reviewed on the machine: MergeLoop's own review reads it on the PR. The reviewer is run like the builder, with the same access, read denials and environment, and no token of any kind, but in a room of its own (`reviews/<build>/`, outside the build's room), so in `workspace` access its sandbox lets it write only there and its CLI's temp folder: it reads the build's worktree and cannot change it. In `full` access nothing confines it: read-only is then only what its prompt asks, and the daemon's check that the worktree holds just the commit it reviewed, which makes a build whose reviewer changed it stuck, with nothing pushed.
-
-Once its PR is open, the daemon lands it: it is the PR's author in the land loop (`next_need`), as `mergeloop [PR]` is for an agent. Review threads, and changes a required reviewer asked for, are worked by the agent in a fresh worktree on the PR's branch; the agent changes files only, and the daemon runs `verify`, commits as the App's bot with you as `Co-authored-by`, pushes, then posts the agent's replies in the threads, each naming the pushed commit, and resolves the threads the agent named. When GitHub refuses a reply, a resolve or the read of the threads, the daemon tries again, twice more, without running the agent again or posting a reply twice (a reply GitHub took but whose answer was lost is found in its thread, not posted again); still refused, the build is released as stuck, saying what GitHub refused. After a run that pushed, the daemon waits for MergeLoop to hear of the push and say what the PR needs next. After a run that pushed nothing, it asks for the PR's need again at once: whatever the run replied or resolved, a need that is still as it was was not settled by it. The next run is told so, with the threads still open, since a reply alone closes none; replies already posted on that need are not posted again, and every run counts toward the 10. When MergeLoop cannot answer for now (it is unreachable, or answers 5xx, as when its own read of GitHub failed), the daemon says so and asks again after a pause, heartbeating, while it builds as while it lands; only MergeLoop's refusals end a build. A PR that waits, on the queue or on a human (an approval, a draft, a PR taken out of the queue), runs no agent and is reported `waiting`; while it waits, the daemon asks the server how the PR stands as often as it heartbeats. A PR a person closed without merging ends its build as stuck, saying so on the issue; one merged, by the queue or outside it, ends it as merged. An ejected PR is queued again once; ejected a second time, or still needing its author after 10 runs of the agent, the build is released as stuck. A merged PR ends the build. A PR that waits holds no slot and keeps no worktree: its work is all on GitHub, and only its transcripts stay. Ctrl-C keeps the builds that have a PR: started again, the daemon lands them again. A build claimed with its PR, from a holder that went quiet or gave it back, is landed the same way.
-
-The agent and what it runs never act as you on GitHub or MergeLoop: a reply or a resolved thread from your own login would count as a human's answer to MergeLoop's review. Every run loses `GH_TOKEN`, `GITHUB_TOKEN`, `MERGELOOP_TOKEN`, `SSH_AUTH_SOCK` and the like from your environment, `gh` gets an empty config folder in the build's room (`GH_CONFIG_DIR`), and git no credential helper (`credential.helper` cleared) and no prompt. An agent working a PR's need gets a token minted for the build's repo that only reads it and its PRs (`contents: read`, `pull_requests: read`), as `GH_TOKEN`, `GITHUB_TOKEN` and `MERGELOOP_TOKEN`, so `gh` and `mergeloop call` read as the App's bot: it reads what anyone who can comment on the PR wrote, so it holds nothing that can write. The token that pushes and replies stays in the daemon, for its own git and its own calls to GitHub; no agent run and no verify command has it. This is what the agent is given, not a wall: in `workspace` access the agent cannot read `~/.config/gh`, `~/.git-credentials` or your session, but on macOS nothing stops it from asking the keychain for what it holds, and in `full` access it can read whatever you can.
-
-`mergeloop daemon --help` lists its settings. They live in `~/.mergeloop/daemon.toml` (or `--config FILE`); without the file, the defaults hold:
-
-```toml
-slots = 1                          # builds at once
-workspace = "~/.mergeloop/daemon"  # the daemon's own folder
-access = "workspace"               # or "full"
-# deny_read = ["~/.ssh", ...]      # what a build may not read: default below
-
-[builder]
-agent = "claude"                   # or "codex": the flags it gets, and how its output reads
-command = "claude"                 # default: the agent's name; a wrapper that takes its flags works, such as "mclaude"
-# model = "..."                    # default: the CLI's own
-# effort = "..."
-args = []                          # more arguments for every run
-timeout_minutes = 60
-
-[reviewer]                         # the same keys as [builder], and:
-enabled = true                     # false: no review
-# agent = "codex"                  # default: the other agent when its CLI is on PATH, else the builder's (also when command is set)
-# command = "codex"                # default: the agent's name, or the builder's command and args for the builder's own agent
-```
-
-The workspace folder holds `daemon/` (its lock, its name, and the process groups its builds run), `repos/<owner>/<name>.git` (a clone per repo), `builds/<build>/` (a build's room: its worktree `tree/`, on its local branch, and its `tmp/`), `reviews/<build>/` (the reviewer's room, made empty for each review) and `transcripts/<build>/` (the agent's output, kept 7 days). The daemon never touches your own checkouts. The agent and each verify command run in a process group of their own, and whatever they leave running is stopped when their run ends; a process that leaves its group (`setsid`) is not found. A build's room and branch are removed when the build ends, however it ends, once its processes are gone; on start the daemon first stops what a daemon killed mid-build left running, then removes whatever a crash left of builds (a build waiting on its PR has nothing there but its transcripts), gives back the builds without a PR that it still holds, and lands again those with one. A landing's worktree lives only while its agent works a need, and goes once the change is pushed. The daemon names itself once, in `daemon/id` in its folder, and every claim carries that name: another daemon of yours, on this machine or another, holds none of its builds, and takes one only once it is given back or goes 30 minutes unheard, as anyone would.
-
-With `access = "workspace"`, a build may write only its own room: the agent, what it runs, and the repo's verify commands, which the agent may have changed (run under `sandbox-exec` on macOS, `bwrap` on Linux). The clones, their git metadata, other builds, the transcripts and the daemon's own files are not writable by a build, and the daemon's own git names each worktree's git dir rather than following its `.git`, and runs no hooks, so nothing a build leaves runs as the daemon. It commits a build's tree only while the tree is the folder it made: a build that puts a link or another folder in its place is stuck, and nothing is pushed. In `workspace` access the daemon's git on a tree runs under the verify commands' read denials too. A build may not read the `deny_read` paths either, nor a symlink to one: by default your MergeLoop session (`~/.mergeloop/session`) and the places credentials live in a home folder (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.docker/config.json`, `~/.kube`, `~/.npmrc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.gem/credentials`, `~/.codex/auth.json`, `~/.claude/.credentials.json`); a `deny_read` list in the config replaces that list. The agent CLIs read their own login themselves, outside their sandboxes, so they keep working. That is the whole boundary: everything else you can read, the agent can read, including the macOS keychain through `security`, and the network is open. An issue's text is input from whoever wrote the issue, so label only issues you would hand to an agent on your own machine.
-
-The daemon passes each CLI its own confinement:
-
-- Claude Code: `--setting-sources user` (a repo's `.claude/` settings, which a build can write, never loosen it), `--permission-mode acceptEdits --add-dir <room>` and `--settings` that turn on its sandbox (refusing to start without one, with no retry outside it, network open) with `filesystem.denyRead`, a `Read` allow rule and `Read` deny rules for its file tools (they read what its shell may), and `permissions.blockWritesOutsideWorkingDirectories`. Its shell can also write to its own temp folder, `/tmp/claude-<uid>`, which every build shares: it does not run without it. On Linux its sandbox needs `bubblewrap` and `socat`; its read denials there are Claude Code's documented behaviour, not checked by MergeLoop.
-- Codex: `--skip-git-repo-check` (a reviewer's room is no git repo), `--ignore-user-config` (your `config.toml` is not read, as a `sandbox_mode` in it would replace what follows; your login still is), and a permission profile in `-c`: read everything, write the room, `deny` each `deny_read` path, network on, no approvals. On Linux its read denials are Codex's documented behaviour, not checked by MergeLoop.
-
-Tools that write outside the room, such as a package manager's cache in your home folder, fail under `workspace`: set `access = "full"`, which lifts the confinement and the read denials (`--permission-mode bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`).
+`mergeloop daemon` builds and lands the build lane's tasks on your machine: see [The build lane](#the-build-lane).
 
 A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell which of its workspaces such a token belongs to. The tools marked **Sign-in** work across a workspace, so they need the sign-in, and show only the workspace's repos you can read. Each tool takes the repo as `repo`, `owner/name`, or the workspace as `workspace`, its installation ID. `get_session` lists those IDs for a sign-in; with a GitHub token it answers `status: "signed_out"`, with no workspaces, so a token's calls name a `repo`.
 
@@ -475,6 +434,150 @@ The second form reads up to 100 PRs of one repo, as `{ "pulls": [...] }` in the 
 | `merged`, `ejected` | How it last left the queue: `{ at, sha }` or `{ at, reason }`. Both `null` while it is queued, and when it left otherwise |
 
 Every response has an `ETag`: send it back as `If-None-Match` for a `304` when nothing changed. Each caller, by its token, has 5,000 calls an hour, a `304` included, which `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-used` and `x-ratelimit-reset` (Unix seconds) report. Past the limit, a `429` has a `retry-after`, in seconds. So does a `503` when GitHub's own rate limit is used up.
+
+## The build lane
+
+The build lane turns labeled issues into merged PRs on your developers' own machines. Someone puts the repo's label on an issue written as a brief an agent can act on. A developer's daemon, `mergeloop daemon`, claims it, has an agent CLI on their machine (Claude Code or Codex, signed in with their own login) build it in a fresh worktree, runs the repo's `verify` commands, has a second agent review the change, and pushes it. MergeLoop's App opens the PR, labeled, so it is queued, and the daemon lands it like any PR: it works the review's threads and what the PR needs until it merges. The **Builds** page shows each build, who holds it and how far it is.
+
+The lane is off until a workspace turns it on. It changes nothing for PRs people open. MergeLoop never approves a PR it built, since its App is the PR's author: what may merge with no human is up to the repo's rules (see [Dark merges](#dark-merges)).
+
+### What an agent may do on your machine
+
+Read this before you run the daemon. The daemon runs agents, and the commands they write, on your machine, from the text of an issue that anyone who can open issues in the repo may have written. Label only issues you would hand to an agent on your own machine.
+
+`access` in the [config file](#the-config-file) picks how far a build is confined. A build is everything that runs for it: the agent, the commands the agent runs, and the repo's `verify` commands, which the agent may have changed.
+
+| | `access = "workspace"` (default) | `access = "full"` |
+| --- | --- | --- |
+| Writes | Only the build's own folder, `builds/<build>/` in the daemon's folder: its worktree and its temp folder. Not your checkouts, other builds, the clones' git metadata, the transcripts or the daemon's own files. | Anything you can write |
+| Reads | Anything you can read, except the `deny_read` paths: by default your MergeLoop session and the places credentials live in a home folder | Anything you can read |
+| Prompts | None: the agent works without asking | None |
+| macOS | The agent CLI's own sandbox (Claude Code's, Codex's permission profile), and `sandbox-exec` for the verify commands. Checked on this platform. | |
+| Linux | The agent CLI's own sandbox (Claude Code's needs `bubblewrap` and `socat`), and `bwrap` for the verify commands. The CLIs' read denials there are their documented behaviour, not checked by MergeLoop. | |
+| Elsewhere | Refused when the daemon starts | |
+
+What nothing stops, in either mode:
+
+- **Reads outside `deny_read`.** Your source, your dotfiles and anything else you can read, the agent can read.
+- **The network.** It is open, so what the agent reads it can send.
+- **The macOS keychain.** An agent can ask it, through `security`, for what it holds, as your own programs can; a `git -c credential.helper=osxkeychain push` of a ref that exists is a network call no sandbox sees.
+- **Claude Code's temp folder.** Its shell may always write `/tmp/claude-<uid>`, which every build shares: it does not run without it.
+- **`full` access.** It lifts the confinement and the read denials alike (`--permission-mode bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`). Tools that write outside the build's folder, such as a package manager's cache in your home folder, fail under `workspace` and need it.
+
+The daemon prints what does not hold on your platform when it starts. The [details](#how-a-build-is-confined) below say how each part is confined.
+
+### Turn it on
+
+1. In **Settings**, turn on **Build lane**, or call `set_build_settings`. While it is off, every lane tool but its settings refuses, and the **Builds** page says how to start. Turning it off forgets the issues waiting and the builds merged; builds in progress or stuck are kept for when it is on again, and a daemon that holds one stops working on it.
+2. Put the repo's label (its `label` setting, `mergeloop` by default) on an issue. An issue is a task while it is open and labeled, in a repo whose queue runs. A self-hosted App created before the `issues` event joined its events must be subscribed to it, as [Run it with an App you made yourself](#run-it-with-an-app-you-made-yourself) says; until then a labeled issue becomes a task within 5 minutes of a daemon asking for work, rather than at once.
+3. On each machine that builds, install [the `mergeloop` command](#the-mergeloop-command), run `mergeloop login` once, then `mergeloop daemon`.
+
+Only a developer whom GitHub lets push to a repo is given its tasks, and a token for it: an issue assigned to them goes to their daemon first, then unassigned ones; an issue assigned to someone else is never given to them. When a daemon claims an unassigned issue, MergeLoop assigns the developer on GitHub, for people to see who has it.
+
+### Run the daemon
+
+`mergeloop daemon` signs in with the session from `mergeloop login` (never `MERGELOOP_TOKEN` or `gh`'s token) and serves every workspace you belong to that has the lane on, until Ctrl-C. While it has a free slot, it claims a task and builds it:
+
+1. In its own clone of the repo and a fresh worktree, on the branch `mergeloop/build-<issue>`, the builder agent builds the issue.
+2. The repo's `verify` commands, as its config file declares them, must pass; when they fail, the agent gets one more run to fix them. A repo that declares none runs none here.
+3. The reviewer reads the change (see [The local reviewer](#the-local-reviewer)).
+4. The daemon commits the change as the App's bot, with you as `Co-authored-by`, and pushes the branch with a token MergeLoop mints for that one repo and that build. It never pushes over the branch if it changed on GitHub while the build ran: the build is stuck instead, saying so.
+5. MergeLoop's App opens the PR: not a draft, labeled with the repo's label, assigned to you, its body ending in `Closes #<issue>`.
+6. The daemon lands it, as below.
+
+A build holds a slot from its claim until its PR is open, and again while an agent works a need on the PR. A PR that waits holds none.
+
+Once its PR is open, the daemon is the PR's author in the land loop (`next_need`), as `mergeloop [PR]` is for an agent. Review threads, and changes a required reviewer asked for, are worked by the agent in a fresh worktree on the PR's branch: the agent changes files only, and the daemon runs `verify`, commits as the App's bot with you as `Co-authored-by`, pushes, then posts the agent's replies in the threads, each naming the pushed commit, and resolves the threads the agent named. When GitHub refuses a reply, a resolve or the read of the threads, the daemon tries again, twice more, without running the agent again or posting a reply twice. After a run that pushed, the daemon waits for MergeLoop to say what the PR needs next. After a run that pushed nothing, it asks again at once: a need still as it was was not settled by the run, and the next run is told so, with the threads still open, since a reply alone closes none. A PR that waits, on the queue or on a human (an approval, a draft, a PR taken out of the queue), runs no agent, and the daemon asks how it stands as often as it heartbeats. An ejected PR is queued again once. When MergeLoop cannot answer for now (it is unreachable, or answers 5xx), the daemon says so and asks again after a pause; only MergeLoop's refusals end a build.
+
+The daemon names itself once, in `daemon/id` in its folder, and holds only the builds it claimed: another daemon of yours, on this machine or another, takes one only once it is given back or goes 30 minutes unheard, as anyone's would.
+
+### The config file
+
+`mergeloop daemon --help` lists the settings. They live in `~/.mergeloop/daemon.toml`, or the file `--config FILE` names; without the file, the defaults hold. An unknown key is an error.
+
+```toml
+slots = 1                          # builds at once, at least 1
+workspace = "~/.mergeloop/daemon"  # the daemon's own folder: absolute, or ~/...
+access = "workspace"               # or "full": see "What an agent may do on your machine"
+# deny_read = ["~/.ssh", ...]      # what a build may not read in workspace access: replaces the default list
+
+[builder]
+agent = "claude"                   # or "codex": the flags it gets, and how its output reads
+command = "claude"                 # default: the agent's name; a wrapper that takes its flags works, such as "mclaude"
+# model = "..."                    # default: the CLI's own
+# effort = "..."                   # default: the CLI's own
+args = []                          # more arguments for every run, after MergeLoop's
+timeout_minutes = 60               # the longest one run may take, at least 1
+
+[reviewer]
+enabled = true                     # false: no local review
+# agent = "codex"                  # default: the other agent when its CLI is on PATH, else (or when command is set) the builder's
+# command = "codex"                # default: the agent's name, or, for the builder's own agent, the builder's command and args
+# model = "..."                    # its own, not the builder's; default: the CLI's own
+# effort = "..."                   # its own; default: the CLI's own
+# args = []                        # default: none, or the builder's with the builder's command
+timeout_minutes = 60               # the longest one review may take, at least 1
+```
+
+The default `deny_read` is your MergeLoop session (`~/.mergeloop/session`) and the places credentials live in a home folder: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.docker/config.json`, `~/.kube`, `~/.npmrc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.pypirc`, `~/.gem/credentials`, `~/.codex/auth.json`, `~/.claude/.credentials.json`. A path that holds the daemon's folder, or lies in it, is an error. The agent CLIs read their own login themselves, outside their sandboxes, so they keep working.
+
+### The local reviewer
+
+Between `verify` and the push, a reviewer reads the change against the issue: a fresh session of the other agent CLI (Codex for a Claude builder, Claude for a Codex one) when it is on your `PATH`, else of the builder's own. It answers with findings, each at a file and line, or with none. Findings go back to the builder as a new run in the same worktree, `verify` runs again, and the reviewer reads the change again: at most 3 reviews. Findings left after the third make the build stuck, with them, and nothing is pushed; so does a reviewer that does not answer with its findings.
+
+The PR body's **Local review** section says who reviewed the change and in how many rounds, or that the local review was turned off on the machine that built it. A change made later for a need on the PR is not reviewed on the machine: MergeLoop's own review reads it on the PR.
+
+The reviewer runs with the builder's access, read denials and environment, and no token of any kind, in a folder of its own (`reviews/<build>/`, outside the build's): in `workspace` access it may write only there and in its CLI's temp folder, so it reads the build's worktree and cannot change it. In `full` access nothing confines it, and what stands is the daemon's check, after every review, that the worktree still holds just the commit it reviewed: a build whose reviewer changed a tracked file, added an unignored one or committed is stuck, with nothing pushed. Writes to ignored files, or outside the worktree, are not caught.
+
+### Who the agent acts as
+
+An agent and what it runs never act as you on GitHub or MergeLoop: a reply or a resolved thread from your own login would count as a human's answer to MergeLoop's review. Every run loses `GH_TOKEN`, `GITHUB_TOKEN`, `MERGELOOP_TOKEN`, `MERGELOOP_URL`, `SSH_AUTH_SOCK` and the like from your environment; `gh` gets an empty config folder in the build's folder (`GH_CONFIG_DIR`), and git no credential helper and no prompt.
+
+- **The builder, the reviewer and every `verify` command** get no token.
+- **An agent working a need on the PR** gets a token for the build's repo that only reads it and its PRs (`contents: read`, `pull_requests: read`), as `GH_TOKEN`, `GITHUB_TOKEN` and `MERGELOOP_TOKEN`, so `gh` and `mergeloop call` read as the App's bot. It reads what anyone who can comment on the PR wrote, so it holds nothing that can write.
+- **The token that pushes** (`contents: write`, `pull_requests: write`, for that one repo, for GitHub's hour) stays in the daemon, for its own git and its replies and resolves. The daemon asks for it with `mint_build_token` and the `push` scope; MergeLoop mints it only while you hold the build and GitHub says, asked afresh, that you may push.
+
+### The workspace folder, and how it is cleaned
+
+The daemon's folder, `~/.mergeloop/daemon` by default, holds:
+
+- `daemon/`: its lock (a second daemon on the same folder refuses to start), its name (`id`), and the process groups its builds run.
+- `repos/<owner>/<name>.git`: its own clone of each repo it builds in. It never touches your checkouts.
+- `builds/<build>/`: a build's folder, its worktree `tree/` on its local branch, and its `tmp/`.
+- `reviews/<build>/`: the reviewer's folder, made empty for each review.
+- `transcripts/<build>/`: what the agents printed, kept 7 days after last written.
+
+The agent and each `verify` command run in a process group of their own, and whatever they leave running is stopped when their run ends; a process that leaves its group (`setsid`) is not found. A build's folders and local branch are removed when the build ends, however it ends, once its processes are gone. A PR's need gets a worktree only while its agent works, and loses it once the change is pushed: a PR that waits has nothing on disk but its transcripts. On start, the daemon stops what a daemon killed mid-build left running, removes whatever a crash left of builds, gives back the builds without a PR that it still holds, and lands again those with one.
+
+### How a build is confined
+
+In `workspace` access, the daemon passes each CLI its own confinement:
+
+- Claude Code: `--setting-sources user` (a repo's `.claude/` settings, which a build can write, never loosen it), `--permission-mode acceptEdits --add-dir <build folder>`, and `--settings` that turn on its sandbox (refusing to start without one, with no retry outside it, network open) with `filesystem.denyRead`, a `Read` allow rule and `Read` deny rules for its file tools (so they read what its shell may), and `permissions.blockWritesOutsideWorkingDirectories`.
+- Codex: `--skip-git-repo-check` (a reviewer's folder is no git repo), `--ignore-user-config` (your `config.toml` is not read, as a `sandbox_mode` in it would replace what follows; your login still is), and a permission profile in `-c`: read everything, write the build's folder, `deny` each `deny_read` path, network on, no approvals.
+- `verify` commands: `sandbox-exec` on macOS, `bwrap` on Linux, writing only the build's folder and reading no `deny_read` path, nor a symlink to one.
+
+The daemon's own git on a build names the worktree's git dir rather than following its `.git`, runs no hooks, and in `workspace` access runs under the same read denials, so nothing a build leaves runs as the daemon. It commits a build's worktree only while it is the folder the daemon made: a build that puts a link or another folder in its place is stuck, and nothing is pushed.
+
+### How a build ends
+
+- **Merged.** The PR merged, by the queue or outside it. The build shows as merged until its issue closes, as the PR's `Closes #<issue>` does.
+- **Stuck.** The agent gave up, `verify` still failed after its fix, the reviewer still had findings after 3 rounds, the PR was ejected a second time or still needed its author after 10 runs of the agent, GitHub kept refusing the daemon's answer, a person closed the PR without merging it, or anything else went wrong. The daemon says why on the issue, and the **Builds** page shows it in full. To try again, take the label off the issue and put it back: a stuck build with an open PR goes back to landing it, and one whose PR was closed is built anew over the old branch.
+- **Given back.** Ctrl-C gives back the builds without a PR: they are tasks again at once. It keeps those with one, which the daemon lands again when started; another daemon takes one over once it goes 30 minutes unheard. A build is given back too when GitHub says you may no longer push.
+- **Dropped.** The issue was closed or lost its label before the build had a PR. A build with a PR is never dropped this way: closing its issue is what merging it does.
+
+### Dark merges
+
+A *dark merge* is one that no human saw. The build lane does not decide this; two gates do, both outside the daemon: MergeLoop's review, with its confidence bars and the kinds it always asks a human about, and GitHub's rules for the branch, which the repo's maintainers set. What must never merge dark is a human decision, made as a required approval.
+
+The App's bot is the author of every built PR, so the developer whose daemon built it is not: they can approve it, and MergeLoop counts their answer to a question its review asks. GitHub does not let an author approve its own PR, so MergeLoop never approves a PR it built. How dark a built PR gets depends on the repo's rules:
+
+| How the repo is set up | An ordinary change | A path that must never merge dark |
+| --- | --- | --- |
+| **Rules by path.** No approval is needed in general; sensitive paths need their code owner. | **Dark.** It merges once MergeLoop's review lets it on. | **A human.** The code owner approves; that can be the developer, if they are one. |
+| **Every PR needs one approval.** The common default. | **One click.** The developer approves their daemon's PR. Never dark. | **A human.** The code owner approves. |
+
+A PR a person opens can merge dark under "every PR needs one approval", since MergeLoop approves it once its review passes; a built PR cannot. Letting MergeLoop bypass that rule for built PRs, with the sensitive paths in a second ruleset with no bypass, is not built.
 
 ## How jobs are isolated
 

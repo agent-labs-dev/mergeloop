@@ -6,14 +6,11 @@
 //! A process that leaves its group (`setsid`, `setpgid`) is not found this way.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
+use mergepatrol_resolver::Group;
 
 use super::folder::not_followed;
-
-/// The longest a stopped group is waited for.
-const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The daemon's note of the process groups its builds run.
 #[derive(Clone, Debug)]
@@ -53,14 +50,14 @@ impl Groups {
         };
         for entry in entries {
             let path = entry?.path();
-            let Some((build, pgid)) = parse(&path) else {
+            let Some((build, group)) = parse(&path) else {
                 continue;
             };
             if !which(build) {
                 continue;
             }
             let noted = std::fs::read_to_string(&path).unwrap_or_default();
-            stop(pgid, noted.trim()).await;
+            stop(group, noted.trim()).await;
             match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     return Err(e).with_context(|| format!("remove {}", path.display()));
@@ -99,10 +96,10 @@ impl Groups {
 }
 
 /// `<build>.<pgid>`.
-fn parse(path: &Path) -> Option<(u64, i32)> {
+fn parse(path: &Path) -> Option<(u64, Group)> {
     let name = path.file_name()?.to_str()?;
     let (build, pgid) = name.split_once('.')?;
-    Some((build.parse().ok()?, pgid.parse().ok().filter(|p| *p > 1)?))
+    Some((build.parse().ok()?, Group::led_by(pgid.parse().ok()?)?))
 }
 
 /// When process `pid` started, as `ps` says: empty when it is gone.
@@ -117,31 +114,19 @@ fn started(pid: u32) -> String {
 /// Kills the group led by `pgid` and waits for it to go, if it is still the build's: its leader
 /// is gone or a zombie (a pid is not given again while its group lives), or is the one that
 /// started at `noted`. A leader that started at another time is a stranger with a reused pid.
-async fn stop(pgid: i32, noted: &str) {
-    if !exists(-pgid) {
+async fn stop(group: Group, noted: &str) {
+    if !group.exists() {
         return;
     }
-    let leader = if exists(pgid) {
-        started(pgid as u32)
+    let leader = if group.leader_exists() {
+        started(group.leader())
     } else {
         String::new()
     };
     if !leader.is_empty() && leader != noted {
         return;
     }
-    // SAFETY: `kill` takes any pid and signal; a negative pid names a process group.
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    let deadline = tokio::time::Instant::now() + STOP_WAIT;
-    while exists(-pgid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Whether a process (`pid` > 0) or a process group (`-pgid`) exists.
-fn exists(pid: i32) -> bool {
-    // SAFETY: signal 0 checks only.
-    let found = unsafe { libc::kill(pid, 0) } == 0;
-    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    group.stop().await;
 }
 
 #[cfg(test)]
@@ -149,19 +134,22 @@ mod tests {
     use super::*;
 
     /// A process group of its own, `sh` with a `sleep` child, reaped as it dies.
-    fn group() -> u32 {
+    fn group() -> Group {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "sleep 60 & sleep 60"]);
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let mut child = cmd.spawn().unwrap();
-        let pid = child.id();
+        let group = Group::led_by(child.id()).unwrap();
         std::thread::spawn(move || child.wait());
-        pid
+        group
     }
 
     #[test]
     fn only_a_build_and_a_group_of_its_own_are_read_from_a_name() {
-        assert_eq!(parse(Path::new("/g/7.4242")), Some((7, 4242)));
+        assert_eq!(
+            parse(Path::new("/g/7.4242")),
+            Some((7, Group::led_by(4242).unwrap()))
+        );
         for name in ["7.1", "7.0", "7.-5", "x.4242", "74242"] {
             assert_eq!(parse(&Path::new("/g").join(name)), None, "{name}");
         }
@@ -171,10 +159,10 @@ mod tests {
     async fn a_stopped_group_is_gone_when_stop_returns() {
         let dir = tempfile::tempdir().unwrap();
         let groups = Groups::new(dir.path().join("groups"));
-        let pgid = group();
-        groups.track(3, pgid);
+        let group = group();
+        groups.track(3, group.leader());
         groups.stop(3).await.unwrap();
-        assert!(!exists(-(pgid as i32)), "the group outlived stop");
+        assert!(!group.exists(), "the group outlived stop");
         assert_eq!(
             std::fs::read_dir(dir.path().join("groups"))
                 .unwrap()
@@ -187,14 +175,13 @@ mod tests {
     async fn a_group_whose_leader_started_at_another_time_is_a_stranger_and_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let groups = Groups::new(dir.path().join("groups"));
-        let pgid = group();
+        let group = group();
         std::fs::create_dir_all(dir.path().join("groups")).unwrap();
-        let noted = dir.path().join(format!("groups/4.{pgid}"));
+        let noted = dir.path().join(format!("groups/4.{}", group.leader()));
         std::fs::write(&noted, "Mon Jan  1 00:00:00 2001").unwrap();
         groups.stop_all().await.unwrap();
-        assert!(exists(pgid as i32), "a stranger was stopped");
+        assert!(group.exists(), "a stranger was stopped");
         assert!(!noted.exists(), "it is forgotten all the same");
-        // SAFETY: the test's own group.
-        unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+        group.stop().await;
     }
 }

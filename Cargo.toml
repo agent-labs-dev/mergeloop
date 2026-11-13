@@ -9,8 +9,8 @@ repository = "https://github.com/agent-labs-dev/mergepatrol"
 
 # The Rust style we adopted from Google's guide. CONTRIBUTING.md says what we left out and why.
 [workspace.lints.rust]
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 enum_glob_use = "warn"
-undocumented_unsafe_blocks = "warn"
 wildcard_imports = "warn"

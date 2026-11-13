@@ -23,7 +23,7 @@ use mergepatrol_executor::proxy::Api;
 use mergepatrol_executor::remote;
 use mergepatrol_git::{Git, RebaseStep};
 use mergepatrol_resolver::{
-    ClaudeResolver, CodexResolver, FixRequest, Outcome, QuestionRequest, Resolution,
+    ClaudeResolver, CodexResolver, FixRequest, Group, Outcome, QuestionRequest, Resolution,
     ResolveRequest, Resolver, ReviewRequest, Scope, Stopped, Verify, VerifyRequest, claim,
     commit_subject, new_title, vote,
 };
@@ -1227,8 +1227,9 @@ async fn run_command(dir: &Path, cmd: &str) -> Result<Ran> {
     let child = c.spawn()?;
     let group = child.id();
     let done = tokio::time::timeout(VERIFY_TIMEOUT, child.wait_with_output()).await;
-    if let Some(group) = group {
-        stop_group(group).await;
+    // What it left running, a test runner or an install, could write into the next command's tree.
+    if let Some(group) = group.and_then(Group::led_by) {
+        group.stop().await;
     }
     let Ok(output) = done else {
         return Ok(Ran {
@@ -1253,23 +1254,6 @@ async fn run_command(dir: &Path, cmd: &str) -> Result<Ran> {
         not_run: matches!(output.status.code(), Some(126 | 127)),
         tail: tail[cut..].to_owned(),
     })
-}
-
-/// Stops every process left in a command's group, and waits until none is: one left running, a
-/// test runner or an install, could write into the tree of the next command.
-async fn stop_group(group: u32) {
-    let Ok(group) = i32::try_from(group) else {
-        return;
-    };
-    // SAFETY: `kill` takes any pid and signal; a negative pid names the group.
-    unsafe { libc::kill(-group, libc::SIGKILL) };
-    for _ in 0..50 {
-        // SAFETY: signal 0 only asks whether the group has a process left.
-        if unsafe { libc::kill(-group, 0) } != 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 /// Runs the repo's verify commands, which must pass after `what` the agent did.

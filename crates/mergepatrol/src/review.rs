@@ -1,17 +1,17 @@
 //! The agent's review, the queue's first gate. A tick starts a review of each queued PR's head;
 //! this worker runs it in the sandbox, sends what the agent is sure should change back to the
-//! PR's author, and asks a human only about what the author cannot settle, on GitHub and on the
-//! dashboard. It also has the agent answer questions about its findings: a human's, or the
-//! author's reply to a finding sent back, which the agent may withdraw on.
+//! PR's author, and asks a human only about what the author cannot settle, each in a thread on
+//! GitHub. It also has the agent answer questions about its findings, in their threads: a
+//! human's, or the author's reply to a finding sent back, which the agent may withdraw on.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_core::{
-    Answered, Depth, Evidence, Finding, Judged, Lean, PrNumber, RepoName, RepoSettings,
-    ReviewSettings, ReviewStatus, SentBack, Verdict, Verification, review_status, review_url,
-    settled_by,
+    Answered, Depth, Evidence, FINDING_MARKS as MARKS, Finding, Judged, Lean, PrNumber,
+    REPLY_MARKS, RepoName, RepoSettings, ReviewSettings, ReviewStatus, SentBack, TITLE_CHARS,
+    Verdict, Verification, clip, finding_title, review_status, settled_by, thread_title as norm,
 };
 use mergepatrol_executor::protocol::{
     ANSWER_FILE, JobOutcome, JobSpec, REVIEW_FILE, ReviewOutput, Task,
@@ -243,6 +243,12 @@ async fn earlier(ctx: &Ctx, gh: &Installation, r: &ReviewRecord) -> Result<Earli
     })
 }
 
+/// The branch of the stack layer below the PR, which its review reads its changes from: those
+/// below are reviewed on their own. `None` for a PR, or a stack's bottom.
+fn below(pr: &PullRequest) -> Option<String> {
+    (pr.base_ref_name != pr.merges_into()).then(|| pr.base_ref_name.clone())
+}
+
 /// Runs the review in the sandbox. `Err` says why the agent could not review.
 async fn run_review(
     ctx: &Ctx,
@@ -265,7 +271,7 @@ async fn run_review(
         &r.head_sha[..8]
     );
     let ran = async {
-        let trunk = gh.branch_sha(&r.repo, pr.merges_into()).await?;
+        let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
         let task = Task::Review {
             answered,
             sent_back,
@@ -273,8 +279,9 @@ async fn run_review(
             reviewed,
             depth,
         };
-        let (spec, granted) =
+        let (mut spec, granted) =
             job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
+        spec.base_ref = below(pr);
         if granted.is_none() {
             bail!(
                 "{NO_KEY} in the workspace's settings for {}: the agent cannot review.",
@@ -563,47 +570,24 @@ async fn codeowners(gh: &Installation, repo: &RepoName) -> Option<CodeOwners> {
     None
 }
 
-/// Starts each of MergeLoop's threads, with the finding's title, so the next review finds it.
-/// Each mark after the first is how MergeLoop wrote it as Mergepatrol, on threads still open.
-const MARKS: [&str; 2] = ["<!-- mergeloop-finding: ", "<!-- mergepatrol-finding: "];
 const MARK: &str = MARKS[0];
 /// End the body of each of MergeLoop's reviews, so its request for changes is dismissed once
 /// what it sent back no longer holds.
 pub(crate) const REVIEW_MARKS: [&str; 2] =
     ["<!-- mergeloop-review -->", "<!-- mergepatrol-review -->"];
 const REVIEW_MARK: &str = REVIEW_MARKS[0];
-/// End each of MergeLoop's replies in a thread, so a reply is not taken for the author's.
-const REPLY_MARKS: [&str; 2] = ["<!-- mergeloop-reply -->", "<!-- mergepatrol-reply -->"];
 const REPLY_MARK: &str = REPLY_MARKS[0];
 
-/// A title as threads match it: as bounded as the comment that carries it.
-fn norm(title: &str) -> String {
-    clip(&title.trim().to_lowercase().replace("--", "-"), TITLE_CHARS).into_owned()
-}
-
-/// The most characters a comment shows of a finding's title, of its other text (what it found,
-/// the change it asks for, the command's output, the review's summary), and of a command or its
-/// files. Bounded so, a comment always fits without its test, which goes in only whole.
-const TITLE_CHARS: usize = 300;
+/// The most characters a comment shows of a finding's other text (what it found, the change it
+/// asks for, the command's output, the review's summary), and of a command or its files, beside
+/// `TITLE_CHARS` of its title. Bounded so, a comment always fits without its test, which goes
+/// in only whole.
 const TEXT_CHARS: usize = 4_000;
 const COMMAND_CHARS: usize = 1_000;
 
-/// `text`, at most `max` characters of it: one cut short ends in `…`.
-fn clip(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
-    if text.chars().count() <= max {
-        return text.into();
-    }
-    let mut cut: String = text.chars().take(max - 1).collect();
-    cut.push('…');
-    cut.into()
-}
-
 /// The title of the finding a thread of MergeLoop's is about.
 fn title_of(t: &ReviewThread) -> Option<String> {
-    let rest = MARKS
-        .iter()
-        .find_map(|m| Some(&t.body[t.body.find(m)? + m.len()..]))?;
-    Some(rest[..rest.find(" -->")?].to_owned())
+    finding_title(&t.body)
 }
 
 /// MergeLoop's threads on the PR. None when GitHub could not say.
@@ -663,7 +647,13 @@ async fn post(
     }
     let sent_back = held.iter().any(|f| f.sent_back);
     if done.error.is_some() || !held.is_empty() {
-        let body = format!("{}\n\n{REVIEW_MARK}", github_body(ctx, key, r.number, done));
+        let app = app_credentials(ctx)
+            .await?
+            .context("no GitHub App is set up")?;
+        let body = format!(
+            "{}\n\n{REVIEW_MARK}",
+            review_body(&format!("@{}", app.slug), &key.repo, r.number, done)
+        );
         let verdict = match sent_back {
             true => ReviewVerdict::RequestChanges,
             false => ReviewVerdict::Comment,
@@ -705,7 +695,7 @@ async fn post(
 fn still(f: &Judged) -> String {
     match f.asked {
         true => {
-            "A human decides this one: MergeLoop asked them. Resolve this thread once they have."
+            "For a human who can push to the repo: resolve this thread if it's fine as it is, or reply with the change it needs. The PR's author leaves it to them."
                 .to_owned()
         }
         false => match clip(&f.finding.suggestion, TEXT_CHARS).as_ref() {
@@ -853,13 +843,6 @@ fn thread_body(f: &Judged, head: &str) -> String {
     })
 }
 
-/// The review's summary on GitHub: what it sent back to the author and asks a human, each in
-/// a thread on its line, and what it cleared.
-fn github_body(ctx: &Ctx, key: &LaneKey, number: PrNumber, done: &ReviewDone) -> String {
-    let url = review_url(&ctx.config.public_url, &key.repo, &key.trunk, number);
-    review_body(&url, &key.repo, number, done)
-}
-
 /// Why a change the review cleared is only a note. Empty for one it found fine.
 fn cleared_note(f: &Finding) -> String {
     match (f.lean, f.shows_the_change(), &f.verified) {
@@ -875,12 +858,14 @@ fn cleared_note(f: &Finding) -> String {
     }
 }
 
-/// The review's summary, with `url` where a human answers it: bounded, whatever the agent wrote.
-fn review_body(url: &str, repo: &RepoName, number: PrNumber, done: &ReviewDone) -> String {
+/// The review's summary on GitHub: what it sent back to the author and asks a human, each in a
+/// thread on its line, and what it cleared. `mention` calls the App into a thread. Bounded,
+/// whatever the agent wrote.
+fn review_body(mention: &str, repo: &RepoName, number: PrNumber, done: &ReviewDone) -> String {
     let mut body = String::from("**MergeLoop's review**");
     if let Some(why) = &done.error {
         body.push_str(&format!(
-            "\n\nThe agent could not review this PR: {}\n\nA human reviews it instead: [approve it, or ask for changes]({url}), or approve it here on GitHub.",
+            "\n\nThe agent could not review this PR: {}\n\nA human reviews it instead: approve it, or request changes, here on GitHub.",
             clip(why, TEXT_CHARS)
         ));
         return body;
@@ -900,19 +885,19 @@ fn review_body(url: &str, repo: &RepoName, number: PrNumber, done: &ReviewDone) 
     }
     if sent > 0 {
         body.push_str(&format!(
-            "\n\nIt sent {sent} back to the author, each in a thread on its line. For each, fix it and push, or reply with why it doesn't apply, then resolve the thread. Once every thread is resolved, the PR goes on to the merge queue with no human approval."
+            "\n\nIt sent {sent} back to the author, each in a thread on its line. For each, fix it and push, or reply with why it doesn't apply, then resolve the thread. To have the agent look again before you push, reply in the thread with {mention} and why. Once every thread is resolved, the PR goes on to the merge queue with no human approval."
         ));
     }
     if asks > 0 {
-        body.push_str(&asks_section(asks, &done.asked, url));
+        body.push_str(&asks_section(asks, &done.asked, mention));
     }
     body.push_str(&cleared_section(&cleared));
     body.push_str(&noted_section(&noted));
     body
 }
 
-/// Who it asks about how many findings, and where they answer.
-fn asks_section(asks: usize, asked: &[String], url: &str) -> String {
+/// Who it asks about how many findings, and how they answer, in the threads.
+fn asks_section(asks: usize, asked: &[String], mention: &str) -> String {
     let who = match asked {
         [] => "Anyone who may approve this PR".to_owned(),
         logins => logins
@@ -922,7 +907,7 @@ fn asks_section(asks: usize, asked: &[String], url: &str) -> String {
             .join(", "),
     };
     format!(
-        "\n\nIt asks a human about {asks}, each in a thread on its line. {who}: [answer them in MergeLoop]({url}), or approve the PR here on GitHub if they are all fine as they are. The PR keeps its place in the queue meanwhile."
+        "\n\nIt asks a human about {asks}, each in a thread on its line. {who}: answer each in its thread. Resolve it if it's fine as it is, or reply with the change it needs, which goes to the author. Approving the PR answers them all as fine, and requesting changes sends them all to the author. To have the agent look again first, reply in the thread with {mention} and your question. The PR keeps its place in the queue meanwhile."
     )
 }
 
@@ -982,13 +967,13 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
         let key = lane_key(&r, &pr);
         lane = Some(key.clone());
         let settings = settings(ctx, &gh, &r.repo).await?;
-        let trunk = gh.branch_sha(&r.repo, pr.merges_into()).await?;
+        let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
         let task = Task::Question {
             finding: Box::new(finding),
             question: q.question.clone(),
             sent_back,
         };
-        let (spec, granted) = job_spec(
+        let (mut spec, granted) = job_spec(
             ctx,
             &gh,
             &key,
@@ -1000,6 +985,7 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
             task,
         )
         .await?;
+        spec.base_ref = below(&pr);
         if granted.is_none() {
             bail!("{NO_KEY} in the workspace's settings: the agent cannot answer.");
         }
@@ -1025,24 +1011,76 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
         .and_then(withdraws);
     if !ctx
         .store
-        .answer_question(r.id, r.claim, &q.id, answer)
+        .answer_question(r.id, r.claim, &q.id, answer.clone())
         .await?
     {
         return Ok(());
     }
+    let mut withdrew = false;
     if let Some(outcome) = withdrawn
         && let Some(status) = ctx
             .store
             .withdraw_finding(r.id, &q.finding, outcome)
             .await?
     {
+        withdrew = true;
         tracing::info!(repo = %r.repo, pr = r.number, finding = %q.finding, status = status.as_str(), "the agent withdrew a finding");
         if let Some(key) = &lane {
             let message = format!("withdrew {} on the author's reply", q.finding);
             record(ctx, key, r.number, "review-withdrew", &message).await?;
         }
     }
+    if let Err(e) = answer_in_thread(ctx, &r, &q.finding, &answer, withdrew).await {
+        tracing::warn!(repo = %r.repo, pr = r.number, finding = %q.finding, error = %format!("{e:#}"), "could not post the agent's answer");
+    }
     Ok(())
+}
+
+/// Posts the agent's answer in the thread of the finding it was asked about, where the question
+/// was put, and resolves the thread of a finding it withdrew.
+async fn answer_in_thread(
+    ctx: &Ctx,
+    r: &ReviewRecord,
+    finding: &str,
+    answer: &std::result::Result<String, String>,
+    withdrew: bool,
+) -> Result<()> {
+    let Some(f) = r.findings.iter().find(|f| f.finding.id == finding) else {
+        return Ok(());
+    };
+    let (gh, _) = pull(ctx, r).await?;
+    let title = norm(&f.finding.title);
+    let Some(t) = threads(&gh, r)
+        .await
+        .into_iter()
+        .find(|t| title_of(t).as_ref() == Some(&title))
+    else {
+        return Ok(());
+    };
+    gh.reply_in_thread(
+        &r.repo,
+        r.number,
+        t.comment_id,
+        &answer_body(answer, withdrew),
+    )
+    .await?;
+    if withdrew && !t.resolved {
+        gh.resolve_thread(&t.id, true).await?;
+    }
+    Ok(())
+}
+
+/// The agent's answer, as its reply in the thread: bounded, whatever the agent wrote.
+fn answer_body(answer: &std::result::Result<String, String>, withdrew: bool) -> String {
+    let said = match answer {
+        Ok(text) => clip(text.trim(), TEXT_CHARS).into_owned(),
+        Err(why) => format!("The agent could not answer: {}", clip(why, TEXT_CHARS)),
+    };
+    let withdrawn = match withdrew {
+        true => "\n\n**Withdrawn**: this no longer holds the PR.",
+        false => "",
+    };
+    format!("{said}{withdrawn}\n\n{REPLY_MARK}")
 }
 
 #[cfg(test)]
@@ -1078,6 +1116,7 @@ mod tests {
         };
         ReviewRecord {
             since_head: None,
+            diff_id: None,
             claim: 0,
             id,
             installation_id: 1,
@@ -1122,6 +1161,7 @@ mod tests {
         let thread = ReviewThread {
             id: "t".into(),
             resolved: false,
+            resolved_by: None,
             comment_id: 1,
             body: thread_body(&f, "abc1234"),
             reply: None,
@@ -1234,7 +1274,7 @@ mod tests {
             findings: vec![f],
             asked: Vec::new(),
         };
-        let body = review_body("https://m.test", &RepoName::parse("o/r").unwrap(), 7, &done);
+        let body = review_body("@merge-loop", &RepoName::parse("o/r").unwrap(), 7, &done);
         assert!(
             body.contains("a note: 1 of 3 fresh agents said it holds, and 2 had to"),
             "{body}"
@@ -1258,7 +1298,7 @@ mod tests {
             asked: Vec::new(),
         };
         assert_eq!(done.status, ReviewStatus::Approved);
-        let body = review_body("https://m.test", &repo, 7, &done);
+        let body = review_body("@merge-loop", &repo, 7, &done);
         let issue = old.issue_url(&repo, 7).unwrap();
         assert!(
             body.contains(&format!(
@@ -1319,6 +1359,7 @@ mod tests {
         let thread = ReviewThread {
             id: "t".into(),
             resolved: false,
+            resolved_by: None,
             comment_id: 1,
             body: thread_body(&f, "abc1234"),
             reply: None,
@@ -1336,7 +1377,7 @@ mod tests {
             asked: Vec::new(),
         };
         assert!(
-            review_body("https://m.test", &RepoName::parse("o/r").unwrap(), 7, &done)
+            review_body("@merge-loop", &RepoName::parse("o/r").unwrap(), 7, &done)
                 .chars()
                 .count()
                 <= BODY_CHARS
@@ -1346,14 +1387,9 @@ mod tests {
             ..done
         };
         assert!(
-            review_body(
-                "https://m.test",
-                &RepoName::parse("o/r").unwrap(),
-                7,
-                &failed
-            )
-            .chars()
-            .count()
+            review_body("@merge-loop", &RepoName::parse("o/r").unwrap(), 7, &failed)
+                .chars()
+                .count()
                 <= BODY_CHARS
         );
     }
@@ -1376,5 +1412,38 @@ mod tests {
         assert_eq!((head, findings.len()), ("head3", 1));
         assert!(sent_back_before(&[review(3, false, None), back(2)]).is_none());
         assert!(sent_back_before(&[]).is_none());
+    }
+
+    #[test]
+    fn the_answer_goes_in_the_thread_marked_as_the_agents() {
+        let ok = answer_body(&Ok(" It is capped at line 9. ".into()), false);
+        assert!(ok.starts_with("It is capped at line 9.\n\n"));
+        assert!(ok.ends_with(REPLY_MARK));
+        assert!(!ok.contains("Withdrawn"));
+        let withdrew = answer_body(&Ok("You're right.".into()), true);
+        assert!(withdrew.contains("**Withdrawn**"));
+        let failed = answer_body(&Err("no key".into()), false);
+        assert!(failed.starts_with("The agent could not answer: no key"));
+    }
+
+    #[test]
+    fn a_human_answers_the_asks_on_github() {
+        let section = asks_section(2, &["ann".into()], "@merge-loop");
+        assert!(
+            section.contains("@ann: answer each in its thread"),
+            "{section}"
+        );
+        assert!(
+            section.contains("Resolve it if it's fine as it is"),
+            "{section}"
+        );
+        assert!(
+            section.contains("reply in the thread with @merge-loop"),
+            "{section}"
+        );
+        assert!(
+            !section.contains("]("),
+            "no link away from GitHub: {section}"
+        );
     }
 }

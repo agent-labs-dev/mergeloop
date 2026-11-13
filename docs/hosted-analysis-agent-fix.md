@@ -1,442 +1,300 @@
 # Hosted analysis, review changes by the author
 
-Status: proposal; no runtime changes. Reviewed against `agent-labs-dev/mergeloop` main at
-[`2fddead07867e30181b006c66fc9f10614973040`](https://github.com/agent-labs-dev/mergeloop/commit/2fddead07867e30181b006c66fc9f10614973040),
-2026-11-07. This baseline predates the review-policy decision below. Source links refer to its modules;
-proposed names and fields are explicitly marked.
+Status: proposal; no runtime changes. Reconciled on 2026-11-13 with main at
+[`ac77839088a44af9d83e8182bd711f3a99eb87a0`](https://github.com/agent-labs-dev/mergeloop/commit/ac77839088a44af9d83e8182bd711f3a99eb87a0).
+This shipped baseline replaces the historical November 7 inventory. Proposed settings,
+tools and gates are explicitly marked; describing them does not make them available.
 
-## Decision
+## Decision and shipped baseline
 
-Keep MergeLoop's sandboxed review, security analysis, experiments, evidence replay and merge gates hosted.
-Remove auto-fix for review findings in every execution mode. A finding that requires a code change
-rejects or holds the PR for its author to pick back up; the author's agent may help, but MergeLoop
-does not generate and publish a corrective commit first. Auto-fix is limited to red CI, controlled
-by `fix_ci`; review findings neither use that budget nor start its fixer.
+Keep sandboxed review, security analysis, experiments, evidence replay and merge gates hosted.
+Jonas's November 7 decision is already implemented: review findings go back to the author,
+never to a MergeLoop review fixer. Auto-fix and `fix_ci`'s budget apply only to red CI.
+Read-only review may write disposable diagnostic files and publish findings; it does not
+publish corrective code. Conflict resolution remains a separate hosted task.
 
-Review the PR's diff on the first round. On later rounds, review the diff/new commits since the last
-reviewed head, with unresolved findings and author replies as context, instead of re-reviewing the
-whole PR. Read surrounding code and run experiments where needed to judge those changes.
+The first review reads the PR diff and surrounding code. After findings are sent back, later
+rounds read new commits plus those findings and author replies. A rebase or base merge resets
+that comparison to the whole PR diff when another review is needed. Approval reuse is distinct:
+a clean queue rebase, or a stack layer whose own diff is unchanged, can retain its approval
+without another review. Do not invalidate every review merely because SHAs moved.
 
-Deep review must demonstrate findings with independently replayed evidence, not reviewer agreement.
-Spend its additional budget on behavior, failure paths and deterministic checks. A recurring accepted
-mistake must gain a check that stays in the repository and runs in CI, applied by the user's agent.
-
-In the stricter ownership split below, hand CI edits, conflict resolution and publication to the
-user's own agent too. Show hosted analysis and author action together on the existing PR screen,
-with the next action and the head each is working on. Every hosted-originated change is a proposal
-the owner can see and accept or reject through their agent. Only that agent applies accepted
-changes; show each proposal's target commit alongside the current head. A review finding is a
-request to its author, not an automatic patch proposal the author must accept.
-
-Extend the existing execution setting with an opt-in third mode, proposed as
-`agent.runs: hosted-review`. Keep the review, CI and conflict ownership of `hosted` and `local`,
-subject to the global removal of review auto-fix. The current `local` setting moves the review to
-the author's agent too, so switching to it does not meet the hosted-analysis request.
-
-Make the existing PR list the owner's control surface: readiness kept current while the author
-works, access to the PR, description and discussion, and an explicit Merge control. Ship the
-read-only readiness, context and next-action view first, then the merge action with head fencing.
-The polling loop already exists; the execution split and independent validation of an author's
-fix are the larger change.
-
-## Feedback and its limits
-
-The request's excerpt of Furqan's third bullet ends at “easy to m...”. That fragment alone establishes
-no additional requirement. Reading the full #mergepatrol message recovered the actual continuation:
-he describes his agent looping, pulling the latest state and checking whether it needs to do something.
-The following bullet asks to use MergeLoop directly instead of having his agent search PR comments.
-This is recovered source text, not a completion inferred from the fragment.
-
-Source: Furqan's message at 2026-11-06 04:03 UTC, message
-`evt_06aed519304277b38000cdaeda6ccdc9`, in channel `chan_06ae376bbb427a7680006e6808afe8d4`.
-The proposal addresses that confirmed polling request alongside the interface and execution split;
-it infers no other meaning for the truncated text.
-
-Furqan's further feedback at 2026-11-06 05:06 UTC was “i can't really control what it puts in.”
-That establishes the owner-control requirement below. The screenshot is unavailable; no claim
-about its contents or which writer produced them is needed or inferred.
-
-Jonas's decision in #mergepatrol on 2026-11-07, agreed by Furqan, supersedes the earlier review-fix
-framing: auto-fix remains only for red CI; code-change findings reject or hold the PR for the author;
-later reviews cover the diff/new commits rather than the whole PR again. The optional ownership
-split adds owner control without preserving a hosted review fixer in another mode.
-
-Furqan's 2026-11-07 19:15 UTC message, `evt_06aef78cdfb07bac8000b40fd1bc953d`, asks for
-“readiness” kept up to date by his agent, a route from the list to the PR, its description and
-chat comments, and a merge button: the control he valued in the old flow. He also asks for a
-list without more pages and describes his agent as the interface. This belongs here because
-it makes the ownership decisions above usable while a PR is still being worked on. Extend the
-existing list/detail surface and shared API/MCP reads so his agent can present the same view
-in chat. The attachment is unreadable; no layout or behavior is inferred from it. His wider
-remarks about grouping, faster git and continuous patrols do not expand this implementation.
-
-## Implementation baseline before the decision
-
-The Rust crates retain their `mergepatrol` names. Hosted execution means the service's job sandbox,
-not the user's agent process. `LocalExecutor` in [executor](../crates/executor/src/lib.rs) is a development
-subprocess implementation; it is distinct from `agent.runs: local`.
-
-| Step | Baseline owner and behavior | Agreed behavior (`hosted-review` where noted) |
+| Surface | Shipped behavior at this baseline | Remaining proposal |
 | --- | --- | --- |
-| Review scheduling and deep analysis | [review.rs](../crates/mergepatrol/src/review.rs), `review` / `run_review`, sends `Task::Review` through `job_spec` and the executor. [job.rs](../crates/mergepatrol/src/job.rs), `review`, invokes the resolver, parses findings and attaches code. [resolver](../crates/resolver/src/lib.rs), `review_prompt`, permits reading callers, tests, config and history, running tools and writing diagnostic tests; it covers bugs, security, data loss and broken contracts. | Remains hosted in `hosted` and `hosted-review`, including experiments and security analysis. First review covers the PR diff; later rounds cover new commits and unresolved findings. Diagnostic edits are disposable analysis, never a published fix. |
-| Review finding handoff | `review::finish` can hold a PR before publishing its findings; `conclude` calls `fix_sent_back`. This calls `queue::fix_findings`, constructs `Task::FixReview`, then runs `fix_and_publish`. The sandbox's `job::fix` / `commit_fix` validates and commits edits. The orchestrator checks the bundle and publishes it, including restacking. | Remove this review-fix path in all modes. Make findings and evidence immediately readable, reject or hold the PR and return it to its author. No hidden fix attempt, fix-budget fallback or automatic corrective commit. |
-| Failed CI and conflicts | [queue/prep.rs](../crates/mergepatrol/src/queue/prep.rs), `hold` / `job`, starts rebase or fix work off the lane. [queue.rs](../crates/mergepatrol/src/queue.rs), `run_job`, also has rebase, fixing and rechecking phases. [core/job.rs](../crates/core/src/job.rs) owns the job state machine. CI and review share `fix_ci`'s hosted fix budget; the documented default is three. | Reserve `fix_ci` and its budget for red CI alone in `hosted`. Conflict resolution remains a separate task. In `hosted-review`, reuse `AuthorRebase` and `AuthorFix` holds: the author's agent edits, tests and pushes, without consuming hosted CI attempts. |
-| Verify-command selection | `job::checks_for` prefers configured `spec.verify`. Otherwise `checks_from_ci` reads sorted files in `.github/workflows` at the checked-out PR head. [core/ci.rs](../crates/core/src/ci.rs), `verify_from_ci`, keeps at most five distinct usable commands from workflows containing `pull_request`; it handles working directories and skips unsupported or CI-dependent commands. There is no `crates/mergepatrol/src/ci.rs` on this baseline. | Keep one hosted derivation and send its result, source and head to the author's agent. Reuse `verify_from_ci`, also already used by `review::author_brief`; do not implement another workflow parser in a client. |
-| Verify enforcement | [resolver](../crates/resolver/src/lib.rs) distinguishes `Verify::Configured`, `Ci` and `None`. `job::verify` runs only `spec.verify` after a resolution or fix. Workflow-derived commands inform the agent; they are not an additional automatic ejection gate. GitHub's required checks remain a separate gate. | Author runs the supplied commands locally. Hosted validation independently runs configured verify commands; workflow-derived suggestions retain their existing advisory role. |
-| Finding evidence | `job::check_evidence` resets to the reviewed head for each change finding, applies only its named evidence files, runs the command and records the patch/output. `failed` excludes timeouts and exit 126/127. `unsafe_file` rejects paths outside the checkout and `.github` / `.mergepatrol`. [core/review.rs](../crates/core/src/review.rs), `shows_the_change` / `ReviewSettings::route`, requires failed evidence for a non-security author change; security may be supported by code alone. Confidence, human-only kinds and `needs_human` still apply. | Remains hosted. Apply the Deep evidence contract below instead of accepting votes for an unproven non-security change. Keep security and human-decision exceptions explicit. A local report that a command passed or failed cannot replace replay. |
-| Evidence after an author change | `job::apply_evidence` installs the original failing evidence before the hosted fixer; `evidence_passes` requires its commands to pass and its patches to remain intact. `commit_fix` also runs configured verify commands. `queue::check_fix_output` checks ancestry and protected paths before publishing a hosted fix. | Preserve independent hosted evidence replay on an author's resulting head without restoring a review fixer. Extract this validation from the removed review-fix path; red-CI fixing remains separate. |
-| Gate and merge | [web/gate.rs](../crates/web/src/gate.rs), review status, required checks and thread resolution feed queue holds. `queue::run_job` rechecks the review and head before merging. [queue-flow.md](queue-flow.md) explains preparation, stacks and the single merge lane. | Remains hosted. Neither a progress report nor a local “done” grants approval, resolves a human decision or authorizes a merge. |
+| Execution settings | Review, CI-fix and conflict work is hosted. `agent.runs` was removed; a file still setting it fails to parse and stops the repo's queue. | An opt-in author-publication policy below, with no local review mode or revival of `agent.runs`. |
+| Stack visibility | Queue shows each layer's title, checks, diff and blocker, and collapses runs of similar layers in long stacks. | Add readiness, ownership and evidence provenance to these rows; do not rebuild shipped stack UI. |
+| Stack reviews | Each layer is reviewed against the layer below. An approved layer whose own diff is unchanged after a lower-layer fix keeps its approval. | Preserve reuse and show original assessment versus carried coverage. Changed layer behavior still needs review. |
+| GitHub approval | Once review no longer holds a PR and its review comments are resolved, MergeLoop approves on GitHub. Newly posted comments must be resolved too. Approval can satisfy required reviews unless rules require a human; stale approvals are renewed once coverage is established for the new head. The App never approves a PR it opened. | Preserve the default. Strict publication ownership would change this in the opt-in policy and needs the decision below. |
+| PR interface | Dashboard is a queue view. Rows open GitHub for description, diff, discussion and replies. You, in-app PR detail and the unqueued-PR list were removed. GitHub labels and API/MCP/CLI queue PRs. | Improve queue and agent-rendered views without claiming removed pages or APIs exist. An in-app PR manager is a separate decision. |
+| Deep evidence | Deep still permits panel agreement to support a non-security change without a replayed failure. Security and human exceptions remain explicit. | [Draft #306](https://github.com/agent-labs-dev/mergeloop/pull/306) removes the non-security exception. It is unshipped and narrower than the correction-replay and prevention requirements below. |
 
-Two existing capabilities narrow the implementation considerably:
+Source contracts: [hosted execution](../content/changelog/2026-11-07-agent-runs-local-is-gone.md),
+[incremental reviews](../content/changelog/2026-11-06-rereview-reads-only-new-commits.md),
+[GitHub inbox](../content/changelog/2026-11-10-github-is-your-inbox.md),
+[GitHub PR pages](../content/changelog/2026-11-10-prs-open-on-github.md),
+[stack visibility](../content/changelog/2026-11-11-see-each-pr-of-a-stack.md),
+[unchanged-layer approvals](../content/changelog/2026-11-11-stack-layers-keep-their-review.md),
+[GitHub approvals](../content/changelog/2026-11-12-mergeloop-approves-on-github.md) and
+[waiting for comments](../content/changelog/2026-11-12-no-approval-beside-open-comments.md).
 
-- [core/repo_config.rs](../crates/core/src/repo_config.rs), `Runs::{Hosted, Local}`, already selects execution
-  ownership. With `Local`, prep leaves conflicts/check failures to the author, and `review::review` waits for
-  an author-submitted review. `posted_review` trusts that agent's evidence claim without rerunning it.
-  That legacy exception must not become the path used by the new hosted-review mode.
-- [web/need.rs](../crates/web/src/need.rs), `next_need`, already returns `needs`, `id`, `layer`, `brief`,
-  `then`, `exit_code` and `status`. It supports `after` and up to 50 seconds of long polling, with an
-  internal three-second poll. [cli](../crates/cli/src/main.rs), `land`, calls it through MCP and waits
-  through `wait` responses; it starts no agent. A user agent follows the returned brief, then polls again.
+## Feedback and decisions still needed
+
+Furqan's November 6 feedback asks for hosted analysis, fixing through his own agent, visibility
+and an agent polling MergeLoop directly. His follow-up says he cannot control what MergeLoop
+puts in. The unavailable screenshot establishes no additional facts. His November 7 message
+asks for agent-maintained readiness, PR context, discussion, merge control and a list without
+more pages; his agent can render that list in chat.
+
+Those goals remain relevant, but earlier design choices now conflict with shipped behavior:
+
+- **Author ownership is a new opt-in policy.** Main deliberately removed local runs and hosts
+  CI fixes and conflicts. Author-owned CI/conflict publication is not an existing mode.
+- **GitHub is the PR interface.** Start with queue rows, GitHub links and agent reads. An
+  unqueued/draft PR manager, inline discussion or dashboard Merge button would reverse the
+  November 10 simplification. They remain product choices outside the first slice. Assessment
+  before queueing also needs an explicit execution action; status reads alone prove no review.
+- **Strict publication changes automatic GitHub reviews and approvals.** The owner-control
+  requirement includes comments, review requests, thread resolutions and approvals, not only
+  commits. Under that strict opt-in boundary, the user's agent applies accepted writes. It
+  cannot retain automatic App approvals unchanged. Jonas must choose that boundary or explicitly
+  authorize a hosted review/status publication exception. No exception is inferred here. A user's
+  agent cannot supply required independent/human approval by approving its author's own PR.
+- **Head-bound merge consent is stronger than today's queue delegation.** Queueing currently
+  allows normal preparation and subsequent author pushes under the queue request. The proposed
+  control requires renewed consent for changed content or stack scope. Diff-equivalent review
+  coverage can carry, but cannot authorize a different commit for that control.
+- **Correction replay and recurring prevention add gates.** Main can clear findings after thread
+  resolution or a later review. Requiring independent correction replay and a retained prevention
+  check is additional policy, not shipped behavior or all of #306.
+
+This update records these choices without implementing or silently deciding them. Default hosted
+behavior stays as shipped. Deep's non-security vote exception is an intentional policy change in
+#306, rather than a conflict with stack visibility or GitHub approvals.
+
+## Current implementation seams
+
+The Rust crates retain their `mergepatrol` names. Hosted means a service job sandbox;
+`LocalExecutor` in [executor](../crates/executor/src/lib.rs) is a development subprocess executor,
+not an author-run review setting.
+
+| Responsibility | Current source and reuse boundary |
+| --- | --- |
+| Review and author handoff | [review.rs](../crates/mergepatrol/src/review.rs) schedules hosted review and publishes findings. Findings hold for the author; do not recreate removed `FixReview`. |
+| CI and conflicts | [prep.rs](../crates/mergepatrol/src/queue/prep.rs), [queue.rs](../crates/mergepatrol/src/queue.rs) and [job.rs](../crates/mergepatrol/src/job.rs) dispatch prep/lane work. `FixChecks` is for red CI. Default `fix_ci.attempts` is three; conflicts are separate. |
+| Verify commands | `job::checks_for` uses configured `verify`, or [core/ci.rs](../crates/core/src/ci.rs)'s workflow derivation at the PR head. Reuse that parser. Derived commands guide agents; configured commands gate a resolution/fix, separately from required GitHub checks. |
+| Evidence | `job::check_evidence` resets to the reviewed head, applies only named evidence files and records command, patch and output. Timeouts and exit 126/127 do not qualify. Protected/outside-checkout files are refused. [core/review.rs](../crates/core/src/review.rs) owns routing; [resolver](../crates/resolver/src/lib.rs) owns instructions. |
+| Approval coverage | [store/review.rs](../crates/store/src/review.rs)'s `diff_id`, `carry_unchanged`, `carry_review` and `review_queue_change` distinguish unchanged coverage from edits needing review. Reuse the producer's per-layer comparison, not a client approximation. |
+| Gates | [web/gate.rs](../crates/web/src/gate.rs), review state, required checks, threads and the lane's final head checks govern merging. [queue-flow.md](queue-flow.md) documents prep/lane behavior. Neither readiness nor GitHub approval bypasses another gate. |
+| Reads and actions | [routes.rs](../crates/web/src/routes.rs) registers `list_queue`, `pull_status`, `get_agent_review`, `next_need`, `list_events`, `queue_pull` and `dequeue_pull`. Removed inbox, PR-detail, local-review-submission and in-app answer routes are not integration seams. Discussion/replies are on GitHub with `gh`. |
+| Polling | [need.rs](../crates/web/src/need.rs)'s `NeedView` has `needs`, `id`, `layer`, `brief`, `then`, `exit_code` and `status`. Its endpoint supports `after` and up to 50 seconds of long polling. [CLI](../crates/cli/src/main.rs) uses these tools; it starts no author agent. |
 
 ## Deep review: demonstrate behavior and retain prevention
 
-This extends the same hosted analysis and author handoff, so it belongs in this proposal. It is an
-independent review requirement, not conditional on the optional execution split. The newer Deep
-baseline at [`6061d17845c2e5e4a46723a98273e22ae78102eb`](https://github.com/agent-labs-dev/mergeloop/commit/6061d17845c2e5e4a46723a98273e22ae78102eb)
-allows panel votes to replace missing executable evidence for non-security changes through
-[`Depth::votes_on`](https://github.com/agent-labs-dev/mergeloop/blob/6061d17845c2e5e4a46723a98273e22ae78102eb/crates/core/src/review.rs#L138-L141),
-[`Finding::shows_the_change`](https://github.com/agent-labs-dev/mergeloop/blob/6061d17845c2e5e4a46723a98273e22ae78102eb/crates/core/src/review.rs#L402-L407)
-and the [resolver's evidence/panel instructions](https://github.com/agent-labs-dev/mergeloop/blob/6061d17845c2e5e4a46723a98273e22ae78102eb/crates/resolver/src/lib.rs#L658-L706).
-The requirements below supersede that fallback; the older implementation inventory remains historical.
+This is independent of the optional publication split. Main's `Depth::votes_on` and
+`Finding::shows_the_change` still permit Deep's non-security panel fallback. #306 proposes
+Standard's independent evidence requirement at every depth, retaining three Deep reviewers,
+security panels, confidence bars and human exceptions. It does not implement all of this section.
 
-1. **Use Deep's extra effort to run the behavior.** Independent reviewers may discover candidate
-   findings, but votes cannot establish executable proof. Prioritize focused real user flows,
-   failure injection, property checks and deterministic static or formal checks for the changed
-   invariant. A non-security code-change finding needs a command that MergeLoop independently runs
-   on the reviewed head and sees fail for the claimed defect. A formal counterexample must be
-   reproducible; record the model, assumptions and bounds instead of claiming whole-system proof.
-2. **Attach every claim to its commit.** Each finding and evidence record names its review ID,
-   comparison base and reviewed `head_sha`, command/setup, evidence files or patch, expected
-   violation, observed exit/output and execution limits. Expose these together through the shared
-   UI/API/MCP projections. Missing evidence or a command that does not demonstrate the defect leaves
-   a candidate as a non-blocking note, never an author-change request justified by agreement.
-   Missing tools, setup failure or timeout means incomplete execution, not proof of a bug or a fix;
-   required validation stays unknown and cannot clear an existing supported finding. Preserve the
-   explicit security and human-decision routes with code-path rationale and stated uncertainty;
-   label these exceptions, never describe panel agreement as executable verification.
-3. **Verify the author's correction at the new commit.** Save the original evidence and replay it
-   independently against the author's candidate head, recording both offending and candidate SHAs.
-   A passing author report or a new vote cannot clear it. A moved head invalidates that result;
-   replay on the new head and review only new commits plus unresolved findings as specified below.
-4. **Prevent an accepted mistake from recurring.** Link a recurring finding to the earlier accepted
-   finding or owner rule. Its correction must include a retained regression check, lint/type rule,
-   property test or deterministic architecture constraint in the normal CI path. Reuse an existing
-   check when it already protects the invariant. Record the check's path, command, offending SHA
-   where it fails for that mistake and corrected SHA where it passes. Disposable diagnostic evidence
-   alone is insufficient: keep it, or prove the retained check covers the same failure. This remains
-   author action until that protection is independently verified. Present any proposed check with
-   its exact content and target head; only the user's agent applies it through the agreed owner flow.
+1. **Run the behavior.** Spend Deep's extra effort on user flows, failure injection, property
+   checks and deterministic static/formal checks. Non-security author-change findings need a
+   command MergeLoop independently runs on the reviewed head and sees fail for that defect.
+   Majority/unanimous agreement and stored votes cannot replace proof. Formal results record
+   the model, assumptions and bounds, not a claim of whole-system verification.
+2. **Keep provenance.** Identify review ID, comparison base, reviewed SHA, setup/command, evidence
+   patch, expected violation, observed exit/output and limits. Missing proof leaves a non-blocking
+   note. Timeout, absent tools or setup failure is incomplete execution and cannot clear an
+   existing supported finding. Label security/human exceptions and rationale; votes are not
+   executable verification.
+3. **Replay corrections independently.** Preserve original evidence and run it against the
+   author's candidate head, recording offending and candidate SHAs. An author report or new vote
+   cannot substitute. An earlier passing run is not execution at a new SHA. Coexist with
+   unchanged-layer approval reuse: show carried coverage separately from current execution,
+   and revalidate changed work and unresolved findings.
+4. **Retain prevention for recurring accepted mistakes.** Link the earlier finding or owner rule.
+   Keep a regression check, lint/type rule, property test or deterministic architecture constraint
+   in normal CI; reuse existing sufficient protection. Record command/path and proof it fails on
+   the offending SHA and passes on the correction. Disposable evidence alone is insufficient.
+   The user's agent applies proposed checks through the owner flow; pending/rejected/stale
+   suggestions cannot clear findings.
 
-Acceptance must cover an unproven non-security finding with two-of-three or unanimous votes staying
-a note; a reproduced defect reaching its author without a hosted fix; a formal check reporting its
-bounds; stale or unavailable replay never clearing a supported finding; and a recurring correction
-remaining held until its retained CI check fails on the offending commit and passes on the new one.
-Extend existing review-routing and job scenarios at implementation time. No runtime change or new
-test is part of this design update, and red-CI-only auto-fix and owner merge controls remain intact.
+Acceptance includes unproven majority/unanimous findings staying notes, reproduced defects reaching
+authors without hosted fixes, formal bounds, stale/unavailable replay never clearing a supported
+finding, and independently proven retained prevention. Extend existing routing/job scenarios when
+implementing; this design adds no runtime tests.
 
-## Execution contract and implementation
+## Proposed author-publication policy
 
-### Hosted output is a proposal; the user's agent owns publication
+### Settings and dispatch
 
-In the opt-in `hosted-review` mode, enforce this boundary across code and PR content:
+Use one proposed typed publication policy on existing `AgentSettings`, with tentative YAML
+`agent.edits: hosted | author`. Both values run hosted reviews. `hosted` preserves today's default;
+opt-in `author` hands CI edits, conflicts and PR-content writes to the user's agent. This is a new,
+unimplemented field, not valid current configuration. `agent.runs` stays rejected; do not restore
+`Runs`, `local` or `hosted-review` run values, or author-submitted reviews.
 
-- Hosted jobs may read code, run analysis and experiments, write disposable diagnostic files,
-  and persist findings, evidence, proposals and validation/gate state inside MergeLoop. They may
-  not publish those files or generated content directly into the user's repository or PR.
-- Every proposed change has a stable proposal ID and revision, repo/PR/layer, target `head_sha`,
-  originating review ID where applicable, reason/evidence, and the exact diff or proposed text.
-  This includes source, tests, docs/config, rebases/restacks, empty commits, PR titles/bodies,
-  comments/replies, reviewer requests and thread resolutions. The owner can inspect the complete
-  change and accept or reject it through their agent before any write to GitHub.
-- Persist a typed decision/application state: `pending | accepted | rejected | stale | applied`.
-  Acceptance authorizes the user's agent to apply that version through its own workflow; it
-  never invokes a hosted publisher. Record the agent's resulting commit or GitHub operation
-  separately and verify it before showing `applied`. Polling, a heartbeat or a lease is no consent.
-- Rejection is recorded and leaves the repo/PR untouched. It does not clear an unresolved finding,
-  authorize a merge, start a hosted fixer or reissue the same rejected proposal as new work.
-  A revised proposal needs a new revision and a fresh decision. A moved target head makes an
-  unapplied proposal stale; refresh its diff/text and request a new decision before application.
-- The queue may prepare integration work in a disposable checkout. Any rebase, restack or other
-  change to a user's branch still goes through their agent, even when deterministic. An explicitly
-  owner-authorized final merge remains hosted behind the existing gates, using the content the
-  agent applied; merge authorization cannot authorize additional generated content.
-
-These publication guarantees belong to the proposed new mode; the review-policy change applies
-to every mode. Preserve existing ownership settings except that review findings always go to the
-author. Store proposal context once and project it through the existing review/need reads to both
-the UI and the polling agent. Rejecting a suggested edit never clears the underlying review hold.
-
-### One execution policy, applied at every dispatch
-
-Add proposed `Runs::HostedReview` with an explicit serde name `hosted-review` in
-[core/repo_config.rs](../crates/core/src/repo_config.rs). Add an exhaustive task-routing method on that
-existing enum using `SpendTask`, rather than a second settings hierarchy:
-
-| Mode | Review | Review findings requiring code | Red CI | Conflict resolution |
+| Proposed value | Review | Review findings | Red CI | Conflicts / branch updates |
 | --- | --- | --- | --- | --- |
-| `hosted` | Hosted | Reject/hold for the author | Hosted auto-fix when enabled | Hosted |
-| `local` | Author's agent | Reject/hold for the author | Author's agent | Author's agent, subject to the baseline prep-disabled exception |
-| `hosted-review` (new) | Hosted | Reject/hold for the author | Author's agent | Author's agent |
+| `hosted` (default) | Hosted | Hold for author | Hosted when `fix_ci` enables it | Current hosted prep |
+| `author` (opt-in) | Hosted | Hold for author | Author's agent; no hosted attempts consumed | Author's agent, including clean rebases/restacks |
 
-Question answering currently runs hosted even with `local`; preserve that behavior. For the new mode,
-questions about findings and security investigation stay hosted in MergeLoop. Queue preparation
-and the final merge remain hosted within the boundary above; clean rebases, restacks, title
-corrections and empty-commit workarounds require a proposal applied by the author's agent too.
+Route exhaustively at dispatch and publication with the existing task model, not a second
+scheduler. Enforce it in prep and lane, including `MERGEPATROL_PREP=false`. Author ownership cannot
+depend on prep, lease expiry or a missing key. Hosted analysis still needs its key and a visible
+missing-key hold; never fall back to author review or skip explicitly requested analysis. Findings
+cannot become `FixChecks`. Policy changes cancel obsolete jobs and reject their publication.
 
-Apply the policy to all of these existing seams:
+Round-trip the new field through parsing/writing/inheritance in
+[repo_config.rs](../crates/core/src/repo_config.rs), `RepoSettingsView` in
+[web/api.rs](../crates/web/src/api.rs), generated `ui/src/api`, [RepoSettings](../ui/src/RepoSettings.tsx)
+and `get_repo_config`, `propose_repo_config`, `get_repo_defaults`, `set_repo_defaults`.
+Keep defaults and fork restrictions; grant no new GitHub or model credentials.
 
-- `review::review` selects the reviewer; `finish` must make findings immediately readable and
-  reject or hold the PR for the author in every mode. Remove `hold_for_fix`, `fix_sent_back`,
-  `queue::fix_findings` and `Task::FixReview` dispatch instead of retaining a mode-specific bypass.
-  Keep `FixChecks` restricted to failed CI; a review finding cannot masquerade as a CI failure.
-- `review::publish` / `post`, reviewer requests, queue comments and `retitle` must hand proposed PR
-  writes to the user's agent in this mode. Guard branch publication (`publish_to_pr` and restack
-  paths) as well as job dispatch; suppressing a fixer alone does not enforce this boundary.
-- `queue::read_repo` currently uses one `hosted` boolean for review enablement and credential tasks.
-  Determine credentials per task: this mode needs the hosted review key, not hosted fix/rebase keys.
-  Explicit opt-in to hosted review must hold with a visible missing-key reason if that review cannot
-  run, rather than silently skipping analysis through the default-review key shortcut.
-- `prep::hold`, `Prep::takes_agent_work`, `queue::run_job`, `fix_and_publish` and
-  `rebase_layers` must enforce author ownership in both prep and the lane. A conflict must stop
-  before a resolver runs; a failed check must return an author hold before `Phase::Fixing` or a
-  hosted retitle/recheck workaround. A stack's hold names the affected layer and keeps its place.
-- Cover `MERGEPATROL_PREP=false` explicitly. Today prep returns early and the README documents
-  hosted conflict resolution even with `local` in that configuration. For the new mode, ownership
-  must be checked independently of prep: return the same author holds from the lane. Never silently
-  fall back to a hosted fixer. On policy changes, cancel old corrective jobs and reject their results
-  before publication; existing head/queue checks alone do not check execution-policy changes.
-- Update the config writer/inheritance in `core/repo_config.rs`, `RepoSettingsView`'s explicit
-  TypeScript union in [web/api.rs](../crates/web/src/api.rs), generated `ui/src/api` types and
-  [RepoSettings.tsx](../ui/src/RepoSettings.tsx). Keep existing defaults. The relevant MCP settings
-  tools are `get_repo_config`, `propose_repo_config`, `get_repo_defaults` and `set_repo_defaults`;
-  they must round-trip the new value instead of dropping it.
+### Owner-visible proposals
 
-Keep fork handling unchanged: main does not run its agent on fork PRs. This proposal does not grant
-the author's agent any new GitHub or model credentials.
+In the strict opt-in variant, hosted jobs may read, experiment, persist findings/validation and
+prepare disposable integration work, but cannot publish generated code or PR content. Every
+source/test/docs/config edit, rebase/restack, empty commit, retitle/body change, comment, review,
+approval, reviewer request or thread resolution carries a stable proposal ID/revision, repo/PR/layer,
+target SHA, originating review, reason/evidence and exact diff/text. Including automatic App
+reviews/approvals is deliberate; the decision section identifies the resulting product conflict.
 
-### Hand off a finding; verify the author's pushed result
+Persist typed `pending | accepted | rejected | stale | applied` state. Acceptance records consent
+for that revision/head, never a hosted publish. The user's agent applies it through its authorized
+workflow; verify its commit/GitHub operation before showing `applied`. Changed target heads make
+unapplied proposals stale and require refreshed content and consent. Rejection cannot clear a
+finding, authorize merging or reissue the suggestion as new work. Heartbeats/leases are no consent.
+Guard publication as well as dispatch, including comments, approvals, retitles and stack updates.
+
+An explicitly authorized final merge may remain hosted behind normal gates with content the agent
+applied. It cannot authorize extra generated edits or supply required review. Any automatic App
+review/status exception must be explicit before implementation; pending proposals cannot count as
+GitHub approvals or make a PR ready.
+
+### Author handoff and correction validation
 
 ```mermaid
 flowchart LR
-    R[Hosted diff review and evidence] --> H[Reject or hold PR; findings to author]
-    H --> A[Author or own agent fixes or disputes; pushes changes]
-    A --> V[Hosted replay on the new head]
-    V --> R2[Review new commits and unresolved findings]
-    R2 --> G[Existing review, thread and CI gates]
-    G --> M[Merge lane]
-    V -->|still fails or cannot replay| H
-    R2 -->|new actionable finding| H
+    R[Hosted diff review and evidence] --> H[Hold; author fixes or disputes]
+    H --> A[Author agent edits, checks and pushes]
+    A --> V[Independent replay at candidate head]
+    V --> D[Review changed work and unresolved findings]
+    D --> G[Review, thread, CI and GitHub gates]
+    G --> M[Authorized merge lane]
+    V -->|fails or unavailable| H
 ```
 
-This is the proposed flow. Do not clear a finding just because the client reports completion.
+Extend `NeedView` with proposed reviewed/candidate heads, review ID, proposals and verify commands
+with typed `configured | ci | none` source. Keep current need kinds and `id`/`after`/`wait`.
+Removed `fix_checks` and `conflict` needs cannot be reused; introduce typed author-work holds/needs
+where the new policy requires them in prep and lane. Scope finding IDs by review: `f1` starts again
+in each. `get_agent_review` already returns evidence command, output and patch, but its latest
+review may be of an older head. Present an authoritative snapshot with freshness explicit.
 
-1. Add typed handoff context to `NeedView`: proposed `head_sha`, `review_id`, `proposals` and `verify` with
-   `source: configured | ci | none`. Retain `id` / `after` / `wait` and the current need kinds.
-   `proposals` carries the shared proposal context and decision/application state above; it is
-   delivered through the existing `next_need` loop, not a separate agent or subscription.
-   Scope finding identity by review ID and head: `f1` is numbered anew for each review.
-   `get_agent_review` already returns the complete evidence patch, command and output.
-   Fetch a single authoritative snapshot and recheck its head before handing it out; an outdated
-   latest review must be labeled stale, not presented as work on the current head.
-2. The author picks up the rejected or held PR, inspects the findings/evidence and decides how to
-   fix or dispute them. Their own agent may edit, run checks, commit and push through the author's
-   authorized workflow. A hosted suggestion remains optional; if used, show its exact content and
-   target head, record owner acceptance and recheck its revision/head before application. Only the
-   user's agent applies it. Accepting or rejecting a suggestion cannot clear a finding. The agent
-   replies to findings it fixed or disputes; it does not use `answer_agent_review` to approve itself.
-   The next webhook/tick discovers the new head, as with author pushes today.
-3. Add proposed `Task::VerifyFix { findings }` to [executor/protocol.rs](../crates/executor/src/protocol.rs)
-   and dispatch it in `job.rs`. It returns validation data, never a bundle or fix commit;
-   `Task::returns_code` must be false. Extract the evidence replay helpers within the job domain
-   so red-CI fixing and author-change validation can reuse them without a review fixer. Update
-   protocol output allowlists/remote transport if a separate validation result file is introduced.
-4. Replay the saved hosted evidence against the new head in a disposable checkout. If its original
-   patch is already intact, use it; otherwise apply that original patch. Use
-   [Git::holds / apply](../crates/git/src/lib.rs), and check patch integrity after commands run.
-   A patch conflict or changed diagnostic test is an explicit replay failure needing refreshed
-   hosted evidence or a human decision, never an inferred pass. Configure/install dependencies
-   through the command just as today's evidence replay does. Run configured verify commands too.
-5. Persist validation against `(review_id, reviewed_head, candidate_head)` in
-   [store/review.rs](../crates/store/src/review.rs) with a migration. Stale results cannot clear a
-   different head. Preserve failure output; timeouts/tool absence mean validation incomplete.
-   `review::earlier` and the resolver already carry prior findings and replies into the next review;
-   attach this independent validation there. Security findings without runnable evidence still
-   require the hosted reviewer to examine the correction. Human asks retain their existing gate.
-6. Carry the last reviewed head and candidate head through review scheduling and the prompt.
-   The first round reviews the PR diff; later rounds review only the diff/new commits since that
-   reviewed head plus unresolved findings and replies. Keep prior review coverage instead of
-   re-reviewing unchanged work. A rewritten history or unavailable baseline requires an explicit
-   new comparison baseline shown in the review; never claim incremental coverage without one.
+The author fixes/disputes GitHub threads and pushes through their workflow; proposal decisions
+cannot settle the finding. Do not revive local-review or in-app answer tools. The next tick/webhook
+discovers the push as today.
 
-The sandbox keeps its existing read-only fetch token, revocation and model proxy boundaries.
-The author agent never receives `JobSpec`'s service access or a hosted job link. The new validation
-job may write temporary diagnostic files but must not publish any of them.
+Propose a validation-only task in [protocol.rs](../crates/executor/src/protocol.rs), with
+`returns_code` false, no bundle or fix commit. Reuse job evidence helpers. Replay original evidence
+in a disposable checkout, using an intact retained patch or applying the original with
+[Git::holds/apply](../crates/git/src/lib.rs); check integrity after commands. Conflicts, weakened
+diagnostics, absent tools and timeouts need refreshed evidence or a human, never an inferred pass.
+Run configured verify commands; keep workflow-derived advice advisory.
 
-## The PR list, readiness and owner controls
+Persist validation keyed by `(review_id, reviewed_head, candidate_head)` in the review store with
+a migration. Attach it to prior-finding context. Distinguish original execution, correction replay
+and carried unchanged-diff coverage. Review changed work/unresolved findings when comparison is
+valid; otherwise expose the full-diff reset. Security without runnable evidence still requires
+hosted examination; human asks keep their gate.
 
-Use the existing Queue and [You](../ui/src/You.tsx) lists, with one readiness summary per PR
-and the selected PR's existing [PullDetail](../ui/src/PullDetail.tsx). Include PRs still in draft
-or outside the queue; opening this view or polling it never queues, publishes or merges them.
-Keep stack/layer context inline. Do not introduce another page or require grouping to manage a PR.
-Put ownership detail in [QueueGate](../ui/src/Queue.tsx), already shared by Queue and You,
-with [AgentReview](../ui/src/AgentReview.tsx)'s findings and the activity tab behind it.
+Keep sandbox read-only fetch tokens, revocation and model proxies. Author agents receive no
+`JobSpec` service credentials or hosted job access. Validation never publishes diagnostic files.
 
-Readiness answers whether this PR is ready at this commit and why. Derive it server-side from
-the existing typed review, evidence, CI, draft, required-approval, thread, conflict and stack gates;
-do not invent a score or infer approval from green CI alone. Show ready, blocked with the owner
-of the next action, checking, or unknown/stale, as applicable. Missing required review coverage,
-failed reads and incomplete required checks cannot produce ready. Show queue position separately
-from readiness; an unqueued PR without an assessment stays unknown until work is explicitly requested.
+## Readiness and control through the queue and the user's agent
 
-Return the assessed head, comparison base, last reviewed head, source and last-updated time with
-the reasons. The user's agent refreshes the same reads through `next_need` while the author works;
-new commits trigger only incremental review plus unresolved findings. Update the list on pushes,
-check/review results and gate changes. A new head immediately invalidates the previous ready
-signal until its gates are verified; a changed base rechecks the applicable integration gates.
-An agent's summary or heartbeat may explain work but cannot attest that hosted gates passed.
+Extend shipped [Queue](../ui/src/Queue.tsx) layer rows and shared API/MCP projections. Keep GitHub
+as the route to PR description, diff and discussion. Agent chat tables can combine these reads
+with authorized GitHub reads. Do not recreate You, PullDetail, inbox tables or removed detail/reply
+APIs as prerequisites. Propose any missing canonical backend read explicitly instead of claiming
+a removed read exists or re-deriving backend state in each client.
 
-Selecting a row opens the description, general PR comments and review discussion in place,
-with a direct GitHub PR link. Keep existing summary/timeline views; expose full thread replies
-and pagination through the backend where summaries are insufficient. Show loading, errors and
-truncation explicitly. For every readiness, finding, proposal, agent-work and discussion item,
-show the commit it refers to alongside current head. Preserve a review comment's original commit;
-general comments/description identify the head at observation, without implying code-review coverage.
+Derive readiness server-side from review coverage/evidence, CI, draft, approvals, threads, conflicts
+and stack gates. Show ready, blocked with next actor, checking or unknown/stale; never a score or
+green-CI-only approval. Separate position from readiness. Return assessed/base/reviewed heads,
+source, update time, blocker and carried coverage. On pushes refresh applicable gates while
+preserving proven unchanged-layer coverage. Do not imply execution at the new SHA. Missing
+required reads stay unknown.
 
-Keep a visible Merge control in the selected PR, with its current gate or permission reason when
-unavailable. Clicking it explicitly authorizes the existing queue/merge path for the displayed PR,
-head and stack scope; show any affected layers before submission. It never bypasses gates or
-silently marks a draft ready. Reuse `queue_pull`, add an expected-head precondition, and recheck
-caller authorization and head server-side. A moved head rejects the stale click and refreshes the
-view; new PR content after submission invalidates that authorization before the final merge too.
-Show queued/waiting, failure or verified merged outcome instead of claiming an immediate merge.
-Readiness, polling and accepting a suggestion are never merge consent. Hosted suggestions remain
-inspectable with Accept/Reject decisions; only the user's agent applies accepted content.
+Stack rows, checks, diffs, holds and GitHub links already exist. New value is shared readiness,
+next actor and provenance. `next_need` shows required action, not proof an agent is connected.
+Stored review `pending`/`running` and events show coarse hosted activity; buffered job events are
+not live tool streams. A running review may await a sandbox slot. An author hold never means
+their agent runs.
 
-Illustrative content, not a production screenshot:
+Unqueued/draft PRs found on GitHub stay unassessed unless actual coverage exists. Reading or
+polling cannot queue them. Assess-only execution, an in-app manager and an owner Merge button
+remain separate decisions. If scoped Merge is chosen, extend `queue_pull` with expected head and
+stack scope; recheck caller permissions/gates server-side, reject stale submissions and invalidate
+consent when authorized content changes. Show affected layers and queued/waiting/failed/verified
+merged outcomes. Never bypass gates, publish drafts implicitly or infer consent from readiness.
 
-```text
-List          PR #N · Blocked: author action · assessed <current head> · updated <time>
-Selected      PR #N · head <current head> · Open on GitHub
-Context       Description · Comments / review discussion · Activity
+## API/MCP and progress
 
-MergeLoop     Hosted review finished on <reviewed head> · 2 findings need changes
-Author        PR held: fix or dispute the findings · targets <reviewed head>
-Proposal P1   Optional suggestion · targets <proposal head> · pending owner decision
-Your agent    Action needed: inspect findings and evidence · connection/activity unknown
-GitHub CI     Waiting for a new push · current checks linked below
+[routes.rs](../crates/web/src/routes.rs) stays the route/tool registry; MCP calls the same handlers
+as its authenticated caller. Use `next_need`'s long poll, not a daemon or subscription transport.
+The CLI's landing command queues work; inspecting an unqueued PR uses reads. A `queue` need is
+not user permission to queue.
 
-Next action   Pick up review findings   Copy agent command
-Control       Merge unavailable: review changes on <reviewed head>
-Activity      Last queue event and time
-```
-
-Once progress reporting exists, the agent row can instead say “Jonas's agent · fixing · last
-reported 20s ago”, or “No recent report”. Agent name and phase are reported status, not proof
-that a process is alive. Do not label an author hold “your agent is running”.
-
-| Information the view needs | Existing source | Gap / proposed addition |
-| --- | --- | --- |
-| List readiness, including unqueued/draft PRs | `get_inbox`, `list_open_pulls`, `pull_status`, review and GitHub check reads. | One shared server projection of gate reasons, next-action owner, assessed/base/reviewed heads and freshness. An unassessed PR is unknown, not ready; no implicit queue action to obtain status. |
-| PR description, discussion and owner merge action | `get_pull` / `PullDetail` already show description, timeline comments and thread summaries; `queue_pull` requests the normal merge path. | Extend the existing detail read for full replies/pagination and commit context. Head-fence the merge request and show its scope, gates and outcome; do not add a direct-merge bypass. |
-| Queue stage, active lane step, holds and stack layer | `EntryView` in `web/api.rs`; `PullStateView` / `HoldReasonView` in [web/v1.rs](../crates/web/src/v1.rs). `list_queue`, `pull_status` and `next_need` expose these. | Project ownership from the typed policy and hold, not from parsing English event messages. A `prep_*` hold means hosted work; an `author_*` hold means work required from the user's agent. `review_changes` always returns responsibility to the author. |
-| Review head, findings, cleared/withdrawn status and last update | `ReviewRecord` in `store/review.rs`, projected as `AgentReviewView` / `ReviewBriefView` in [web/review.rs](../crates/web/src/review.rs). | Show reviewed head beside current head. Add review ID and effective execution mode to the shared response where needed. `agent_fixed` means the queue's agent fixed it; it does not identify the user's agent. |
-| Each proposed change and its owner decision | New shared proposal context on the existing review/need projections. | Show proposal ID/revision, exact diff/text, target commit, current commit, pending/accepted/rejected/stale/applied state and verified application result. Label stale proposals explicitly; never imply acceptance for a different head. |
-| What to do next | `NeedView` and its `brief` / `then`, served by `next_need`. | First slice reads with `wait: 0` for the selected PR. Show action plus connection unknown; do not launch an agent or queue a PR merely to display it. |
-| Last activity and coarse hosted work | Stored queue events via `list_events`; `QueueActivity` already polls every three seconds. Review `pending` / `running` is stored. | Job `JobEvent`s are accumulated in `job.rs` and recorded by `review::run_job` after executor completion; they are not a live tool stream. A running review can be waiting for a sandbox slot. Show coarse state honestly; live hosted substeps need new streaming/persistence. |
-| Actual user-agent acknowledgement, phase and freshness | Absent. `ReviewRecord.claim` and database `claimed_at` fence hosted review workers; prep claims live in memory. Database `fixing` tracks an internal hosted review fix and is not a user-agent presence field. | Later add a durable agent-work lease and heartbeat, scoped to installation/repo/PR/layer/head. Do not reuse hosted worker claims. |
-
-The first slice reads readiness, PR context, ownership and the next action without a presence
-database. A full live agent view requires the last row's new state. Reuse the same server
-projection for UI and MCP, including agent-rendered chat tables; do not create a second client-side
-queue state machine. The merge write follows as a separate slice with the head check above.
-
-## MCP contract at `https://mergeloop.ai/mcp`
-
-[routes.rs](../crates/web/src/routes.rs) is the single route/tool registry; [mcp.rs](../crates/web/src/mcp.rs)
-calls those API handlers as the authenticated caller. MCP currently answers POSTs as JSON, has no
-sessions or server-sent events, and GET returns 405. Use `next_need`'s existing long poll; no new
-subscription transport is needed for Furqan's polling request.
-
-| Surface | Concrete change |
+| Surface | Proposed change |
 | --- | --- |
-| Existing reads: `get_inbox`, `list_open_pulls`, `list_queue`, `pull_status`, `get_agent_review`, `next_need`, `list_events`, `get_pull` | Add shared readiness, ownership and head/freshness context through their canonical projections, keeping existing fields compatible. `get_pull` already provides description, timeline comments, current head, checks and open-thread summaries; add full replies/pagination and commit context for the selected PR. First UI slice uses reads only. |
-| Owner Merge control: existing `queue_pull` | Add the displayed expected head and stack scope to the request; reject stale submissions and invalidate consent on subsequent PR content changes before the final merge. Use the same API/MCP action, caller permissions and gates for a click or the user's explicitly instructed agent. Opening the view, a ready assessment or the `queue` need is not authorization to call it. |
-| Existing `next_need` loop | Continue `next_need({repo, number, after: id, wait: 50})`; `threads` returns findings/evidence and an author hold, never an auto-fix request. Optional proposals require an owner decision before application. Keep `fix_checks` specific to red CI and preserve `conflict`, then poll again. Proposal revisions and decisions update the authoritative need; rejected proposals are not repeatedly offered as new work. `NeedKind` serializes snake_case. `id` is a hash of need/hold/latest event, not a proposal ID, acceptance or proof the agent took work. Progress events must not mint endless new work from heartbeats. |
-| Proposed decision tool, with the execution split | Register `respond_to_agent_proposal` with proposal ID/revision, target head and typed `accept` / `reject`. Reuse repo authorization, persist the caller and decision idempotently, and reject stale revisions/heads. It records consent only; all repository and PR writes are applied by the user's agent. This does not wait for the later progress/lease tools. |
-| Existing `post_review` | Remains the legacy all-local review submission. New mode uses hosted findings and must never accept a local assertion through `posted_review` as hosted evidence. `ask_agent_about_review` remains the way to dispute a hosted finding; human `answer_agent_review` retains its existing role. |
-| Proposed progress tools, after the split | Register `claim_agent_work`, `report_agent_work` and `release_agent_work` under a PR's `/api/w/{id}/repos/{owner}/{name}/pulls/{number}/agent-work` routes. Claims return an opaque fenced lease; reports name its head, work generation and a typed phase (`fixing`, `verifying`, `pushing`, `blocked`). Use a client operation ID for retry idempotency, monotonic fencing and lease expiry. Resolve caller identity server-side; a display name/session label is descriptive only. |
-| Direct thread work | Today `need::THREADS` still tells the agent to list/reply/resolve threads with `gh` GraphQL. `get_pull`'s open-thread summaries lack thread IDs/full replies. Extend [github/detail.rs](../crates/github/src/detail.rs) and the shared read projection in the first slice so both UI and agent can inspect discussion. Registered reply/resolve tools backed by existing GitHub adapters follow later; update the brief then. All tools stay scoped to the requested PR. |
+| `list_queue`, `pull_status`, `get_agent_review`, `next_need`, `list_events` | Shared readiness, ownership, head/freshness/coverage provenance with compatible fields. No removed inbox/detail endpoints. |
+| `next_need` | Poll with `after`, `wait: 50`; `threads` hands findings to author. New CI/conflict work needs typed additions. Decisions update needs; rejection/heartbeats do not create repeated work. The hashed `id` is no proposal ID, consent or proof of activity. |
+| Proposed decision tool | `respond_to_agent_proposal` idempotently records accept/reject for ID/revision/head after repo authorization; it never publishes. |
+| Optional scoped merge | Extend `queue_pull` only if chosen, with expected-head/scope checks and normal gates. |
+| Proposed progress tools | `claim_agent_work`, `report_agent_work`, `release_agent_work` use fenced leases scoped to installation/repo/PR/layer/head, operation IDs, typed phases, monotonic fencing and expiry. Caller identity is server-derived; display labels are descriptive. |
 
-For new writes, reuse [auth.rs](../crates/web/src/auth.rs)'s `Caller::repo` and
-`caller.github_token` conventions. Require repo write access to claim/report fixing work. A lease
-is not a GitHub credential and cannot authorize other repos, approve findings or request a merge.
-Invalidate it on a new head, dequeue, retarget, stack reshape or mode change; expired reports cannot
-revive it. The proposal boundary applies even before leases exist; a missing or expired lease
-never permits hosted publication in `hosted-review`. Reconnect reads authoritative head/work
-before reclaiming. A push is verified on GitHub before being shown
-as pushed, and still needs hosted validation and normal gates. Lease expiry never starts a hosted fixer.
+Reuse [auth.rs](../crates/web/src/auth.rs)'s `Caller::repo` and `caller.github_token` conventions.
+Require repo write access for editing claims/reports. Leases grant no credentials, approval or
+merge authority. Invalidate on new head/policy, dequeue, retarget or stack reshape; old reports
+cannot revive them. Verify reported pushes on GitHub. Expiry shows no recent report and keeps
+author ownership, never starts a hosted fixer. Store separately from review-worker claims,
+since work spans review, CI and conflicts. The agent reports its phase; the thin CLI cannot
+observe it. Register routes with `tool!`, update README descriptions and regenerate API types.
 
-Implement lease storage in `crates/store` with a migration and typed models in `crates/core`;
-it spans CI, conflict and review work, so it cannot be represented by the review row's worker claim.
-The CLI remains a thin client of these tools, reporting only what it observes; the agent integration
-must report its editing phase because the CLI cannot observe the parent agent. Register every new
-API route with `tool!`, update descriptions and the README tool table, and regenerate `ui/src/api`
-under the repository's existing API/MCP parity checks.
+## Delivery and acceptance
 
-## Order and acceptance
+| Slice | Status / completion criterion |
+| --- | --- |
+| Polling and author review handoff | Shipped. No daemon, review-fixer removal or local-review feature remains to implement. |
+| Stack rows and unchanged-layer review reuse | Shipped. Preserve them while adding queue/agent readiness and ownership provenance. |
+| GitHub reviews and approvals | Shipped, including open-comment and App-authored safeguards. Preserve defaults; decide strict-policy publication exceptions explicitly. |
+| Deep failing evidence | Draft #306, independent of the split. Shared evidence routing; retain security/human exceptions and three reviewers. |
+| Correction replay / recurring prevention | Additional design, not all of #306. Demonstrate failures/corrections at named SHAs and retained protection while preserving legitimate carried coverage. |
+| Author-publication policy | Needs Jonas's decision. Ship settings, proposal decisions/storage, prep/lane guards, publication guards and validation together; no `agent.runs` or local review. |
+| Progress | After ownership, add durable fenced acknowledgement/phase/freshness; no invented presence. |
+| PR manager, assess-only, scoped Merge UI | Separate product/authority choices against today's GitHub-first interface, not readiness/Deep prerequisites. |
 
-| Order | Slice | Why / completion criterion |
-| --- | --- | --- |
-| Already available | Confirmed third bullet: agent polls for work | `next_need` and `mergeloop` already implement it. Show an example using the existing skill/CLI; no daemon or new transport to land. This is the smallest ask to satisfy. |
-| First new change | Read-only PR list readiness, context and next action | Extend Queue/You rows and the existing detail with shared readiness/reasons, head freshness, description, discussion and GitHub link, plus hosted/your-agent/CI ownership, brief and copyable command. Include unqueued/draft PRs without queuing them. Render proposal targets/decisions when the split supplies them; no invented legacy proposals or agent presence. No new page, execution-policy or gate change. |
-| Independent policy change | Remove review auto-fix and make later reviews incremental | In every mode, findings reject/hold for the author immediately; only red CI can auto-fix. Review the first PR diff, then new commits plus unresolved findings. Preserve evidence, security/human gates and independent replay without a corrective publisher. This is not conditional on the optional split. |
-| Independent evidence change | Deep demonstrates findings and retains checks for recurring mistakes | Enforce the Deep evidence contract above: independent reproduction instead of non-security votes, claims and replay tied to exact commits, explicit security/human exceptions, and retained CI protection proven on offending/corrected heads. Reuse existing evidence, finding and proposal seams; only the user's agent applies changes. This does not wait for the optional split. |
-| Next control slice | Explicit owner Merge action | Keep the action in the selected PR; add server-side expected-head/stack-scope checks to the existing API/MCP queue path. Show blockers and queued/waiting/verified merged outcomes. No gate bypass, implicit draft publication or consent inferred from readiness. This does not depend on the optional execution split. |
-| Then | Opt-in `hosted-review` execution split, owner decisions and author-change validation | Route every hosted-originated repo/PR change through an owner-visible proposal and the user's agent; retain deep hosted diff review, configured checks, immutable evidence replay and head checks. Ship proposal storage/decisions, publication guards and validation together. This mode also hands CI fixes and conflicts to the author's agent; it never reinstates review auto-fix. |
-| After the split | Acknowledgement/progress and thread writes | Add fenced leases and freshness reporting for a true live agent view, then reply/resolve tools to remove the brief's dependence on `gh` thread queries. Discussion reads already ship in the first slice. This is an implementation sequence, not an invented feedback request. |
+Extend existing review routing, job, review-store and
+[queue-loop scenarios](../crates/mergepatrol/src/queue/loop_tests/getting_ready.rs) at implementation:
 
-Before shipping the first slice, inspect the existing list/detail UI in both execution modes and
-show unqueued/draft, pending review, author action, human ask, new/stale head, CI wait, stack layer,
-disconnected/unknown and merged/ejected states. From a row, reach the description, discussion and
-PR link without a new page. Every status/item names its commit and freshness; green CI alone is
-not ready. A new push removes the old ready signal, and UI and agent reads converge on the same
-head and reasons without queuing the PR. Before enabling Merge, prove a stale-head/scope click,
-new content after submission, missing permission or draft cannot merge without fresh authorization
-and the applicable gates. An authorized request still follows the normal queue path.
+- Findings hold for authors without corrective publication; only red CI uses `FixChecks` and
+  default hosted attempts. Author-policy CI/conflicts stop for the author in prep and lane,
+  including prep disabled. No removed review fixer returns.
+- Lower-layer fixes preserve approval above only for unchanged layer diffs. Show each layer's
+  checks, diff, blocker and original/carried provenance. Changed work needs review; no old command
+  result is relabeled execution at a new SHA.
+- GitHub approval waits for unresolved comments, including newly posted findings, follows current
+  coverage/stale-approval rules, never approves the App's own PR or replaces required human review.
+  Strict-policy changes to these writes are explicitly selected.
+- Pending/rejected/stale proposals cause no publication. The user's agent applies accepted content;
+  decisions cannot clear findings. Stale jobs/leases/validation cannot publish or clear a different
+  head/policy. Defaults remain unchanged outside opt-in scope.
+- Corrections pass original-evidence replay; weakened patches, conflicts, timeouts or missing tools
+  cannot imply a pass. Incremental/full-diff resets and carried coverage stay distinct. Security
+  and human routes remain explicit.
+- UI/API/MCP agree on readiness/next actor. Heartbeats, green CI, missing reads and unassessed PRs
+  cannot become ready. Reading never queues. Optional scoped Merge rejects stale head/scope or
+  missing authority, respects drafts/gates and reports the verified outcome.
 
-For the split, extend existing queue-loop scenarios in
-[getting_ready.rs](../crates/mergepatrol/src/queue/loop_tests/getting_ready.rs), review-store cases and
-[job tests](../crates/mergepatrol/tests/job.rs) at their stable seams. Prove these behaviors:
-
-- A hosted review can inspect code/run a failing reproducer; its actionable finding rejects or
-  holds the PR for the author immediately, in every mode, including in the lane and with prep
-  disabled. It produces no `FixReview` and cannot dispatch `FixChecks`. A genuinely red CI check
-  may still dispatch `FixChecks` under `fix_ci` in `hosted`; the stricter new mode returns it to
-  the author. Conflicts, title failures and stacks follow their selected ownership policy.
-- Every hosted-originated repo/PR change is visible with its exact content and target commit before
-  acceptance. Pending, rejected and stale proposals cause no GitHub content writes, including
-  comments, retitles and clean rebases. Acceptance alone also causes no hosted publication;
-  only the user's agent applies it. UI and `next_need` show the same proposal, head and decision.
-- An author push with a real fix passes the original hosted evidence and receives a diff-scoped review;
-  a still-failing command, weakened diagnostic test, replay conflict or unavailable tool cannot
-  silently clear it. Later rounds review new commits and unresolved findings without repeating
-  the whole PR review. Preserve security and human-decision exceptions.
-- A moved head, changed mode or removed queue label prevents an old job/lease/validation result
-  from publishing or clearing anything. Existing `hosted` and `local` retain their ownership settings,
-  except that neither may auto-fix review findings and both use the incremental review contract.
-- API and MCP present the same next action. A heartbeat does not count as completed work or
-  continuously reissue an already claimed task. Expiry displays no recent report and keeps author
-  ownership; no background hosted fixer takes over.
-
-This PR is a design only. Implementation slices need their own user-facing changelog entries and
-validation. Keep this proposal open and unqueued; Jonas decides when it enters the merge queue.
+This is a design only. Runtime slices need validation and user-facing changelog entries.
+Keep #260 open, draft, unqueued and unlabeled with auto-merge off; Jonas decides what to adopt.

@@ -226,6 +226,7 @@ mod tests {
             number,
             head_sha: format!("h{id}"),
             since_head: None,
+            diff_id: None,
             status,
             claim: 0,
             error: None,

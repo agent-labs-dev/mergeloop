@@ -16,7 +16,7 @@ async fn a_later_fix_settles_every_review_that_sent_the_same_finding_back() {
     let head = world.pr(1).head_ref_oid;
     let current = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     let settings = world.ctx.config.repo_defaults.clone();

@@ -17,7 +17,7 @@ The trigger label is `label` in `.mergeloop/mergeloop.yml` on the default branch
 
 ## Over MCP
 
-When the `mergeloop` MCP server is connected (an older connection may be named `mergepatrol`), use its tools instead of the labels: `queue_pull` (with `priority` for the front of the queue), `dequeue_pull`, `pull_status` and `list_queue`. They change the same labels, as the GitHub user or bot the server was connected as, so everything below still holds. `pull_status` reads where a PR is without parsing MergeLoop's comment. The server's other tools do what the MergeLoop dashboard does, such as reviewing a PR or reading why the queue ejected one.
+When the `mergeloop` MCP server is connected (an older connection may be named `mergepatrol`), use its tools instead of the labels: `queue_pull` (with `priority` for the front of the queue), `dequeue_pull`, `pull_status` and `list_queue`. They change the same labels, as the GitHub user or bot the server was connected as, so everything below still holds. `pull_status` reads where a PR is without parsing MergeLoop's comment. The server's other tools read the queue, the agent's review and the queue's history, and change a repo's MergeLoop settings. Reviews, approvals and comments happen on GitHub, with `gh`.
 
 ## With the `mergeloop` command
 
@@ -60,7 +60,7 @@ Queuing is not the end of your job. If you built the PR, stay with it until it m
 
 Every unresolved review thread on the PR, whoever started it, is one comment:
 
-- MergeLoop's review posts a thread on its line for each finding that holds the PR. "Sent back to the author" is yours to work. "For a human" is a finding it asked a human about: leave it to them, and resolve it once they have answered.
+- MergeLoop's review posts a thread on its line for each finding that holds the PR. "Sent back to the author" is yours to work. "For a human" is a finding it asked a human about, which they answer in the thread: resolving it says it is fine as it is, and a reply asks for a change, which comes back to you as a review. Never resolve or answer one yourself.
 - A thread from a human reviewer or another bot.
 
 Also count a review that requests changes, and a top-level comment that asks for one. Findings the review cleared, and its notes under the bar, need nothing from you.
@@ -92,9 +92,9 @@ A PR with no unresolved thread and nothing asked of a human goes on to the queue
 
 ### The MergeLoop review's findings
 
-- Never call `answer_agent_review` on a PR you built, and never approve your own PR with `review_pull`. That would answer your own review.
+- Never resolve a "For a human" thread, or approve your own PR. Each would answer your own review.
 - After three reviews in a row that send findings back, the next one asks a human about what is still left. Don't try to beat it with a fourth fix: mark those `needs-human`.
-- To have the reviewer settle a finding now rather than on the next push, reply to it with `ask_agent_about_review`, giving its `head_sha` and finding id. Its answer, in `questions`, ends `VERDICT: withdrawn` (the finding was wrong), `VERDICT: intended` (the code does what its author meant), or `VERDICT: stands`. Either of the first two lifts the finding.
+- To have the reviewer settle a finding now rather than on the next push, reply in its thread mentioning MergeLoop's App, as the review's summary names it (`@merge-loop` on mergeloop.ai), with why it doesn't apply. The agent reads the code again and answers in the thread, ending `VERDICT: withdrawn` (the finding was wrong), `VERDICT: intended` (the code does what its author meant), or `VERDICT: stands`. Either of the first two lifts the finding and resolves its thread.
 - A finding about what wasn't checked, such as "never run on a device" or "no tests cover this", is yours to close while you can: run it, or write the test, and say what you ran in its reply. Only when you can't, such as having no device, is it `needs-human`, and it says what a human would have to run.
 
 ### The ledger

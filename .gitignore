@@ -4,3 +4,4 @@ node_modules
 /ui/dist
 .env
 *.log
+*.tsbuildinfo

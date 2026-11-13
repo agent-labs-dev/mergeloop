@@ -601,6 +601,17 @@ impl World {
         ctx.config.data_dir = tmp.path().join("data");
         ctx.executor = agent.clone();
         ctx.jobs = Semaphore::new(2);
+        // The App the review's comments mention, with no webhooks: the URL is http.
+        ctx.hosted_app = Some(AppCredentials {
+            id: 1,
+            slug: "mp".into(),
+            client_id: "c".into(),
+            client_secret: "s".into(),
+            webhook_secret: None,
+            pem: String::new(),
+            owner: "o".into(),
+            html_url: "https://github.com/apps/mp".into(),
+        });
         // The cache's `origin` is GitHub's URL, whatever the test: it is sent here.
         let cache = cache_path(&ctx.config.data_dir, "o", "r");
         std::fs::create_dir_all(&cache).unwrap();
@@ -755,7 +766,11 @@ impl World {
     /// `conclude`, in a repo with these settings.
     async fn conclude_with(&self, confidence: u8, settings: &RepoSettings) -> i64 {
         let head = self.pr(1).head_ref_oid;
-        let r = self.store.start_review(1, &repo(), 1, &head).await.unwrap();
+        let r = self
+            .store
+            .start_review(1, &repo(), 1, &head, None)
+            .await
+            .unwrap();
         self.conclude_review(&r, finding(confidence), settings)
             .await;
         r.id
@@ -1389,7 +1404,7 @@ async fn approved_stack(
         let head = world.pr(n).head_ref_oid;
         let r = world
             .store
-            .start_review(1, &repo(), n, &head)
+            .start_review(1, &repo(), n, &head, None)
             .await
             .unwrap();
         world.store.finish_review(r.number, ReviewStatus::Approved);
@@ -1574,7 +1589,7 @@ async fn a_pr_pushed_to_during_the_review_gets_no_out_of_date_review() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     world.gh.with_mut(|s| s.push(1, "pushed"));
@@ -1607,7 +1622,7 @@ async fn the_next_review_says_what_became_of_what_the_last_sent_back() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     world.conclude_review(&r, fixed, &settings).await;
@@ -1650,7 +1665,7 @@ async fn a_review_that_asks_a_human_comments_and_dismisses_what_it_sent_back() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head)
+        .start_review(1, &repo(), 1, &head, None)
         .await
         .unwrap();
     let asks = Finding {

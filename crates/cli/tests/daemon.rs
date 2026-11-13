@@ -1760,10 +1760,11 @@ async fn a_pr_github_would_not_label_yet_is_opened_on_a_later_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn transcripts_older_than_seven_days_are_removed() {
+async fn transcripts_older_than_seven_days_are_removed_and_no_other_folder_is() {
     let w = World::new().await;
     w.mark();
-    for (build, stamp) in [("1", "202001010000"), ("2", "")] {
+    // `notes` is as old as build 1's transcripts, and not a folder the daemon makes.
+    for (build, stamp) in [("1", "202001010000"), ("2", ""), ("notes", "202001010000")] {
         let dir = w.workspace().join("transcripts").join(build);
         std::fs::create_dir_all(&dir).unwrap();
         if !stamp.is_empty() {
@@ -1782,7 +1783,7 @@ async fn transcripts_older_than_seven_days_are_removed() {
     })
     .await;
 
-    assert_eq!(w.transcripts(), ["2"]);
+    assert_eq!(w.transcripts(), ["2", "notes"]);
 }
 
 /// The threads the daemon replied in, one entry per reply posted, in order.

@@ -326,7 +326,7 @@ impl Folder {
     /// `now`.
     pub async fn prune_transcripts(&self, now: SystemTime) -> Result<()> {
         for dir in listing(&self.root.join("transcripts"))? {
-            if !own_dir(&dir, |_| true)? {
+            if !own_dir(&dir, |name| name.parse::<u64>().is_ok())? {
                 continue;
             }
             let written = std::fs::symlink_metadata(&dir)?.modified()?;

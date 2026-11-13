@@ -6,6 +6,8 @@
 //!   daemon/id                 the daemon's name for itself, made once: its claims are its own
 //!   daemon/groups/            the process groups of running builds (`groups`)
 //!   repos/<owner>/<name>.git  a bare clone of each repo it builds in, with its worktrees' git dirs
+//!     mergeloop-renamed       there when the repo was since renamed: the clone goes once unused
+//!   repos/<owner>/<name>.git.gone  such a clone, being removed
 //!   builds/<build>/           the build's room: all that the build may write
 //!     tree/                   its git worktree, on the local branch `mergeloop/build-<issue>`
 //!     tmp/                    its TMPDIR
@@ -45,6 +47,10 @@ use super::verify;
 pub const TRANSCRIPTS_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The local branches of builds, in every clone.
 const BRANCHES: &str = "refs/heads/mergeloop/build-";
+/// In a clone whose repo was renamed: it holds the new name.
+const RENAMED: &str = "mergeloop-renamed";
+/// What a clone is renamed to while it is removed, so a crash halfway leaves it known.
+const GONE: &str = ".gone";
 
 /// The workspace folder, and a lock per clone: git commands on one clone run one at a time.
 #[derive(Clone)]
@@ -207,7 +213,31 @@ impl Folder {
         let _held = lock.lock().await;
         remove_dir(&self.reviews(task.build)).await?;
         self.remove_locked(&clone, &self.room(task.build).root, &task.branch)
-            .await
+            .await?;
+        retire(&clone).await
+    }
+
+    /// Notes that the repo `old` is now `new`: its clone under the old name goes now if no
+    /// build's worktree is in it, else when the last one goes.
+    pub async fn renamed(&self, old: &str, new: &str) -> Result<()> {
+        let clone = self.clone_of(old);
+        let lock = self.clone_lock(&clone);
+        let _held = lock.lock().await;
+        match kind(&clone)? {
+            Some(Kind::Dir) => {}
+            Some(Kind::Link) => return Err(not_followed(&clone)),
+            _ => return Ok(()),
+        }
+        let mark = clone.join(RENAMED);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&mark)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{new}\n").as_bytes()))
+            .with_context(|| format!("write {}", mark.display()))?;
+        retire(&clone).await
     }
 
     async fn remove_locked(&self, clone: &Path, room: &Path, branch: &str) -> Result<()> {
@@ -268,11 +298,20 @@ impl Folder {
     }
 
     async fn reconcile_owner(&self, owner: &Path) -> Result<()> {
+        let gone = |n: &str| n.strip_suffix(GONE).is_some_and(|n| n.ends_with(".git"));
         for clone in listing(owner)? {
-            if !own_dir(&clone, |n| n.ends_with(".git"))? {
+            if !own_dir(&clone, |n| n.ends_with(".git") || gone(n))? {
                 continue;
             }
-            if let Err(e) = self.reconcile_clone(&clone).await {
+            if clone.file_name().and_then(|n| n.to_str()).is_some_and(gone) {
+                discard(&clone, "a renamed repo's clone a crash left half removed")?;
+                continue;
+            }
+            let reconciled = match self.reconcile_clone(&clone).await {
+                Ok(()) => retire(&clone).await,
+                e => e,
+            };
+            if let Err(e) = reconciled {
                 // Made again when a build next needs it.
                 discard(&clone, &format!("{e:#}"))?;
             }
@@ -345,6 +384,32 @@ pub struct Checkout {
     pub tree: Tree,
     /// Where the task's branch was on GitHub at checkout: the push replaces only that.
     pub remote: Option<String>,
+}
+
+/// Removes `clone` when its repo was renamed and no build's worktree is in it: first renamed to
+/// its `GONE` name, which start-up removes when a crash stopped this halfway. Run it under the
+/// clone's lock.
+async fn retire(clone: &Path) -> Result<()> {
+    if kind(&clone.join(RENAMED))? != Some(Kind::File) {
+        return Ok(());
+    }
+    Git.run(clone, &["worktree", "prune"]).await?;
+    let trees = Git.run(clone, &["worktree", "list", "--porcelain"]).await?;
+    // The first is the bare clone itself.
+    if trees.lines().filter(|l| l.starts_with("worktree ")).count() > 1 {
+        return Ok(());
+    }
+    let mut gone = clone.as_os_str().to_owned();
+    gone.push(GONE);
+    let gone = PathBuf::from(gone);
+    if kind(&gone)? == Some(Kind::Dir) {
+        discard(&gone, "a renamed repo's clone a crash left half removed")?;
+    }
+    std::fs::rename(clone, &gone).with_context(|| format!("move {}", clone.display()))?;
+    discard(
+        &gone,
+        "the clone of a repo since renamed, which no build uses",
+    )
 }
 
 /// Refuses `root` unless it is the daemon's: it holds the daemon's name, or nothing but what

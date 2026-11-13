@@ -200,6 +200,12 @@ impl Builder {
                 task.repo, now.repo
             ),
         );
+        if let Err(e) = self.folder.renamed(&task.repo, &now.repo).await {
+            say(
+                task,
+                &format!("could not clean up the old name's clone: {e:#}"),
+            );
+        }
         Ok(Task { pr: task.pr, ..now })
     }
 

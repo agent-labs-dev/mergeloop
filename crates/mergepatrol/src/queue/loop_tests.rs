@@ -1411,8 +1411,18 @@ impl Store for Mem {
         self.exit_authors.lock().unwrap().push((pr, author));
         Ok(None)
     }
-    async fn builders(&self, _: u64, _: &RepoName) -> Result<Vec<(PrNumber, String)>> {
-        Ok(self.builders.lock().unwrap().clone())
+    async fn builders(
+        &self,
+        _: u64,
+        _: &RepoName,
+        prs: &[PrNumber],
+    ) -> Result<Vec<(PrNumber, String)>> {
+        let builders = self.builders.lock().unwrap();
+        Ok(builders
+            .iter()
+            .filter(|(n, _)| prs.contains(n))
+            .cloned()
+            .collect())
     }
     async fn has_left(&self, _: &LaneKey, pr: PrNumber) -> Result<bool> {
         let events = self.events.lock().unwrap();
@@ -5068,6 +5078,28 @@ async fn a_build_taken_over_counts_for_whoever_holds_it_when_the_count_is_made()
     assert_eq!(run.merged(), [1]);
     assert_eq!(run.exit_authors(1), [Some("carol".to_owned())]);
     assert_eq!(*plans.seats.lock().unwrap(), ["bob"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_build_taken_over_is_its_new_holders_when_its_pr_leaves_unmerged() {
+    let run = Run::new(Fake::new(|s| {
+        s.add_pr(1);
+        let pr = s.prs.get_mut(&1).unwrap();
+        pr.details = by_the_app();
+        pr.review_decision = Some("REVIEW_REQUIRED".into());
+    }));
+    run.built(1, "bob");
+    run.tick().await;
+    assert_eq!(run.kinds(1), ["enqueued", "held"]);
+
+    // Carol takes the build over, and the label comes off before the queue looks again: the
+    // PR is no longer among the labeled ones, and its exit is still hers.
+    run.built(1, "carol");
+    run.gh
+        .with_mut(|s| s.prs.get_mut(&1).unwrap().labels.clear());
+    run.tick().await;
+    assert_eq!(run.kinds(1).last().unwrap(), "dequeued");
+    assert_eq!(run.exit_authors(1), [Some("carol".to_owned())]);
 }
 
 /// The settings that give `release` a queue.

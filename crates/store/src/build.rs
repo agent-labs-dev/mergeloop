@@ -1372,16 +1372,18 @@ mod tests {
         claim(&store, "cy").await.unwrap();
         let r = repo("o/r");
         assert_eq!(
-            store.builders(1, &r).await.unwrap(),
+            store.builders(1, &r, &[40, 41]).await.unwrap(),
             [(40, "ana".to_owned())]
         );
-        assert!(store.builders(2, &r).await.unwrap().is_empty());
+        // Only the PRs asked about, in the workspace asked about.
+        assert!(store.builders(1, &r, &[41]).await.unwrap().is_empty());
+        assert!(store.builders(2, &r, &[40]).await.unwrap().is_empty());
 
         heard_ago(&pool, pr.id, STALE as i64 + 1).await;
         let ben = claim(&store, "ben").await.unwrap();
         assert_eq!(ben.pr, Some(40));
         assert_eq!(
-            store.builders(1, &r).await.unwrap(),
+            store.builders(1, &r, &[40]).await.unwrap(),
             [(40, "ben".to_owned())]
         );
     }

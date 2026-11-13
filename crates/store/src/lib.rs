@@ -172,12 +172,13 @@ pub trait Store: ReadCache + ReviewStore {
         detail: &str,
         summary: &PrSummary,
     ) -> Result<Option<StepTimes>>;
-    /// The repo's PRs that the build lane opened, each with the developer who holds its build,
+    /// Those of `prs` that the build lane opened, each with the developer who holds its build,
     /// or held it last: a built PR is theirs, for seats and history.
     async fn builders(
         &self,
         installation_id: u64,
         repo: &RepoName,
+        prs: &[PrNumber],
     ) -> Result<Vec<(PrNumber, String)>>;
     /// Whether the PR left the queue since it last joined: its exit is recorded. `false` for a
     /// PR that never joined.
@@ -729,14 +730,16 @@ impl Store for PgStore {
         &self,
         installation_id: u64,
         repo: &RepoName,
+        prs: &[PrNumber],
     ) -> Result<Vec<(PrNumber, String)>> {
+        let prs: Vec<i64> = prs.iter().map(|n| *n as i64).collect();
         let rows = sqlx::query(
             "SELECT pr, holder FROM builds
-             WHERE installation_id = $1 AND repo = $2 AND pr IS NOT NULL AND holder IS NOT NULL
-             ORDER BY pr",
+             WHERE installation_id = $1 AND repo = $2 AND pr = ANY($3) AND holder IS NOT NULL",
         )
         .bind(installation_id as i64)
         .bind(repo.to_string())
+        .bind(prs)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows

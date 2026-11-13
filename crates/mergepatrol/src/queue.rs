@@ -166,7 +166,7 @@ impl Prs {
         builders: &Builders,
     ) {
         let left = lanes.iter().flat_map(|lane| &lane.entries);
-        let left = left.map(|e| (e.number, e.summary.clone()));
+        let left = left.map(|e| (e.number, builders.saved(e.number, e.summary.clone())));
         let labeled = labeled.iter().map(|pr| (pr.number, builders.summary(pr)));
         let prs = left.chain(labeled).collect();
         let mut map = self.0.lock().unwrap();
@@ -194,21 +194,25 @@ impl Prs {
 struct Builders(HashMap<PrNumber, String>);
 
 impl Builders {
-    async fn read(ctx: &Ctx, installation: u64, repo: &RepoName) -> Result<Self> {
-        Ok(Self(
-            ctx.store
-                .builders(installation, repo)
-                .await?
-                .into_iter()
-                .collect(),
-        ))
+    /// Those behind `prs`, the PRs this tick looks at.
+    async fn read(ctx: &Ctx, installation: u64, repo: &RepoName, prs: &[PrNumber]) -> Result<Self> {
+        let builders = ctx.store.builders(installation, repo, prs).await?;
+        Ok(Self(builders.into_iter().collect()))
     }
 
     /// What the dashboard and the history show of `pr`: a PR the lane built is its developer's.
     fn summary(&self, pr: &PullRequest) -> PrSummary {
-        let mut summary = pr.summary();
-        let by_an_app = summary.author.as_ref().is_some_and(|a| a.bot);
-        if let Some(login) = self.0.get(&pr.number).filter(|_| by_an_app) {
+        let summary = pr.summary();
+        match summary.author.as_ref().is_some_and(|a| a.bot) {
+            true => self.saved(pr.number, summary),
+            false => summary,
+        }
+    }
+
+    /// `summary` of PR `number` as an earlier tick kept it, for whoever holds its build now.
+    /// GitHub's author is not at hand for a PR that left: a build has only a PR the App opened.
+    fn saved(&self, number: PrNumber, mut summary: PrSummary) -> PrSummary {
+        if let Some(login) = self.0.get(&number) {
             summary.author = Some(Person {
                 login: login.clone(),
                 avatar_url: format!("https://github.com/{login}.png"),
@@ -750,7 +754,12 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     let units = units(gh, repo, &snap.labeled).await?;
     let layers: Vec<PullRequest> = units.iter().flat_map(|u| u.layers.clone()).collect();
     let saved: Vec<Lane> = lanes.iter().map(|(_, lane)| lane.clone()).collect();
-    let builders = Builders::read(ctx, installation, repo).await?;
+    let left = saved
+        .iter()
+        .flat_map(|lane| &lane.entries)
+        .map(|e| e.number);
+    let seen: Vec<PrNumber> = left.chain(layers.iter().map(|pr| pr.number)).collect();
+    let builders = Builders::read(ctx, installation, repo, &seen).await?;
     ctx.prs
         .update(installation, repo, &saved, &layers, &builders);
     let gate = match &ctx.billing {

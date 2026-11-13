@@ -570,7 +570,7 @@ The daemon's own git on a build names the worktree's git dir rather than followi
 
 ### Whose PR a built PR is
 
-GitHub has the App's bot as the author of a built PR. Everywhere MergeLoop asks whose PR it is, it is the PR of the developer whose daemon holds its build at that moment: the seat it takes when it joins a private repo's queue, and the name it is kept under in the history, the people view and the queue's events. A developer has one seat whether their PRs are built or their own. When a stale build is taken over, the seat already taken when the PR joined stays; the next count made, such as its leaving the queue, is the new holder's.
+GitHub has the App's bot as the author of a built PR. Everywhere MergeLoop asks whose PR it is, it is the PR of the developer whose daemon holds its build at that moment: the seat it takes when it joins a private repo's queue, and the name it is kept under in the history, the people view and the queue's events. A developer has one seat whether their PRs are built or their own. When a stale build is taken over, the seat already taken when the PR joined stays; the next count made, such as its leaving the queue, is the new holder's. A seat is kept by GitHub login, as for every PR, and the daemon's login is the one from its sign-in: a developer who renames their GitHub account, even only its capitalization, runs `mergeloop login` again, or their built PRs take a seat under the old name beside the one their own PRs take.
 
 ### Dark merges
 

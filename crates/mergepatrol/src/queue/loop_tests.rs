@@ -819,14 +819,8 @@ impl Scripted {
 
 #[async_trait]
 impl Sandbox for Scripted {
-    async fn rebase(
-        &self,
-        key: &LaneKey,
-        _: &RepoSnapshot,
-        unit: &Unit,
-        _: &RepoSettings,
-        agent: bool,
-    ) -> Result<Event> {
+    async fn rebase(&self, at: LaneRead<'_>, unit: &Unit, conflicts: Conflicts) -> Result<Event> {
+        let key = at.key;
         let n = {
             let mut n = self.rebases.lock().unwrap();
             *n += 1;
@@ -841,9 +835,9 @@ impl Sandbox for Scripted {
             return Ok(Event::RebaseFailed(reason.clone()));
         }
         if self.conflicts_on.contains(&unit.number) {
-            return Ok(match agent {
-                true => Event::RebaseFailed("the agent could not resolve it".into()),
-                false => Event::RebaseConflict,
+            return Ok(match conflicts {
+                Conflicts::Resolve => Event::RebaseFailed("the agent could not resolve it".into()),
+                Conflicts::Leave => Event::RebaseConflict,
             });
         }
         if self.rebases_once && n > 1 {
@@ -872,11 +866,9 @@ impl Sandbox for Scripted {
 
     async fn recheck(
         &self,
-        _: &LaneKey,
-        _: &RepoSnapshot,
+        _: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        _: &RepoSettings,
         head: &str,
     ) -> Result<Event> {
         let mut s = self.gh.state.lock().unwrap();
@@ -893,11 +885,9 @@ impl Sandbox for Scripted {
 
     async fn fix(
         &self,
-        _: &LaneKey,
-        _: &RepoSnapshot,
+        _: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        _: &RepoSettings,
         head: &str,
         _: &str,
         failures: &[CheckFailure],

@@ -664,6 +664,7 @@ impl World {
         let sandbox = JobSandbox {
             ctx: &self.ctx,
             gh: &self.installation,
+            runs: Runs::InLane,
         };
         tick(&self.ctx, &*self.gh, &sandbox, &repo())
             .await
@@ -1509,11 +1510,14 @@ async fn rebase_stack(world: &World) -> Event {
     let sandbox = JobSandbox {
         ctx: &world.ctx,
         gh: &world.installation,
+        runs: Runs::InLane,
     };
-    sandbox
-        .rebase(&key, &snap, &unit, settings, true)
-        .await
-        .unwrap()
+    let at = LaneRead {
+        key: &key,
+        snap: &snap,
+        settings,
+    };
+    sandbox.rebase(at, &unit, Conflicts::Resolve).await.unwrap()
 }
 
 /// The status of the review on PR `number`'s head, and the head it goes on from.

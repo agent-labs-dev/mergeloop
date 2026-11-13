@@ -990,10 +990,13 @@ async fn a_workspace_whose_lane_is_off_is_asked_again_later() {
     w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
         .await;
 
+    // The one slot holds the task from its claim: claims after it, once the PR is open, are
+    // the next ones.
     let claims = w
         .fake
-        .tools()
+        .lane_tools()
         .iter()
+        .take_while(|t| *t != "heartbeat_build")
         .filter(|t| *t == "claim_build")
         .count();
     assert_eq!(claims, 2, "refused, then the task");

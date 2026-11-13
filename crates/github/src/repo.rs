@@ -1934,6 +1934,26 @@ mod tests {
         );
     }
 
+    /// GitHub bypasses rules on `merge-async` only when asked (`bypass_rules`, default false). So
+    /// a repo that makes the App a bypass actor changes no merge MergeLoop makes today.
+    #[tokio::test]
+    async fn a_merge_never_asks_github_to_bypass_its_rules() {
+        let (gh, requests) = fake::serve_whole(vec![(
+            200,
+            "",
+            r#"{"status":"merged","details":{"sha":"m1"}}"#,
+        )])
+        .await;
+        let repo = RepoName::parse("o/r").unwrap();
+        gh.merge(&repo, 7, "abc", "squash").await.unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({ "sha": "abc", "merge_method": "squash", "merge_action": "direct_merge" })
+        );
+    }
+
     #[tokio::test]
     async fn a_rejected_merge_stays_rejected() {
         let pr = r#"{"merged":false,"head":{"sha":"abc"},"merge_commit_sha":null}"#;

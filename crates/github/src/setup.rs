@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::AsUser;
 
 const API: &str = "https://api.github.com";
+/// GitHub's site, where a user signs in.
+pub(crate) const WEB: &str = "https://github.com";
 
 /// What GitHub returns when it creates the App. Stored encrypted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,14 +231,16 @@ impl std::fmt::Display for Revoked {
 
 impl std::error::Error for Revoked {}
 
-/// Trades the code from the OAuth callback for a user token.
-pub async fn exchange_code(
+/// Trades the code from the OAuth callback for a user token, at `web` (GitHub's site).
+pub(crate) async fn exchange_code(
+    web: &str,
     app: &AppCredentials,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<UserToken> {
     let res = token_request(
+        web,
         app,
         &[
             ("code", code),
@@ -257,6 +261,7 @@ pub async fn exchange_code(
 /// A new user token for an expired one.
 pub async fn refresh_user_token(app: &AppCredentials, refresh_token: &str) -> Result<UserToken> {
     let res = token_request(
+        WEB,
         app,
         &[
             ("grant_type", "refresh_token"),
@@ -274,14 +279,14 @@ pub async fn refresh_user_token(app: &AppCredentials, refresh_token: &str) -> Re
     }
 }
 
-async fn token_request(app: &AppCredentials, params: &[(&str, &str)]) -> Result<Value> {
+async fn token_request(web: &str, app: &AppCredentials, params: &[(&str, &str)]) -> Result<Value> {
     let mut form = vec![
         ("client_id", app.client_id.as_str()),
         ("client_secret", app.client_secret.as_str()),
     ];
     form.extend_from_slice(params);
     Ok(client()?
-        .post("https://github.com/login/oauth/access_token")
+        .post(format!("{web}/login/oauth/access_token"))
         .header("accept", "application/json")
         .form(&form)
         .send()
@@ -321,37 +326,6 @@ pub struct UserInstallation {
     pub account: String,
     pub account_type: String,
     pub avatar_url: String,
-}
-
-/// The installations of this App that the user can access: their workspaces.
-pub async fn user_installations(token: &str) -> Result<Vec<UserInstallation>> {
-    let mut all = Vec::new();
-    for page in 1.. {
-        let res: Value = user_get(
-            token,
-            &format!("/user/installations?per_page=100&page={page}"),
-        )
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-        let batch = res["installations"].as_array().cloned().unwrap_or_default();
-        all.extend(batch.iter().filter_map(|i| {
-            Some(UserInstallation {
-                id: i["id"].as_u64()?,
-                account: i["account"]["login"].as_str()?.to_owned(),
-                account_type: i["account"]["type"].as_str().unwrap_or("User").to_owned(),
-                avatar_url: i["account"]["avatar_url"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            })
-        }));
-        if batch.len() < 100 {
-            break;
-        }
-    }
-    Ok(all)
 }
 
 /// The repos of installation `id` that the user can read: those they own, collaborate on, or
@@ -450,6 +424,35 @@ impl AsUser {
     /// The token's user.
     pub async fn user(&self) -> Result<GithubUser> {
         Ok(self.get("/user").await?.error_for_status()?.json().await?)
+    }
+
+    /// The installations of this App that the user can access: their workspaces.
+    pub async fn installations(&self) -> Result<Vec<UserInstallation>> {
+        let mut all = Vec::new();
+        for page in 1.. {
+            let res: Value = self
+                .get(&format!("/user/installations?per_page=100&page={page}"))
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let batch = res["installations"].as_array().cloned().unwrap_or_default();
+            all.extend(batch.iter().filter_map(|i| {
+                Some(UserInstallation {
+                    id: i["id"].as_u64()?,
+                    account: i["account"]["login"].as_str()?.to_owned(),
+                    account_type: i["account"]["type"].as_str().unwrap_or("User").to_owned(),
+                    avatar_url: i["account"]["avatar_url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+            }));
+            if batch.len() < 100 {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     /// Whether GitHub takes the token, of any kind: `/rate_limit` answers every token, and

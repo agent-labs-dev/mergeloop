@@ -328,6 +328,22 @@ pub trait Store: ReadCache + ReviewStore {
     async fn create_login_code(&self, code_hash: &str, code: &LoginCode) -> Result<()>;
     /// Deletes the code and returns it, if it has not expired by `now`: a code works once.
     async fn take_login_code(&self, code_hash: &str, now: i64) -> Result<Option<LoginCode>>;
+    async fn create_consent(&self, request_hash: &str, consent: &Consent) -> Result<()>;
+    /// The request, for the browser that holds `browser_hash`'s secret, if it has not expired by
+    /// `now`.
+    async fn consent(
+        &self,
+        request_hash: &str,
+        browser_hash: &str,
+        now: i64,
+    ) -> Result<Option<Consent>>;
+    /// As `consent`, and deletes it: a request is answered once.
+    async fn take_consent(
+        &self,
+        request_hash: &str,
+        browser_hash: &str,
+        now: i64,
+    ) -> Result<Option<Consent>>;
 }
 
 /// Who a secret belongs to.
@@ -456,6 +472,22 @@ pub struct LoginCode {
     pub challenge: String,
     /// The session token, sealed by the vault.
     pub token: Sealed,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+/// A sign-in for an MCP client that waits for the user's answer on the consent page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Consent {
+    /// The SHA-256 of the secret in the cookie of the browser that signed in.
+    pub browser_hash: String,
+    pub token_hash: String,
+    /// The session token a yes hands over, sealed by the vault.
+    pub token: Sealed,
+    /// Who asks, and where the answer goes, as the server wrote it.
+    pub client: String,
+    /// The GitHub login signed in.
+    pub login: String,
     /// Unix seconds.
     pub expires_at: i64,
 }
@@ -1433,11 +1465,13 @@ impl Store for PgStore {
     }
 
     async fn delete_expired_sessions(&self, now: i64) -> Result<u64> {
-        // A code nobody took leaves a session nobody holds.
+        // A code nobody took, or a request nobody answered, leaves a session nobody holds.
         let done = sqlx::query(
-            "WITH codes AS (DELETE FROM login_codes WHERE expires_at <= $1 RETURNING token_hash)
+            "WITH codes AS (DELETE FROM login_codes WHERE expires_at <= $1 RETURNING token_hash),
+                  asks AS (DELETE FROM consents WHERE expires_at <= $1 RETURNING token_hash)
              DELETE FROM sessions
-             WHERE expires_at <= $1 OR token_hash IN (SELECT token_hash FROM codes)",
+             WHERE expires_at <= $1
+                OR token_hash IN (SELECT token_hash FROM codes UNION ALL SELECT token_hash FROM asks)",
         )
         .bind(now)
         .execute(&self.pool)
@@ -1516,6 +1550,75 @@ impl Store for PgStore {
                 expires_at: row.get("expires_at"),
             })
             .filter(|code| code.expires_at > now))
+    }
+
+    async fn create_consent(&self, request_hash: &str, consent: &Consent) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO consents (request_hash, browser_hash, token_hash, token_nonce,
+                token_ciphertext, client, login, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(request_hash)
+        .bind(&consent.browser_hash)
+        .bind(&consent.token_hash)
+        .bind(&consent.token.nonce)
+        .bind(&consent.token.ciphertext)
+        .bind(&consent.client)
+        .bind(&consent.login)
+        .bind(consent.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn consent(
+        &self,
+        request_hash: &str,
+        browser_hash: &str,
+        now: i64,
+    ) -> Result<Option<Consent>> {
+        let row = sqlx::query(
+            "SELECT browser_hash, token_hash, token_nonce, token_ciphertext, client, login, expires_at
+             FROM consents WHERE request_hash = $1 AND browser_hash = $2 AND expires_at > $3",
+        )
+        .bind(request_hash)
+        .bind(browser_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(consent_of))
+    }
+
+    async fn take_consent(
+        &self,
+        request_hash: &str,
+        browser_hash: &str,
+        now: i64,
+    ) -> Result<Option<Consent>> {
+        let row = sqlx::query(
+            "DELETE FROM consents WHERE request_hash = $1 AND browser_hash = $2
+             RETURNING browser_hash, token_hash, token_nonce, token_ciphertext, client, login,
+                expires_at",
+        )
+        .bind(request_hash)
+        .bind(browser_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(consent_of).filter(|c| c.expires_at > now))
+    }
+}
+
+fn consent_of(row: &sqlx::postgres::PgRow) -> Consent {
+    Consent {
+        browser_hash: row.get("browser_hash"),
+        token_hash: row.get("token_hash"),
+        token: Sealed {
+            nonce: row.get("token_nonce"),
+            ciphertext: row.get("token_ciphertext"),
+        },
+        client: row.get("client"),
+        login: row.get("login"),
+        expires_at: row.get("expires_at"),
     }
 }
 
@@ -1671,6 +1774,59 @@ mod tests {
             .unwrap();
         assert_eq!(left, ["taken"]);
         assert_eq!(store.take_login_code("c2", 50).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_consent_is_for_its_browser_answered_once_and_takes_its_session_when_it_expires(
+        pool: PgPool,
+    ) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let session = Session {
+            kind: SessionKind::Setup,
+            expires_at: 10_000,
+            checked_at: 0,
+            github: None,
+        };
+        let consent = |token_hash: &str| Consent {
+            browser_hash: "b".into(),
+            token_hash: token_hash.into(),
+            token: Sealed {
+                nonce: vec![1],
+                ciphertext: vec![2],
+            },
+            client: "{}".into(),
+            login: "ana".into(),
+            expires_at: 100,
+        };
+        store.create_session("answered", &session).await.unwrap();
+        store.create_session("left", &session).await.unwrap();
+        store
+            .create_consent("r1", &consent("answered"))
+            .await
+            .unwrap();
+        store.create_consent("r2", &consent("left")).await.unwrap();
+
+        // Another browser's, or past its time: nothing.
+        assert_eq!(store.consent("r1", "other", 50).await.unwrap(), None);
+        assert_eq!(store.take_consent("r1", "other", 50).await.unwrap(), None);
+        assert_eq!(store.consent("r1", "b", 100).await.unwrap(), None);
+        assert_eq!(
+            store.consent("r1", "b", 50).await.unwrap(),
+            Some(consent("answered"))
+        );
+        assert_eq!(
+            store.take_consent("r1", "b", 50).await.unwrap(),
+            Some(consent("answered"))
+        );
+        assert_eq!(store.take_consent("r1", "b", 50).await.unwrap(), None);
+        // Nobody answered r2 in time: it and its session go.
+        assert_eq!(store.delete_expired_sessions(100).await.unwrap(), 1);
+        let left: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM sessions")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, ["answered"]);
+        assert_eq!(store.consent("r2", "b", 50).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = false)]

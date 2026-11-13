@@ -251,6 +251,7 @@ mod tests {
     use tower::ServiceExt;
 
     mod build_lane;
+    mod consent;
 
     const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 

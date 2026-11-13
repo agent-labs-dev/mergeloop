@@ -86,7 +86,7 @@ pub fn review_build_findings(outcome: &Outcome, text: &str) -> Result<Vec<BuildF
     Ok(reply.findings)
 }
 
-/// The JSON an agent replied with, alone or in a code block, once it ran to the end.
+/// The review JSON an agent replied with, alone or in a code block, once it ran to the end.
 pub fn reply_json<T: DeserializeOwned>(outcome: &Outcome, text: &str) -> Result<T> {
     match outcome {
         Outcome::Failed(why) => bail!("the agent failed: {why}"),
@@ -95,9 +95,9 @@ pub fn reply_json<T: DeserializeOwned>(outcome: &Outcome, text: &str) -> Result<
     }
     let json = match (text.find('{'), text.rfind('}')) {
         (Some(start), Some(end)) if start < end => &text[start..=end],
-        _ => bail!("the agent's reply is not JSON"),
+        _ => bail!("the agent's review is not JSON"),
     };
-    serde_json::from_str(json).context("the agent's reply does not parse")
+    serde_json::from_str(json).context("the agent's review does not parse")
 }
 
 /// What the builder's next run is told of the reviewer's findings.

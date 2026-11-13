@@ -1331,7 +1331,10 @@ mod tests {
         assert_eq!(r.findings[0].confidence, 100, "a percent is at most 100");
         assert_eq!(r.findings[0].kind, mergepatrol_core::Kind::Security);
         assert_eq!(r.findings[0].line, Some(3));
-        assert!(parse_review(&Outcome::Resolved, "I could not review it.").is_err());
+        let why = parse_review(&Outcome::Resolved, "I could not review it.").unwrap_err();
+        assert_eq!(why.to_string(), "the agent's review is not JSON");
+        let why = parse_review(&Outcome::Resolved, "{\"summary\": 1}").unwrap_err();
+        assert_eq!(why.to_string(), "the agent's review does not parse");
         let gave_up = Outcome::GaveUp("no access".into());
         let why = parse_review(&gave_up, text).unwrap_err().to_string();
         assert_eq!(why, "the agent gave up: no access");

@@ -131,7 +131,7 @@ The hosted MergeLoop is free on public repos. Private repos cost $15 a month per
 
 - **Public repos** have a fair-use limit across a workspace: 100 PRs joining a queue, and 50 jobs (rebases and fixes), an hour. Over it, waiting PRs go on hold, keep their place, and go on once the last hour is under the limit. A PR already running finishes.
 - **Private repos** need a subscription, started from the dashboard's Settings. Without one, their waiting PRs go on hold, with a comment that links there.
-- **A seat** is a developer whose PR joined a private repo's queue. They take it with their first such PR, and keep it until removed in Settings. A seat added mid-month is charged for the rest of it; a removed one drops off the next bill. A PR authored by an App, such as Dependabot, takes no seat.
+- **A seat** is a developer whose PR joined a private repo's queue. They take it with their first such PR, and keep it until removed in Settings. A seat added mid-month is charged for the rest of it; a removed one drops off the next bill. A PR authored by an App, such as Dependabot, takes no seat, except a PR the [build lane](#the-build-lane) opened: that one is the PR of the developer whose daemon holds its build, and takes their seat as a PR they opened would.
 
 A self-hosted MergeLoop has no limits, and bills no one.
 
@@ -571,6 +571,10 @@ The daemon's own git on a build names the worktree's git dir rather than followi
 - **Stuck.** The agent gave up, `verify` still failed after its fix, the reviewer still had findings after 3 rounds, the PR was ejected a second time or still needed its author after 10 runs of the agent, GitHub kept refusing the daemon's answer, a person closed the PR without merging it, or anything else went wrong. The daemon says why on the issue, and the **Builds** page shows it in full. To try again, take the label off the issue and put it back: a stuck build with an open PR goes back to landing it, and one whose PR was closed is built anew over the old branch.
 - **Given back.** Ctrl-C gives back the builds without a PR: they are tasks again at once. It keeps those with one, which the daemon lands again when started; another daemon takes one over once it goes 30 minutes unheard. A build is given back too when GitHub says you may no longer push.
 - **Dropped.** The issue was closed or lost its label before the build had a PR. A build with a PR is never dropped this way: closing its issue is what merging it does.
+
+### Whose PR a built PR is
+
+GitHub has the App's bot as the author of a built PR. Everywhere MergeLoop asks whose PR it is, it is the PR of the developer whose daemon holds its build at that moment: the seat it takes when it joins a private repo's queue, and the name it is kept under in the history, the people view and the queue's events. A developer has one seat whether their PRs are built or their own. When a stale build is taken over, the seat already taken when the PR joined stays; the next count made, such as its leaving the queue, is the new holder's. A seat is kept by GitHub login, as for every PR, and the daemon's login is the one from its sign-in: a developer who renames their GitHub account, even only its capitalization, runs `mergeloop login` again, or their built PRs take a seat under the old name beside the one their own PRs take.
 
 ### Dark merges
 

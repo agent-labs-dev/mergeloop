@@ -172,6 +172,14 @@ pub trait Store: ReadCache + ReviewStore {
         detail: &str,
         summary: &PrSummary,
     ) -> Result<Option<StepTimes>>;
+    /// Those of `prs` that the build lane opened, each with the developer who holds its build,
+    /// or held it last: a built PR is theirs, for seats and history.
+    async fn builders(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        prs: &[PrNumber],
+    ) -> Result<Vec<(PrNumber, String)>>;
     /// Whether the PR left the queue since it last joined: its exit is recorded. `false` for a
     /// PR that never joined.
     async fn has_left(&self, key: &LaneKey, pr: PrNumber) -> Result<bool>;
@@ -748,6 +756,28 @@ impl Store for PgStore {
         .execute(&self.pool)
         .await?;
         Ok(steps)
+    }
+
+    async fn builders(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        prs: &[PrNumber],
+    ) -> Result<Vec<(PrNumber, String)>> {
+        let prs: Vec<i64> = prs.iter().map(|n| *n as i64).collect();
+        let rows = sqlx::query(
+            "SELECT pr, holder FROM builds
+             WHERE installation_id = $1 AND repo = $2 AND pr = ANY($3) AND holder IS NOT NULL",
+        )
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(prs)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<i64, _>("pr") as PrNumber, r.get("holder")))
+            .collect())
     }
 
     async fn has_left(&self, key: &LaneKey, pr: PrNumber) -> Result<bool> {

@@ -298,25 +298,25 @@ impl Folder {
     }
 
     async fn reconcile_owner(&self, owner: &Path) -> Result<()> {
-        let gone = |n: &str| n.strip_suffix(GONE).is_some_and(|n| n.ends_with(".git"));
         for clone in listing(owner)? {
-            if !own_dir(&clone, |n| n.ends_with(".git") || gone(n))? {
-                continue;
-            }
-            if clone.file_name().and_then(|n| n.to_str()).is_some_and(gone) {
-                discard(&clone, "a renamed repo's clone a crash left half removed")?;
-                continue;
-            }
-            let reconciled = match self.reconcile_clone(&clone).await {
-                Ok(()) => retire(&clone).await,
-                e => e,
-            };
-            if let Err(e) = reconciled {
-                // Made again when a build next needs it.
-                discard(&clone, &format!("{e:#}"))?;
+            if own_dir(&clone, |n| shape(n).is_some())? {
+                self.reconcile_entry(&clone).await?;
             }
         }
         Ok(())
+    }
+
+    /// Reconciles `path`, an entry of `repos/<owner>/` of a shape the daemon makes.
+    async fn reconcile_entry(&self, path: &Path) -> Result<()> {
+        let name = path.file_name().and_then(|n| n.to_str());
+        if name.and_then(shape) == Some(Shape::Gone) {
+            return discard(path, HALF_REMOVED);
+        }
+        match self.reconcile_clone(path).await {
+            Ok(()) => retire(path).await,
+            // Made again when a build next needs it.
+            Err(e) => discard(path, &format!("{e:#}")),
+        }
     }
 
     /// Makes `clone` a clone of `url`: made, or made whole when a crash left it before it had its
@@ -390,26 +390,48 @@ pub struct Checkout {
 /// its `GONE` name, which start-up removes when a crash stopped this halfway. Run it under the
 /// clone's lock.
 async fn retire(clone: &Path) -> Result<()> {
-    if kind(&clone.join(RENAMED))? != Some(Kind::File) {
-        return Ok(());
-    }
-    Git.run(clone, &["worktree", "prune"]).await?;
-    let trees = Git.run(clone, &["worktree", "list", "--porcelain"]).await?;
-    // The first is the bare clone itself.
-    if trees.lines().filter(|l| l.starts_with("worktree ")).count() > 1 {
+    if kind(&clone.join(RENAMED))? != Some(Kind::File) || in_use(clone).await? {
         return Ok(());
     }
     let mut gone = clone.as_os_str().to_owned();
     gone.push(GONE);
     let gone = PathBuf::from(gone);
     if kind(&gone)? == Some(Kind::Dir) {
-        discard(&gone, "a renamed repo's clone a crash left half removed")?;
+        discard(&gone, HALF_REMOVED)?;
     }
     std::fs::rename(clone, &gone).with_context(|| format!("move {}", clone.display()))?;
     discard(
         &gone,
         "the clone of a repo since renamed, which no build uses",
     )
+}
+
+/// Whether a build's worktree is in `clone`, once those whose folder is gone are pruned.
+async fn in_use(clone: &Path) -> Result<bool> {
+    Git.run(clone, &["worktree", "prune"]).await?;
+    let trees = Git.run(clone, &["worktree", "list", "--porcelain"]).await?;
+    // The first is the bare clone itself.
+    Ok(trees.lines().filter(|l| l.starts_with("worktree ")).count() > 1)
+}
+
+const HALF_REMOVED: &str = "a renamed repo's clone a crash left half removed";
+
+/// What the daemon keeps in `repos/<owner>/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// `<name>.git`
+    Clone,
+    /// `<name>.git.gone`
+    Gone,
+}
+
+/// The shape of the entry called `name` in `repos/<owner>/`, if it is one the daemon makes.
+fn shape(name: &str) -> Option<Shape> {
+    match name.strip_suffix(GONE) {
+        Some(clone) if clone.ends_with(".git") => Some(Shape::Gone),
+        _ if name.ends_with(".git") => Some(Shape::Clone),
+        _ => None,
+    }
 }
 
 /// Refuses `root` unless it is the daemon's: it holds the daemon's name, or nothing but what

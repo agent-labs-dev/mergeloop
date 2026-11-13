@@ -3,7 +3,9 @@
 //! GitHub, and the server sends a one-time code back to a listener on this machine, which trades
 //! it, with the PKCE verifier only this process knows, for a MergeLoop session.
 //!
-//! The server keeps nothing about a client, so the command does not register one.
+//! The server asks the user first, on a consent page that shows the client's name and a short
+//! code. The command registers under its name, and prints the code it sends, so the user can
+//! tell this sign-in from one another program started.
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,6 +29,11 @@ const SIGN_IN_WAIT: Duration = Duration::from_secs(600);
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// The most of a request the listener reads: a callback's line and headers.
 const REQUEST_MAX: usize = 16 * 1024;
+/// The name the consent page shows.
+const CLIENT_NAME: &str = "mergeloop login";
+/// What a code is made of: no `0`/`O` or `1`/`I` to mix up, and 32 of them, so a random byte
+/// picks one evenly.
+const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// Signs in to `server` in the browser, which `browser` opens at the sign-in link, and keeps
 /// the session in `sessions`. Returns the GitHub login signed in.
@@ -40,10 +47,15 @@ pub async fn login(
         .context("listen on 127.0.0.1 for the sign-in")?;
     let port = listener.local_addr()?.port();
     let redirect = format!("http://127.0.0.1:{port}/callback");
+    let client_id = register(server, &redirect).await?;
     let state = random_token(16);
     let verifier = random_token(32);
-    let link = sign_in_link(server, &redirect, &state, &verifier)?;
+    let code = user_code();
+    let link = sign_in_link(server, &client_id, &redirect, &state, &verifier, &code)?;
     eprintln!("mergeloop: sign in at {link}");
+    eprintln!(
+        "mergeloop: your browser will show the code {code}: allow the sign-in only if it does"
+    );
     if let Err(e) = browser(link.as_str()) {
         eprintln!("mergeloop: could not open a browser ({e:#}): open the link yourself");
     }
@@ -56,13 +68,51 @@ pub async fn login(
     Ok(login)
 }
 
-/// The server's sign-in page for this listener, with the `state` and PKCE challenge.
-fn sign_in_link(server: &Server, redirect: &str, state: &str, verifier: &str) -> Result<Url> {
+/// Registers the command as a client of `server`, for this listener: its `client_id`, which
+/// carries the name the consent page shows.
+async fn register(server: &Server, redirect: &str) -> Result<String> {
+    let res = client::http()?
+        .post(format!("{}/oauth/register", server.url()))
+        .json(&json!({ "client_name": CLIENT_NAME, "redirect_uris": [redirect] }))
+        .send()
+        .await
+        .with_context(|| format!("reach {}", server.url()))?;
+    let status = res.status();
+    let body: Value = res.json().await.unwrap_or_default();
+    match body["client_id"].as_str() {
+        Some(id) if status.is_success() => Ok(id.to_owned()),
+        _ => bail!("{} did not register the sign-in ({status})", server.url()),
+    }
+}
+
+/// A short code for the user to compare with the consent page's: `XXXX-XXXX`.
+fn user_code() -> String {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("the OS has no random source");
+    let mut code: String = buf
+        .iter()
+        .map(|b| CODE_ALPHABET[usize::from(b % 32)] as char)
+        .collect();
+    code.insert(4, '-');
+    code
+}
+
+/// The server's sign-in page for this listener, with the `state`, PKCE challenge and code.
+fn sign_in_link(
+    server: &Server,
+    client_id: &str,
+    redirect: &str,
+    state: &str,
+    verifier: &str,
+    code: &str,
+) -> Result<Url> {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     Url::parse_with_params(
         &format!("{}/oauth/authorize", server.url()),
         [
             ("response_type", "code"),
+            ("client_id", client_id),
+            ("user_code", code),
             ("redirect_uri", redirect),
             ("state", state),
             ("code_challenge", &challenge),

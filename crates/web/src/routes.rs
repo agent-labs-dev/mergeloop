@@ -165,6 +165,8 @@ pub(crate) static ROUTES: &[Route] = &[
     route!(POST "/oauth/register", oauth::register, Agent::Exempt(OAUTH)),
     route!(GET "/oauth/authorize", oauth::authorize, Agent::Exempt(OAUTH)),
     route!(POST "/oauth/token", oauth::token, Agent::Exempt(OAUTH)),
+    route!(GET "/oauth/consent", oauth::consent, Agent::Exempt(OAUTH)),
+    route!(POST "/oauth/consent", oauth::answer, Agent::Exempt(OAUTH)),
     route!(GET "/api/v1/repos/{owner}/{name}/pulls/{number}", v1::pull,
         Agent::Exempt("For other apps, by repo and with an ETag. An agent calls `pull_status`, which says the same where MergeLoop is installed.")),
     route!(GET "/api/v1/repos/{owner}/{name}/pulls", v1::pulls,

@@ -9,14 +9,46 @@ use mergeloop_cli::client::{Client, Server};
 use mergeloop_cli::login;
 use serde_json::json;
 
-/// The browser: follows the sign-in link, and its redirect to the command's listener.
+/// The browser: follows the sign-in link to the consent page, checks it shows the code the link
+/// carries, and answers `decision`, which sends it on to the command's listener.
+fn answering(decision: &'static str) -> impl FnOnce(&str) -> anyhow::Result<()> {
+    move |url: &str| {
+        let url = reqwest::Url::parse(url).unwrap();
+        tokio::spawn(async move {
+            let code = url
+                .query_pairs()
+                .find(|(k, _)| k == "user_code")
+                .map(|(_, v)| v.into_owned())
+                .expect("the link carries a code");
+            let page = reqwest::get(url.clone())
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(page.contains(&code), "{page}");
+            assert!(page.contains("mergeloop login"), "{page}");
+            let request = page
+                .split(r#"name="request" value=""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("the page carries its request");
+            let answer = url.join("/oauth/consent").unwrap();
+            let res = reqwest::Client::new()
+                .post(answer)
+                .form(&[("request", request), ("decision", decision)])
+                .send()
+                .await
+                .expect("the answer reaches the listener");
+            assert!(res.status().is_success(), "{}", res.status());
+        });
+        Ok(())
+    }
+}
+
+/// The user allows the sign-in.
 fn browser(url: &str) -> anyhow::Result<()> {
-    let url = url.to_owned();
-    tokio::spawn(async move {
-        let res = reqwest::get(&url).await.expect("the sign-in link answers");
-        assert!(res.status().is_success(), "{}", res.status());
-    });
-    Ok(())
+    answering("allow")(url)
 }
 
 fn sessions(home: &Path) -> PathBuf {
@@ -37,6 +69,46 @@ async fn login_keeps_a_session_that_later_calls_send() {
     let client = Client::signed_in(&server, &sessions(home.path())).unwrap();
     let answer = client.json("list_repos", json!({})).await.unwrap();
     assert_eq!(answer, json!({ "tool": "list_repos", "as": "session" }));
+    assert_eq!(fake.bearers().last().unwrap(), "session-1");
+}
+
+#[tokio::test]
+async fn login_asks_with_a_short_code_and_gives_nothing_when_denied() {
+    let fake = fake::Server::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let path = sessions(home.path());
+    let server = Server::parse(&fake.url).unwrap();
+    let mut link = String::new();
+    login::login(&server, &path, |url: &str| {
+        link = url.to_owned();
+        browser(url)
+    })
+    .await
+    .unwrap();
+    let code = reqwest::Url::parse(&link)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "user_code")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    assert!(
+        code.len() == 9 && code.as_bytes()[4] == b'-',
+        "a short code to read aloud: {code}"
+    );
+
+    let err = login::login(&server, &path, answering("deny"))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("denied"), "{err:#}");
+    // The session from the first sign-in is still the one kept.
+    assert_eq!(
+        Client::signed_in(&server, &path)
+            .unwrap()
+            .json("list_repos", json!({}))
+            .await
+            .unwrap(),
+        json!({ "tool": "list_repos", "as": "session" })
+    );
     assert_eq!(fake.bearers().last().unwrap(), "session-1");
 }
 

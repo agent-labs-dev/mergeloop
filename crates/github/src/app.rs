@@ -564,6 +564,23 @@ impl GitHub {
         App::from_credentials(credentials)
     }
 
+    /// Trades the code GitHub's sign-in sent back for the user's token.
+    pub async fn exchange_code(
+        &self,
+        credentials: &crate::AppCredentials,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+    ) -> Result<crate::setup::UserToken> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(web) = &self.fake {
+            return crate::setup::exchange_code(web, credentials, code, redirect_uri, verifier)
+                .await;
+        }
+        crate::setup::exchange_code(crate::setup::WEB, credentials, code, redirect_uri, verifier)
+            .await
+    }
+
     /// The user whose token this is.
     pub fn as_user(&self, token: &str) -> Result<AsUser> {
         let user = AsUser::new(token.to_owned())?;

@@ -14,10 +14,10 @@ use mergepatrol_executor::LocalExecutor;
 use mergepatrol_executor::proxy::Upstreams;
 use mergepatrol_github::{BranchMerge, BranchRules, Checks, HeadRepository, RepoOwner, StackRef};
 use mergepatrol_store::{
-    AgentTask, BillingStore, Change, DeveloperStats, EventRecord, ExitQuery, ExitRecord, ExitStats,
-    FairUse, LoginCode, PrWrite, ReadCache, RepoReads, RepoState, ReviewAnswers, ReviewDone,
-    ReviewRecord, ReviewStore, SecretRecord, Session, Slice, StepStats, Subscription, Unsynced,
-    ValueRead, Workspace,
+    AgentTask, BillingStore, Change, Consent, DeveloperStats, EventRecord, ExitQuery, ExitRecord,
+    ExitStats, FairUse, LoginCode, PrWrite, ReadCache, RepoReads, RepoState, ReviewAnswers,
+    ReviewDone, ReviewRecord, ReviewStore, SecretRecord, Session, Slice, StepStats, Subscription,
+    Unsynced, ValueRead, Workspace,
 };
 
 use super::*;
@@ -1570,6 +1570,15 @@ impl Store for Mem {
         unreachable!()
     }
     async fn take_login_code(&self, _: &str, _: i64) -> Result<Option<LoginCode>> {
+        unreachable!()
+    }
+    async fn create_consent(&self, _: &str, _: &Consent) -> Result<()> {
+        unreachable!()
+    }
+    async fn consent(&self, _: &str, _: &str, _: i64) -> Result<Option<Consent>> {
+        unreachable!()
+    }
+    async fn take_consent(&self, _: &str, _: &str, _: i64) -> Result<Option<Consent>> {
         unreachable!()
     }
 }

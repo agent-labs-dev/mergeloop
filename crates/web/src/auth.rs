@@ -829,6 +829,12 @@ pub(crate) struct McpClient {
     pub redirect_uri: String,
     pub state: Option<String>,
     pub challenge: String,
+    /// The name it registered with, for the consent page.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The code its terminal shows, for the consent page.
+    #[serde(default)]
+    pub user_code: Option<String>,
 }
 
 /// Signs in with GitHub for the MCP client, which gets a one-time code for the session.
@@ -916,14 +922,13 @@ pub(crate) async fn login_callback(
             .app_credentials()
             .await?
             .ok_or_else(|| anyhow::anyhow!("no GitHub App yet"))?;
-        let user_token =
-            setup::exchange_code(&creds, &code, &callback_url(&state), verifier).await?;
-        let user = state
+        let user_token = state
             .github
-            .as_user(&user_token.access_token)?
-            .user()
+            .exchange_code(&creds, &code, &callback_url(&state), verifier)
             .await?;
-        let installations = setup::user_installations(&user_token.access_token).await?;
+        let as_user = state.github.as_user(&user_token.access_token)?;
+        let user = as_user.user().await?;
+        let installations = as_user.installations().await?;
         save_workspaces(&state, &installations).await?;
         destination = install_destination(&headers, &installations);
         tracing::info!(login = %user.login, workspaces = installations.len(), "signed in");
@@ -942,7 +947,7 @@ pub(crate) async fn login_callback(
         let token = create_session(
             &state,
             SessionKind::User {
-                login: user.login,
+                login: user.login.clone(),
                 avatar_url: user.avatar_url,
                 installations: installations.iter().map(|i| i.id).collect(),
             },
@@ -950,28 +955,41 @@ pub(crate) async fn login_callback(
             USER_SESSION,
         )
         .await?;
-        match &mcp {
-            Some(client) => login_code(&state, &token, &client.challenge).await,
-            None => Ok(token),
-        }
+        Ok((token, user.login))
     }
     .await;
     let clear_oauth = cookie(&state, OAUTH_COOKIE, "", Duration::ZERO);
     if let Some(client) = mcp {
-        return (
-            AppendHeaders([
-                (header::SET_COOKIE, clear_oauth),
-                (
-                    header::SET_COOKIE,
-                    cookie(&state, MCP_COOKIE, "", Duration::ZERO),
-                ),
-            ]),
-            Redirect::to(&mcp_redirect(&client, result)),
-        )
-            .into_response();
+        let clear_mcp = cookie(&state, MCP_COOKIE, "", Duration::ZERO);
+        // The client gets nothing until the user says yes on the consent page.
+        let asked = match result {
+            Ok((token, login)) => {
+                crate::oauth::ask(&state, &headers, &client, &token, &login).await
+            }
+            Err(e) => Err(e),
+        };
+        return match asked {
+            Ok((consent, page)) => (
+                AppendHeaders([
+                    (header::SET_COOKIE, clear_oauth),
+                    (header::SET_COOKIE, clear_mcp),
+                    (header::SET_COOKIE, consent),
+                ]),
+                Redirect::to(&page),
+            )
+                .into_response(),
+            Err(e) => (
+                AppendHeaders([
+                    (header::SET_COOKIE, clear_oauth),
+                    (header::SET_COOKIE, clear_mcp),
+                ]),
+                Redirect::to(&mcp_redirect(&client, Err(e))),
+            )
+                .into_response(),
+        };
     }
     match result {
-        Ok(token) => (
+        Ok((token, _)) => (
             AppendHeaders([
                 (
                     header::SET_COOKIE,
@@ -1001,7 +1019,7 @@ fn install_destination(headers: &HeaderMap, installations: &[UserInstallation]) 
 }
 
 /// Back to the MCP client, with the one-time code or OAuth's error, and its `state`.
-fn mcp_redirect(client: &McpClient, result: anyhow::Result<String>) -> String {
+pub(crate) fn mcp_redirect(client: &McpClient, result: anyhow::Result<String>) -> String {
     let mut query = match result {
         Ok(code) => format!("code={code}"),
         Err(e) => {
@@ -1024,7 +1042,11 @@ fn mcp_redirect(client: &McpClient, result: anyhow::Result<String>) -> String {
 }
 
 /// Seals the new session's token under a one-time code for an MCP client.
-async fn login_code(state: &AppState, token: &str, challenge: &str) -> anyhow::Result<String> {
+pub(crate) async fn login_code(
+    state: &AppState,
+    token: &str,
+    challenge: &str,
+) -> anyhow::Result<String> {
     let code = random_token(32);
     let code_hash = hash(&code);
     let login = LoginCode {
@@ -1179,7 +1201,11 @@ async fn recheck(
         checked.github = Some(state.vault.seal(&name, &serde_json::to_string(&token)?)?);
         state.store.update_session(token_hash, &checked).await?;
     }
-    let installations = setup::user_installations(&token.access_token).await?;
+    let installations = state
+        .github
+        .as_user(&token.access_token)?
+        .installations()
+        .await?;
     save_workspaces(state, &installations).await?;
     checked.kind = SessionKind::User {
         login: login.clone(),
@@ -1223,7 +1249,7 @@ fn code_secret(code_hash: &str) -> String {
     format!("login-code/{code_hash}")
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -1267,7 +1293,7 @@ async fn create_session(
     Ok(token)
 }
 
-fn cookie(state: &AppState, name: &str, value: &str, max_age: Duration) -> String {
+pub(crate) fn cookie(state: &AppState, name: &str, value: &str, max_age: Duration) -> String {
     let secure = if state.secure_cookies() {
         "; Secure"
     } else {
@@ -1279,7 +1305,7 @@ fn cookie(state: &AppState, name: &str, value: &str, max_age: Duration) -> Strin
     )
 }
 
-fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()

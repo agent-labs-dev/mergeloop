@@ -6,6 +6,8 @@
 //!   daemon/id                 the daemon's name for itself, made once: its claims are its own
 //!   daemon/groups/            the process groups of running builds (`groups`)
 //!   repos/<owner>/<name>.git  a bare clone of each repo it builds in, with its worktrees' git dirs
+//!     mergeloop-renamed       there when the repo was since renamed: the clone goes once unused
+//!   repos/<owner>/<name>.git.gone  such a clone, being removed
 //!   builds/<build>/           the build's room: all that the build may write
 //!     tree/                   its git worktree, on the local branch `mergeloop/build-<issue>`
 //!     tmp/                    its TMPDIR
@@ -45,6 +47,10 @@ use super::verify;
 pub const TRANSCRIPTS_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The local branches of builds, in every clone.
 const BRANCHES: &str = "refs/heads/mergeloop/build-";
+/// In a clone whose repo was renamed: it holds the new name.
+const RENAMED: &str = "mergeloop-renamed";
+/// What a clone is renamed to while it is removed, so a crash halfway leaves it known.
+const GONE: &str = ".gone";
 
 /// The workspace folder, and a lock per clone: git commands on one clone run one at a time.
 #[derive(Clone)]
@@ -207,7 +213,31 @@ impl Folder {
         let _held = lock.lock().await;
         remove_dir(&self.reviews(task.build)).await?;
         self.remove_locked(&clone, &self.room(task.build).root, &task.branch)
-            .await
+            .await?;
+        retire(&clone).await
+    }
+
+    /// Notes that the repo `old` is now `new`: its clone under the old name goes now if no
+    /// build's worktree is in it, else when the last one goes.
+    pub async fn renamed(&self, old: &str, new: &str) -> Result<()> {
+        let clone = self.clone_of(old);
+        let lock = self.clone_lock(&clone);
+        let _held = lock.lock().await;
+        match kind(&clone)? {
+            Some(Kind::Dir) => {}
+            Some(Kind::Link) => return Err(not_followed(&clone)),
+            _ => return Ok(()),
+        }
+        let mark = clone.join(RENAMED);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&mark)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{new}\n").as_bytes()))
+            .with_context(|| format!("write {}", mark.display()))?;
+        retire(&clone).await
     }
 
     async fn remove_locked(&self, clone: &Path, room: &Path, branch: &str) -> Result<()> {
@@ -269,15 +299,24 @@ impl Folder {
 
     async fn reconcile_owner(&self, owner: &Path) -> Result<()> {
         for clone in listing(owner)? {
-            if !own_dir(&clone, |n| n.ends_with(".git"))? {
-                continue;
-            }
-            if let Err(e) = self.reconcile_clone(&clone).await {
-                // Made again when a build next needs it.
-                discard(&clone, &format!("{e:#}"))?;
+            if own_dir(&clone, |n| shape(n).is_some())? {
+                self.reconcile_entry(&clone).await?;
             }
         }
         Ok(())
+    }
+
+    /// Reconciles `path`, an entry of `repos/<owner>/` of a shape the daemon makes.
+    async fn reconcile_entry(&self, path: &Path) -> Result<()> {
+        let name = path.file_name().and_then(|n| n.to_str());
+        if name.and_then(shape) == Some(Shape::Gone) {
+            return discard(path, HALF_REMOVED);
+        }
+        match self.reconcile_clone(path).await {
+            Ok(()) => retire(path).await,
+            // Made again when a build next needs it.
+            Err(e) => discard(path, &format!("{e:#}")),
+        }
     }
 
     /// Makes `clone` a clone of `url`: made, or made whole when a crash left it before it had its
@@ -345,6 +384,59 @@ pub struct Checkout {
     pub tree: Tree,
     /// Where the task's branch was on GitHub at checkout: the push replaces only that.
     pub remote: Option<String>,
+}
+
+/// Removes `clone` when its repo was renamed and no build's worktree is in it: first renamed to
+/// its `GONE` name, which start-up removes when a crash stopped this halfway. Run it under the
+/// clone's lock.
+async fn retire(clone: &Path) -> Result<()> {
+    if kind(&clone.join(RENAMED))? != Some(Kind::File) || in_use(clone).await? {
+        return Ok(());
+    }
+    let mut gone = clone.as_os_str().to_owned();
+    gone.push(GONE);
+    let gone = PathBuf::from(gone);
+    if kind(&gone)? == Some(Kind::Dir) {
+        discard(&gone, HALF_REMOVED)?;
+    }
+    std::fs::rename(clone, &gone).with_context(|| {
+        format!(
+            "move {}: give the folder it is in back its permissions (chmod u+rwx), or give the daemon another workspace",
+            clone.display()
+        )
+    })?;
+    discard(
+        &gone,
+        "the clone of a repo since renamed, which no build uses",
+    )
+}
+
+/// Whether a build's worktree is in `clone`, once those whose folder is gone are pruned.
+async fn in_use(clone: &Path) -> Result<bool> {
+    Git.run(clone, &["worktree", "prune"]).await?;
+    let trees = Git.run(clone, &["worktree", "list", "--porcelain"]).await?;
+    // The first is the bare clone itself.
+    Ok(trees.lines().filter(|l| l.starts_with("worktree ")).count() > 1)
+}
+
+const HALF_REMOVED: &str = "a renamed repo's clone a crash left half removed";
+
+/// What the daemon keeps in `repos/<owner>/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// `<name>.git`
+    Clone,
+    /// `<name>.git.gone`
+    Gone,
+}
+
+/// The shape of the entry called `name` in `repos/<owner>/`, if it is one the daemon makes.
+fn shape(name: &str) -> Option<Shape> {
+    match name.strip_suffix(GONE) {
+        Some(clone) if clone.ends_with(".git") => Some(Shape::Gone),
+        _ if name.ends_with(".git") => Some(Shape::Clone),
+        _ => None,
+    }
 }
 
 /// Refuses `root` unless it is the daemon's: it holds the daemon's name, or nothing but what
@@ -487,7 +579,12 @@ fn own_dir(path: &Path, shape: impl Fn(&str) -> bool) -> Result<bool> {
 /// Removes `path`, a folder of the daemon's own just seen there, saying why.
 fn discard(path: &Path, why: &str) -> Result<()> {
     eprintln!("mergeloop: removes {}: {why}", path.display());
-    std::fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
+    std::fs::remove_dir_all(path).with_context(|| {
+        format!(
+            "remove {}: give it back its permissions (chmod -R u+rwx), or remove it yourself, or give the daemon another workspace",
+            path.display()
+        )
+    })
 }
 
 /// The entries of `dir`, a folder of the daemon's own: none when it is not there. A symlink,

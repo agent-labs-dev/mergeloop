@@ -287,9 +287,14 @@ pub trait BuildStore: Send + Sync {
     /// The holder gives the build back, or marks it stuck with a reason, and holds it no more.
     /// `None` when it held the claim no more. Giving back a build without a PR makes it ready,
     /// and takes away the assignee the claim added; giving back one with a PR leaves it as it
-    /// is, for anyone to take at once.
-    async fn release_build(&self, holder: Holder<'_>, stuck: Option<&str>)
-    -> Result<Option<Build>>;
+    /// is, for anyone to take at once. When its PR is `closed_pr`, closed without merging, the
+    /// build forgets it: put back, the issue is a fresh task.
+    async fn release_build(
+        &self,
+        holder: Holder<'_>,
+        stuck: Option<&str>,
+        closed_pr: Option<u64>,
+    ) -> Result<Option<Build>>;
     /// The build, while `holder` holds it.
     async fn held_build(&self, holder: Holder<'_>) -> Result<Option<Build>>;
     /// Whether `holder` holds a live build, in a workspace whose lane is on, all read at once.
@@ -766,6 +771,7 @@ impl BuildStore for PgStore {
         &self,
         holder: Holder<'_>,
         stuck: Option<&str>,
+        closed_pr: Option<u64>,
     ) -> Result<Option<Build>> {
         // The right-hand sides read the row as it was before the update.
         let row = fenced(
@@ -777,6 +783,7 @@ impl BuildStore for PgStore {
                    claim = claim + 1,
                    assignees = CASE WHEN $6::TEXT IS NULL AND pr IS NULL AND mirrored
                      THEN array_remove(assignees, holder) ELSE assignees END,
+                   pr = CASE WHEN pr = $7 THEN NULL ELSE pr END,
                    stage = NULL, heartbeat_at = NULL, updated_at = now()
                  WHERE",
                 fence!(),
@@ -786,6 +793,7 @@ impl BuildStore for PgStore {
             holder,
         )
         .bind(stuck)
+        .bind(closed_pr.map(|pr| pr as i64))
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(build).transpose()
@@ -1075,7 +1083,7 @@ mod tests {
             ..held(&first, "ana")
         };
         assert_eq!(store.heartbeat_build(other, None).await.unwrap(), None);
-        assert_eq!(store.release_build(other, None).await.unwrap(), None);
+        assert_eq!(store.release_build(other, None, None).await.unwrap(), None);
         let no_daemon = Holder {
             daemon: None,
             ..held(&first, "ana")
@@ -1135,7 +1143,7 @@ mod tests {
             .unwrap();
         assert_eq!(late, None, "Ana's heartbeat is refused");
         let late = store
-            .release_build(held(&ana, "ana"), Some("x"))
+            .release_build(held(&ana, "ana"), Some("x"), None)
             .await
             .unwrap();
         assert_eq!(late, None, "and her release");
@@ -1164,7 +1172,7 @@ mod tests {
             installation_id: 2,
             ..held(&ana, "ana")
         };
-        assert_eq!(store.release_build(other, None).await.unwrap(), None);
+        assert_eq!(store.release_build(other, None, None).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = false)]
@@ -1180,7 +1188,10 @@ mod tests {
             .upsert_task(1, &repo("o/r"), &issue(1, &["ana"]))
             .await
             .unwrap();
-        let back = store.release_build(held(&ana, "ana"), None).await.unwrap();
+        let back = store
+            .release_build(held(&ana, "ana"), None, None)
+            .await
+            .unwrap();
         let back = back.unwrap();
         assert_eq!((back.status, back.assignees.len()), (BuildStatus::Ready, 0));
         assert_eq!(claim(&store, "ben").await.map(|b| b.issue), Some(1));
@@ -1193,7 +1204,7 @@ mod tests {
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
         let ana = claim(&store, "ana").await.unwrap();
         let stuck = store
-            .release_build(held(&ana, "ana"), Some("tests never pass"))
+            .release_build(held(&ana, "ana"), Some("tests never pass"), None)
             .await
             .unwrap()
             .unwrap();
@@ -1319,7 +1330,7 @@ mod tests {
         };
         assert_eq!(store.held_build(old).await.unwrap(), None);
         store
-            .release_build(held(&ana, "ana"), Some("no"))
+            .release_build(held(&ana, "ana"), Some("no"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1408,7 +1419,7 @@ mod tests {
         let store = store(pool).await;
         let pr = landing(&store).await;
         let back = store
-            .release_build(held(&pr, "ana"), None)
+            .release_build(held(&pr, "ana"), None, None)
             .await
             .unwrap()
             .unwrap();
@@ -1417,7 +1428,7 @@ mod tests {
         assert_eq!((ben.status, ben.pr), (BuildStatus::Landing, Some(40)));
 
         let stuck = store
-            .release_build(held(&ben, "ben"), Some("ejected twice"))
+            .release_build(held(&ben, "ben"), Some("ejected twice"), None)
             .await
             .unwrap()
             .unwrap();
@@ -1464,7 +1475,10 @@ mod tests {
         );
         assert!(!store.holds(held(&ana, "ana")).await.unwrap());
 
-        let back = store.release_build(held(&ana, "ana"), None).await.unwrap();
+        let back = store
+            .release_build(held(&ana, "ana"), None, None)
+            .await
+            .unwrap();
         assert_eq!(back.map(|b| b.status), Some(BuildStatus::Ready));
         assert_eq!(
             claim(&store, "ben").await,
@@ -1548,7 +1562,7 @@ mod tests {
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
         let ana = claim(&store, "ana").await.unwrap();
         let stuck = store
-            .release_build(held(&ana, "ana"), Some("no"))
+            .release_build(held(&ana, "ana"), Some("no"), None)
             .await
             .unwrap()
             .unwrap();
@@ -1580,7 +1594,7 @@ mod tests {
         assert!(!store.holds(ben).await.unwrap());
 
         let back = store
-            .release_build(held(&pr, "ana"), None)
+            .release_build(held(&pr, "ana"), None, None)
             .await
             .unwrap()
             .unwrap();
@@ -1608,7 +1622,7 @@ mod tests {
         let claimed = claim(&store, "ana").await.unwrap();
         let stuck = claim(&store, "ana").await.unwrap();
         store
-            .release_build(held(&stuck, "ana"), Some("no"))
+            .release_build(held(&stuck, "ana"), Some("no"), None)
             .await
             .unwrap();
         store
@@ -1704,7 +1718,10 @@ mod tests {
         let r = repo("o/r");
         let pr = landing(&store).await;
         store.drop_task(1, &r, 1).await.unwrap();
-        store.release_build(held(&pr, "ana"), None).await.unwrap();
+        store
+            .release_build(held(&pr, "ana"), None, None)
+            .await
+            .unwrap();
         assert_eq!(store.claimable_repos(1, STALE).await.unwrap(), [r]);
         let ben = claim(&store, "ben").await.unwrap();
         assert_eq!((ben.status, ben.pr), (BuildStatus::Landing, Some(40)));
@@ -1721,7 +1738,7 @@ mod tests {
         store.upsert_task(1, &r, &issue(1, &[])).await.unwrap();
         let ana = claim(&store, "ana").await.unwrap();
         let stuck = store
-            .release_build(held(&ana, "ana"), Some("no"))
+            .release_build(held(&ana, "ana"), Some("no"), None)
             .await
             .unwrap()
             .unwrap();
@@ -1742,7 +1759,7 @@ mod tests {
             store.upsert_task(1, &r, &issue(n, &[])).await.unwrap();
             let b = claim(&store, "ana").await.unwrap();
             store
-                .release_build(held(&b, "ana"), Some("no"))
+                .release_build(held(&b, "ana"), Some("no"), None)
                 .await
                 .unwrap();
         }

@@ -305,7 +305,7 @@ pub(crate) async fn claim_build(
         Err(e) => {
             // Without what it needs, the daemon cannot build it: it is a task again.
             let holder = holder(id, build.id, login, daemon, build.claim);
-            app.builds.release_build(holder, None).await?;
+            app.builds.release_build(holder, None, None).await?;
             Err(e)
         }
     }
@@ -652,15 +652,42 @@ pub(crate) async fn release_build(
         return Err(ApiError::bad_request("Say why it is stuck."));
     }
     let held = holder(id, build, user.login(), body.daemon.as_deref(), body.claim);
+    let gh = installation(&app, id).await?;
+    let closed_pr = match stuck {
+        Some(_) => closed_pr(&app, &gh, held).await?,
+        None => None,
+    };
     let released = app
         .builds
-        .release_build(held, stuck)
+        .release_build(held, stuck, closed_pr)
         .await?
         .ok_or_else(|| lost(build))?;
-    tracing::info!(installation = id, repo = %released.repo, issue = released.issue, login = user.login(), stuck, "released a build");
-    let gh = installation(&app, id).await?;
+    tracing::info!(installation = id, repo = %released.repo, issue = released.issue, login = user.login(), stuck, closed_pr, "released a build");
     released_on_github(&gh, &released, user.login(), stuck).await;
     Ok(Json(released.into()))
+}
+
+/// The held build's PR, when GitHub says a person closed it without merging: a stuck build
+/// forgets it, so putting the label back builds the issue anew. `None` when GitHub cannot say:
+/// the build keeps its PR, as for one still open.
+async fn closed_pr(
+    app: &AppState,
+    gh: &Installation,
+    held: Holder<'_>,
+) -> Result<Option<u64>, ApiError> {
+    let Some(build) = app.builds.held_build(held).await? else {
+        return Ok(None);
+    };
+    let Some(pr) = build.pr else {
+        return Ok(None);
+    };
+    match gh.lane_pull(&build.repo, pr).await {
+        Ok(read) => Ok((!read.open && !read.merged).then_some(pr)),
+        Err(e) => {
+            tracing::warn!(installation = held.installation_id, build = build.id, pr, error = %e, "could not read a stuck build's PR");
+            Ok(None)
+        }
+    }
 }
 
 /// Says on the issue why a build is stuck, or takes away the assignee its claim added.

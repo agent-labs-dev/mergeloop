@@ -1626,6 +1626,57 @@ async fn a_pr_taken_out_and_closed_without_merging_ends_its_build_as_stuck() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_issue_whose_pr_was_closed_is_built_anew_over_the_old_branch_once_labeled_again() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    let seed = w.root().join("seed");
+    git(
+        &seed,
+        &["commit", "-q", "--allow-empty", "-m", "the closed PR's"],
+    );
+    git(
+        &seed,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "../remote.git",
+            "HEAD:refs/heads/mergeloop/build-12",
+        ],
+    );
+    git(&seed, &["reset", "-q", "--hard", "HEAD~1"]);
+    w.fake.script(
+        105,
+        vec![fake::need("removed", "r1", "#105 was taken out.")],
+    );
+    w.fake.refuse("report_build", "closed", 409, CLOSED);
+    let agent = w.lander();
+    // Once stuck, the label goes back on: the server gives the issue as a fresh task, no PR.
+    let relabeled = std::sync::atomic::AtomicBool::new(false);
+
+    w.run(w.config(1, &agent), |w| {
+        if w.fake.lane(|l| !l.released.is_empty())
+            && !relabeled.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut task = w.task(5, 12, &[]);
+            task["claim"] = 2.into();
+            w.fake.add_task(task);
+        }
+        w.fake.lane(|l| l.opened.len() == 1)
+    })
+    .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    assert!(released[0].1.as_deref().unwrap().contains("closed PR #105"));
+    let pushed = w.pushed("mergeloop/build-12").unwrap();
+    assert_eq!(pushed[0], "Add the feature", "the old branch is replaced");
+    assert_eq!(
+        git(&w.remote(), &["rev-parse", "mergeloop/build-12~1"]),
+        git(&w.remote(), &["rev-parse", "main"]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pr_merged_outside_the_queue_ends_its_build_as_merged() {
     let w = World::new().await;
     w.held(5, 12, 105);

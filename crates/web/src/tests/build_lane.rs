@@ -1344,6 +1344,28 @@ async fn a_stuck_build_with_a_pr_comes_back_with_its_pr(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_build_stuck_because_its_pr_was_closed_comes_back_as_a_fresh_task(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    assert_eq!(open_pr(&router, "ana", &ana).await.0, StatusCode::OK);
+    hub.lock().unwrap().prs[0].open = false;
+    let (status, _) = report(&router, "ana", &ana, "landing").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, released) = release(&router, "ana", &ana, Some("closed by a person")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (released["status"].as_str(), released["pr"].as_u64()),
+        (Some("stuck"), None)
+    );
+
+    deliver(&router, "labeled", issue(7, &[])).await;
+    let ben = claim(&router, "ben").await;
+    assert_eq!((ben["issue"].as_u64(), ben["pr"].as_u64()), (Some(7), None));
+}
+
+#[sqlx::test(migrations = false)]
 async fn without_webhooks_a_stuck_build_comes_back_once_its_events_show_the_label_put_back(
     pool: PgPool,
 ) {
@@ -1414,7 +1436,7 @@ async fn a_token_minted_while_the_claim_is_given_back_is_revoked_and_refused(poo
                 daemon: None,
                 claim: claim_n,
             };
-            store.release_build(ana, None).await.unwrap().unwrap();
+            store.release_build(ana, None, None).await.unwrap().unwrap();
         },
     );
 
@@ -1814,7 +1836,7 @@ fn given_back_during(hub: &Shared, pool: &PgPool, prefix: &str, claimed: &Value)
             daemon: None,
             claim: claim_n,
         };
-        store.release_build(ana, None).await.unwrap().unwrap();
+        store.release_build(ana, None, None).await.unwrap().unwrap();
     });
 }
 
@@ -1890,7 +1912,7 @@ async fn a_pr_its_opener_could_not_record_stays_open_once_the_next_holder_record
             claim,
         };
         store
-            .release_build(holder("ana", claim_n), None)
+            .release_build(holder("ana", claim_n), None, None)
             .await
             .unwrap()
             .unwrap();

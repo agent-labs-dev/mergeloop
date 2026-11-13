@@ -24,3 +24,6 @@ testing = ["tokio/io-util", "tokio/net"]
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt"] }
+
+[lints]
+workspace = true

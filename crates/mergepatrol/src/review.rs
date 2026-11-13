@@ -24,7 +24,7 @@ use mergepatrol_web::merge_requested;
 use tokio::task::JoinSet;
 
 use crate::github::GitHub;
-use crate::queue::{Alive, Ctx, app_credentials, job_spec, record, unix_now};
+use crate::queue::{Alive, Commits, Ctx, app_credentials, job_spec, record, unix_now};
 
 /// Reviews running at once, across workspaces. Each also takes one of the sandbox's job slots.
 const REVIEWS_AT_ONCE: usize = 4;
@@ -311,8 +311,12 @@ impl Reviewing<'_> {
                 reviewed,
                 depth: bars.depth,
             };
-            let (mut spec, granted) =
-                job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
+            let commits = Commits {
+                head: &r.head_sha,
+                onto: &trunk,
+                below: None,
+            };
+            let (mut spec, granted) = job_spec(ctx, gh, key, pr, settings, commits, task).await?;
             spec.base_ref = below(pr);
             if granted.is_none() {
                 bail!(
@@ -1010,18 +1014,12 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
             question: q.question.clone(),
             sent_back,
         };
-        let (mut spec, granted) = job_spec(
-            ctx,
-            &gh,
-            &key,
-            &pr,
-            &settings,
-            &r.head_sha,
-            &trunk,
-            None,
-            task,
-        )
-        .await?;
+        let commits = Commits {
+            head: &r.head_sha,
+            onto: &trunk,
+            below: None,
+        };
+        let (mut spec, granted) = job_spec(ctx, &gh, &key, &pr, &settings, commits, task).await?;
         spec.base_ref = below(&pr);
         if granted.is_none() {
             bail!("{NO_KEY} in the workspace's settings: the agent cannot answer.");

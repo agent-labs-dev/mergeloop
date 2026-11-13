@@ -12,13 +12,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mergepatrol_core::{CHECKS_TIMEOUT, Event, Hold, PrNumber, RepoName, RepoSettings};
-use mergepatrol_executor::protocol::Task;
 use mergepatrol_github::{CheckState, Installation, RepoSnapshot};
 use mergepatrol_store::LaneKey;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use super::{Ctx, JobSandbox, Unit, rebase_and_publish, record_all, rerun_failed, still_queued};
+use super::{
+    Conflicts, Ctx, JobSandbox, LaneRead, Runs, Sandbox, Unit, record_all, rerun_failed,
+    still_queued,
+};
 use crate::github::GitHub;
 
 /// A job's hold on a PR, which ends with the job, also if it panics or is aborted, and which
@@ -407,8 +409,17 @@ async fn job(ctx: &Ctx, gh: &Installation, w: &Wanted) -> Result<Event> {
     if !still_queued(gh, key, settings, unit, &heads).await? {
         return Ok(Event::HeadMoved);
     }
-    let sandbox = JobSandbox { ctx, gh };
-    let event = match &w.work {
+    let sandbox = JobSandbox {
+        ctx,
+        gh,
+        runs: Runs::BesideLane,
+    };
+    let at = LaneRead {
+        key,
+        snap,
+        settings,
+    };
+    match &w.work {
         Work::Rerun {
             layer,
             failed,
@@ -421,7 +432,7 @@ async fn job(ctx: &Ctx, gh: &Installation, w: &Wanted) -> Result<Event> {
         Work::Rebase => {
             let onto = format!("onto {}", key.trunk);
             record_all(ctx, key, &prs, "rebasing", &onto).await?;
-            rebase_and_publish(ctx, gh, key, snap, unit, 0, settings, true, true).await
+            sandbox.rebase(at, unit, Conflicts::Resolve).await
         }
         Work::Fix { layer, failed } => {
             let pr = &unit.layers[*layer];
@@ -443,11 +454,7 @@ async fn job(ctx: &Ctx, gh: &Installation, w: &Wanted) -> Result<Event> {
             record_all(ctx, key, &prs, "fixing", &what).await?;
             let failures = GitHub::check_failures(gh, &key.repo, head, failed).await?;
             let base = unit.below(gh, key, *layer).await?;
-            let task = Task::FixChecks { failures };
-            sandbox
-                .fix_and_restack(key, snap, unit, *layer, settings, head, &base, task, true)
-                .await
+            sandbox.fix(at, unit, *layer, head, &base, &failures).await
         }
-    };
-    sandbox.published(key, event).await
+    }
 }

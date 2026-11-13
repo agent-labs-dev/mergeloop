@@ -382,8 +382,15 @@ pub(super) struct Reviewed {
     fixed: usize,
 }
 
-/// The PR body's section on the local review.
-fn reviewed_section(r: &Reviewed) -> String {
+/// The PR body's section on the local review, there whether or not one ran, so nobody reads
+/// an unreviewed PR as reviewed.
+fn reviewed_section(reviewed: Option<&Reviewed>) -> String {
+    let Some(r) = reviewed else {
+        return "### Local review\n\nThe local review was turned off on the machine that built \
+                this PR (`[reviewer] enabled = false`), so no reviewer read the change before it \
+                opened."
+            .to_owned();
+    };
     let model =
         r.by.model
             .as_deref()
@@ -466,12 +473,13 @@ impl Builder {
         }
         say(task, &format!("pushed {}", task.branch));
         let subject = subject(task, run);
-        let mut description = build_description(&run.text);
-        if let Some(reviewed) = reviewed {
-            description = format!("{description}\n\n{}", reviewed_section(reviewed))
-                .trim()
-                .to_owned();
-        }
+        let description = format!(
+            "{}\n\n{}",
+            build_description(&run.text),
+            reviewed_section(reviewed)
+        )
+        .trim()
+        .to_owned();
         let mut tries = 0;
         let pr = loop {
             match heard(lane, task, || lane.open_pr(task, &subject, &description)).await {

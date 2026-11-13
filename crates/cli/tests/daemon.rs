@@ -278,7 +278,10 @@ async fn a_task_is_built_pushed_as_the_bot_with_the_developer_and_its_pr_opened(
         [(
             1,
             "Add the feature".to_owned(),
-            "Adds the feature.".to_owned()
+            "Adds the feature.\n\n### Local review\n\nThe local review was turned off on the \
+             machine that built this PR (`[reviewer] enabled = false`), so no reviewer read the \
+             change before it opened."
+                .to_owned()
         )]
     );
     assert!(w.fake.lane(|l| l.released.is_empty()));
@@ -2167,7 +2170,7 @@ async fn in_workspace_access_the_reviewer_cannot_write_the_worktree_and_the_pr_o
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_review_turned_off_in_the_config_never_runs() {
+async fn a_review_turned_off_in_the_config_never_runs_and_the_pr_says_so() {
     let w = World::new().await;
     w.fake.add_task(w.task(1, 7, &[]));
     let builder = w.noting_builder();
@@ -2186,5 +2189,12 @@ async fn a_review_turned_off_in_the_config_never_runs() {
 
     assert_eq!((w.runs(), w.reviews().len()), (1, 0));
     let (_, _, body) = w.fake.lane(|l| l.opened[0].clone());
-    assert!(!body.contains("Local review"), "{body}");
+    assert!(
+        body.contains("### Local review\n\nThe local review was turned off"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("read the change against the issue"),
+        "{body}"
+    );
 }

@@ -1596,15 +1596,18 @@ impl Store for PgStore {
         now: i64,
     ) -> Result<Option<Consent>> {
         let row = sqlx::query(
-            "DELETE FROM consents WHERE request_hash = $1 AND browser_hash = $2
+            // One past its time stays for `delete_expired_sessions`, which takes its session too.
+            "DELETE FROM consents
+             WHERE request_hash = $1 AND browser_hash = $2 AND expires_at > $3
              RETURNING browser_hash, token_hash, token_nonce, token_ciphertext, client, login,
                 expires_at",
         )
         .bind(request_hash)
         .bind(browser_hash)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.as_ref().map(consent_of).filter(|c| c.expires_at > now))
+        Ok(row.as_ref().map(consent_of))
     }
 }
 
@@ -1819,7 +1822,9 @@ mod tests {
             Some(consent("answered"))
         );
         assert_eq!(store.take_consent("r1", "b", 50).await.unwrap(), None);
-        // Nobody answered r2 in time: it and its session go.
+        // Nobody answered r2 in time, and an answer that comes too late does not take it:
+        // it and its session go.
+        assert_eq!(store.take_consent("r2", "b", 100).await.unwrap(), None);
         assert_eq!(store.delete_expired_sessions(100).await.unwrap(), 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM sessions")
             .fetch_all(&store.pool)

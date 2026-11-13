@@ -58,8 +58,12 @@ and a fresh worktree: a local agent CLI, on your own login, builds the issue; th
 verify commands must pass (the agent gets one more run to fix them); the daemon commits
 as the App's bot with you as co-author, pushes the branch with a token the server mints,
 and has the server open the PR. When the agent gives up, or verify still fails, or
-anything else ends a build, it is released as stuck with the reason. Ctrl-C gives back
-what it holds, and cleans up. A build's worktree and branch go however it ends.";
+anything else ends a build, it is released as stuck with the reason. Once the PR is
+open the daemon lands it, as its author in the land loop: the agent works review threads
+and requested changes, as the App's bot, and the daemon pushes, replies and resolves; a PR
+waiting on the queue or a human holds no slot. Ctrl-C gives back the builds without a PR,
+keeps those with one to land again on start, and cleans up. A build's worktree and branch
+go however it ends.";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {

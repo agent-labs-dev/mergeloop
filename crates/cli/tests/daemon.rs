@@ -66,10 +66,7 @@ impl World {
     /// worktree, and answers `answer` as its last message.
     fn agent(&self, name: &str, body: &str, answer: &str) -> PathBuf {
         let bin = self.root().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let result = json!({ "type": "result", "result": answer, "is_error": false });
-        let out = bin.join(format!("{name}.out"));
-        std::fs::write(&out, format!("{{\"type\":\"assistant\"}}\n{result}\n")).unwrap();
+        let out = self.output(name, answer);
         let runs = self.root().join("runs");
         let script = bin.join(name);
         std::fs::write(
@@ -84,6 +81,17 @@ impl World {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// A fake Claude CLI's output, answering `answer` as its last message: what a fake agent
+    /// prints with `cat`.
+    fn output(&self, name: &str, answer: &str) -> PathBuf {
+        let bin = self.root().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let result = json!({ "type": "result", "result": answer, "is_error": false });
+        let out = bin.join(format!("{name}.out"));
+        std::fs::write(&out, format!("{{\"type\":\"assistant\"}}\n{result}\n")).unwrap();
+        out
     }
 
     /// How many times the agent ran.
@@ -130,6 +138,7 @@ impl World {
         let mut daemon = Daemon::new(config, self.client());
         daemon.poll = Duration::from_millis(50);
         daemon.heartbeat_every = Duration::from_millis(200);
+        daemon.github = self.fake.url.clone();
         let stop = until(|| done(self));
         tokio::time::timeout(Duration::from_secs(60), daemon.run(stop))
             .await
@@ -1007,4 +1016,276 @@ async fn a_build_whose_pr_merged_is_reported_merged_not_stuck() {
     assert_eq!(w.fake.args_of("report_build")[0]["standing"], "merged");
     assert!(w.fake.lane(|l| l.released.is_empty()));
     assert_eq!(w.left(), (vec![], vec![]));
+}
+
+const THREADS: &str = "Work the threads.";
+const WORKED: &str = "Checked it.\nMERGELOOP_REPLY: T1 Checks it now.\nMERGELOOP_REPLY: T9 Not this PR's.\nMERGELOOP_RESOLVE: T1\nMERGELOOP_COMMIT: Check it";
+
+impl World {
+    /// A fake agent that builds, and works a need's brief as `WORKED` says. Each run notes the
+    /// token `gh` would act with in `tokens`.
+    fn lander(&self) -> PathBuf {
+        let worked = self.output("worked", WORKED);
+        let tokens = self.root().join("tokens");
+        let body = format!(
+            "echo \"${{GH_TOKEN:-none}}\" >> '{}'\n\
+             case \"$prompt\" in '{THREADS}') echo checked >> feature.txt; cat '{}'; exit 0;; esac\n\
+             echo built > feature.txt",
+            tokens.display(),
+            worked.display()
+        );
+        self.agent("lander", &body, BUILT)
+    }
+
+    fn tokens(&self) -> Vec<String> {
+        let tokens = std::fs::read_to_string(self.root().join("tokens")).unwrap_or_default();
+        tokens.lines().map(str::to_owned).collect()
+    }
+
+    /// A build this daemon holds from before, with PR `pr` from `branch`, pushed to the remote.
+    fn held(&self, build: u64, issue: u64, pr: u64) {
+        let branch = format!("mergeloop/build-{issue}");
+        git(
+            &self.root().join("seed"),
+            &[
+                "push",
+                "-q",
+                "../remote.git",
+                &format!("main:refs/heads/{branch}"),
+            ],
+        );
+        std::fs::create_dir_all(self.workspace().join("daemon")).unwrap();
+        std::fs::write(self.workspace().join("daemon/id"), "this-one\n").unwrap();
+        let mut task = self.task(build, issue, &[]);
+        task["pr"] = pr.into();
+        let mut seen = self.fake.seen.lock().unwrap();
+        seen.lane
+            .held
+            .push(json!({ "id": build, "claim": 1, "pr": pr, "daemon": "this-one" }));
+        seen.lane.held_tasks.insert(build, task);
+    }
+
+    fn transcripts(&self) -> Vec<String> {
+        let dir = self.workspace().join("transcripts");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn its_prs_threads_are_worked_by_the_agent_as_the_bot_and_the_build_ends_once_merged() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    w.fake.script(
+        101,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#101 merged."),
+        ],
+    );
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(1)))
+        .await;
+
+    assert_eq!(w.runs(), 2, "the build, then the need");
+    assert_eq!(
+        w.tokens(),
+        ["none", "ghs_fake"],
+        "the builder acts as nobody; the need's agent as the bot, with the minted token"
+    );
+    let [subject, author, _, body] = w.pushed("mergeloop/build-7").unwrap();
+    assert_eq!(subject, "Check it");
+    assert_eq!(author, format!("{} <{}>", BOT.0, BOT.1));
+    assert!(body.contains(&format!("Co-authored-by: {} <{}>", DEV.0, DEV.1)));
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-7:feature.txt"]),
+        "built\nchecked\n"
+    );
+    let head = git(
+        &w.remote(),
+        &["rev-parse", "--short=7", "mergeloop/build-7"],
+    );
+    let graphql = w.fake.lane(|l| l.graphql.clone());
+    assert!(
+        graphql.iter().all(|(bearer, ..)| bearer == "ghs_fake"),
+        "{graphql:?}"
+    );
+    let replies: Vec<&Value> = graphql
+        .iter()
+        .filter(|(_, q, _)| q.contains("addPullRequestReviewThreadReply"))
+        .map(|(.., vars)| vars)
+        .collect();
+    assert_eq!(
+        replies,
+        [
+            &json!({ "thread": "T1", "body": format!("Checks it now.\n\nPushed in {}.", head.trim()) })
+        ],
+        "a thread not on the PR gets no reply"
+    );
+    assert_eq!(w.fake.lane(|l| l.threads.clone()), [("T1".into(), true)]);
+    let need = &w.fake.args_of("next_need")[0];
+    assert_eq!(
+        (
+            &need["workspace"],
+            &need["repo"],
+            &need["number"],
+            &need["for_daemon"]
+        ),
+        (&json!(1), &json!("o/r"), &json!(101), &json!(true))
+    );
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+    assert_eq!(w.left(), (vec![], vec![]), "no worktree, no branch");
+    assert_eq!(w.transcripts(), ["1"], "only its transcripts");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_daemon_lands_the_pr_it_holds_and_a_human_need_runs_no_agent() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![
+            fake::need("human", "h1", "It waits on a human: one approval."),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert_eq!(w.runs(), 0);
+    assert_eq!(
+        w.fake.lane(|l| l.reports.clone()),
+        [(5, "waiting".into()), (5, "merged".into())]
+    );
+    let task = &w.fake.args_of("get_build_task")[0];
+    assert_eq!(
+        (&task["build"], &task["claim"], &task["daemon"]),
+        (&json!(5), &json!(1), &json!("this-one"))
+    );
+    assert!(w.fake.lane(|l| l.released.is_empty()), "not given back");
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ejected_once_it_is_queued_again_and_ejected_twice_it_is_stuck() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![
+            fake::need("ejected", "e1", "MergeLoop ejected #105: checks failed."),
+            fake::need("queue", "e1-q", "#105 is not queued."),
+            json!({ "needs": "ejected", "id": "e2", "brief": "b", "status": { "ejected": { "reason": "checks failed again" } } }),
+        ],
+    );
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    assert_eq!(released.len(), 1);
+    let why = released[0].1.as_deref().unwrap();
+    assert!(why.contains("a second time: checks failed again"), "{why}");
+    assert_eq!(w.fake.args_of("queue_pull").len(), 1);
+    assert_eq!(w.runs(), 0);
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pr_that_waits_holds_no_slot() {
+    let w = World::new().await;
+    // Waits on the queue for good.
+    w.held(5, 12, 105);
+    w.fake.add_task(w.task(1, 7, &[]));
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| l.opened.len() == 1)
+    })
+    .await;
+
+    assert_eq!(w.runs(), 1, "the one slot built the task");
+    assert!(
+        w.fake
+            .args_of("next_need")
+            .iter()
+            .any(|a| a["number"] == 105)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_claimed_with_its_pr_is_landed_not_given_back() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.seen.lock().unwrap().lane.held.clear();
+    let mut task = w.task(5, 12, &[]);
+    task["pr"] = 105.into();
+    w.fake.add_task(task);
+    w.fake
+        .script(105, vec![fake::need("merged", "m1", "#105 merged.")]);
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+    assert_eq!(w.runs(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pr_github_would_not_label_yet_is_opened_on_a_later_call() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    w.fake.refuse(
+        "open_build_pr",
+        "",
+        502,
+        "GitHub would not label PR #101. Call `open_build_pr` again.",
+    );
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| l.opened.len() == 1)
+    })
+    .await;
+
+    let calls = w.fake.args_of("open_build_pr").len();
+    assert_eq!(calls, 2);
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transcripts_older_than_seven_days_are_removed() {
+    let w = World::new().await;
+    for (build, stamp) in [("1", "202001010000"), ("2", "")] {
+        let dir = w.workspace().join("transcripts").join(build);
+        std::fs::create_dir_all(&dir).unwrap();
+        if !stamp.is_empty() {
+            let touched = std::process::Command::new("touch")
+                .args(["-t", stamp])
+                .arg(&dir)
+                .status()
+                .unwrap();
+            assert!(touched.success());
+        }
+    }
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.tools().contains(&"claim_build".to_owned())
+    })
+    .await;
+
+    assert_eq!(w.transcripts(), ["2"]);
 }

@@ -118,6 +118,23 @@ your own programs can.",
     }
 }
 
+/// What a run's environment changes of the daemon's own: the names it removes, then the names
+/// it sets. The daemon decides what credentials a run may hold; the run only applies it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Env {
+    pub remove: Vec<String>,
+    pub set: Vec<(String, String)>,
+}
+
+impl Env {
+    pub fn apply(&self, cmd: &mut tokio::process::Command) {
+        for name in &self.remove {
+            cmd.env_remove(name);
+        }
+        cmd.envs(self.set.iter().map(|(k, v)| (k, v)));
+    }
+}
+
 /// The name of the Codex permission profile a `workspace` run gets.
 const CODEX_PROFILE: &str = "mergeloop-build";
 
@@ -138,9 +155,17 @@ pub struct LocalAgent {
 }
 
 impl LocalAgent {
-    /// The agent's run in `room`'s tree, given `prompt`. Its temp folder is the room's.
-    pub fn command(&self, room: &Room, prompt: &str, access: &Access) -> tokio::process::Command {
+    /// The agent's run in `room`'s tree, given `prompt`, with `env`. Its temp folder is the
+    /// room's.
+    pub fn command(
+        &self,
+        room: &Room,
+        prompt: &str,
+        access: &Access,
+        env: &Env,
+    ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.command);
+        env.apply(&mut cmd);
         // Its own process group, so that whatever it leaves running can be stopped with it.
         cmd.current_dir(&room.tree)
             .env("TMPDIR", room.tmp())
@@ -245,7 +270,7 @@ impl LocalAgent {
         cmd.args(&self.args).arg(prompt);
     }
 
-    /// Runs the agent in `room` with `prompt`, keeping its output in `transcript`. A run on
+    /// Runs the agent in `room` with `prompt` and `env`, keeping its output in `transcript`. A run on
     /// the developer's own login bills their plan, so it has no cost. An error when it could not
     /// start.
     pub async fn run(
@@ -253,11 +278,12 @@ impl LocalAgent {
         room: &Room,
         prompt: &str,
         access: &Access,
+        env: &Env,
         transcript: &Path,
         spawned: impl FnOnce(u32),
     ) -> Result<Resolution> {
         tokio::fs::create_dir_all(room.tmp()).await?;
-        let cmd = self.command(room, prompt, access);
+        let cmd = self.command(room, prompt, access, env);
         let name = &self.command;
         let mut resolution = match self.vendor {
             Vendor::Claude => {
@@ -339,7 +365,7 @@ mod tests {
         let mut claude = agent(Vendor::Claude, "mclaude");
         claude.model = Some("haiku".into());
         claude.args = vec!["--strict-mcp-config".into()];
-        let cmd = claude.command(&room(), "do it", &workspace());
+        let cmd = claude.command(&room(), "do it", &workspace(), &Env::default());
         let a = argv(&cmd);
         assert_eq!(a[0], "mclaude");
         assert_eq!(
@@ -353,7 +379,7 @@ mod tests {
         assert_eq!(a.last().unwrap(), "--strict-mcp-config");
 
         let codex = agent(Vendor::Codex, "codex");
-        let a = argv(&codex.command(&room(), "do it", &workspace()));
+        let a = argv(&codex.command(&room(), "do it", &workspace(), &Env::default()));
         assert_eq!(a[..3], ["codex", "exec", "--json"]);
         assert!(has(&a, &["--cd", "/ws/builds/1/tree"]), "{a:?}");
         assert_eq!(a.last().unwrap(), "do it");
@@ -361,8 +387,35 @@ mod tests {
     }
 
     #[test]
+    fn a_run_holds_only_the_credentials_its_env_gives() {
+        let env = Env {
+            remove: vec!["GH_TOKEN".into()],
+            set: vec![("GITHUB_TOKEN".into(), "test-bot".into())],
+        };
+        let cmd = agent(Vendor::Claude, "claude").command(&room(), "p", &Access::Full, &env);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                let s = |x: &std::ffi::OsStr| x.to_string_lossy().into_owned();
+                (s(k), v.map(s))
+            })
+            .collect();
+        assert!(envs.contains(&("GH_TOKEN".into(), None)), "{envs:?}");
+        assert!(
+            envs.contains(&("GITHUB_TOKEN".into(), Some("test-bot".into()))),
+            "{envs:?}"
+        );
+    }
+
+    #[test]
     fn workspace_access_lets_claude_write_only_its_room_and_read_nothing_denied() {
-        let a = argv(&agent(Vendor::Claude, "claude").command(&room(), "p", &workspace()));
+        let a = argv(&agent(Vendor::Claude, "claude").command(
+            &room(),
+            "p",
+            &workspace(),
+            &Env::default(),
+        ));
         assert!(has(&a, &["--permission-mode", "acceptEdits"]), "{a:?}");
         assert!(has(&a, &["--add-dir", "/ws/builds/1"]), "{a:?}");
         assert!(has(&a, &["--setting-sources", "user"]), "{a:?}");
@@ -392,7 +445,12 @@ mod tests {
 
     #[test]
     fn workspace_access_gives_codex_a_profile_that_writes_only_its_room() {
-        let a = argv(&agent(Vendor::Codex, "codex").command(&room(), "p", &workspace()));
+        let a = argv(&agent(Vendor::Codex, "codex").command(
+            &room(),
+            "p",
+            &workspace(),
+            &Env::default(),
+        ));
         assert!(a.contains(&"--ignore-user-config".to_owned()), "{a:?}");
         assert!(
             has(&a, &["-c", "default_permissions=\"mergeloop-build\""]),
@@ -432,10 +490,20 @@ mod tests {
 
     #[test]
     fn full_access_lifts_the_confinement() {
-        let claude = argv(&agent(Vendor::Claude, "claude").command(&room(), "p", &Access::Full));
+        let claude = argv(&agent(Vendor::Claude, "claude").command(
+            &room(),
+            "p",
+            &Access::Full,
+            &Env::default(),
+        ));
         assert!(has(&claude, &["--permission-mode", "bypassPermissions"]));
         assert!(!claude.iter().any(|a| a == "--settings" || a == "--add-dir"));
-        let codex = argv(&agent(Vendor::Codex, "codex").command(&room(), "p", &Access::Full));
+        let codex = argv(&agent(Vendor::Codex, "codex").command(
+            &room(),
+            "p",
+            &Access::Full,
+            &Env::default(),
+        ));
         assert!(codex.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
         assert!(
             !codex
@@ -485,6 +553,7 @@ mod tests {
                 &room,
                 "p",
                 &Access::Full,
+                &Env::default(),
                 &dir.path().join("t.jsonl"),
                 |_| {},
             )
@@ -518,6 +587,7 @@ mod tests {
                 &room,
                 "p",
                 &Access::Full,
+                &Env::default(),
                 &dir.path().join("t.jsonl"),
                 |_| {},
             )
@@ -540,6 +610,7 @@ mod tests {
                 &room,
                 "p",
                 &Access::Full,
+                &Env::default(),
                 &dir.path().join("t.jsonl"),
                 |_| {},
             )

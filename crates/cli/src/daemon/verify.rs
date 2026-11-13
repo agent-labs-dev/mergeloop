@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use mergepatrol_resolver::{Access, Room, VerifyFailed};
+use mergepatrol_resolver::{Access, Env, Room, VerifyFailed};
 
 use super::groups::Groups;
 
@@ -64,12 +64,14 @@ pub async fn run(
     commands: &[String],
     room: &Room,
     access: &Access,
+    env: &Env,
     groups: &Groups,
     build: u64,
 ) -> Result<Option<VerifyFailed>> {
     tokio::fs::create_dir_all(room.tmp()).await?;
     for command in commands {
         let mut cmd = shell(command, room, access);
+        env.apply(&mut cmd);
         cmd.current_dir(&room.tree)
             .env("TMPDIR", room.tmp())
             .process_group(0)
@@ -216,7 +218,7 @@ mod tests {
         ];
         let room = room(dir.path());
         let (_g, groups) = groups();
-        let failed = run(&commands, &room, &Access::Full, &groups, 1)
+        let failed = run(&commands, &room, &Access::Full, &Env::default(), &groups, 1)
             .await
             .unwrap()
             .unwrap();
@@ -224,10 +226,17 @@ mod tests {
         assert_eq!(failed.output.trim(), "broken");
         assert!(!dir.path().join("never").exists());
         assert!(
-            run(&commands[..1], &room, &Access::Full, &groups, 1)
-                .await
-                .unwrap()
-                .is_none()
+            run(
+                &commands[..1],
+                &room,
+                &Access::Full,
+                &Env::default(),
+                &groups,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -271,7 +280,7 @@ mod tests {
         let confined = |commands: &[String]| {
             let commands = commands.to_vec();
             let (room, access, groups) = (room.clone(), access.clone(), groups.clone());
-            async move { run(&commands, &room, &access, &groups, 1).await }
+            async move { run(&commands, &room, &access, &Env::default(), &groups, 1).await }
         };
         let inside = vec!["echo x > made && echo y > \"$TMPDIR/t\"".to_owned()];
         assert!(confined(&inside).await.unwrap().is_none());

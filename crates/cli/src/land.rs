@@ -76,19 +76,40 @@ fn waiting(brief: &str) -> &str {
     brief.split_once(". Run `").map_or(brief, |(said, _)| said)
 }
 
-/// Queues the PR, and waits until it needs the agent: prints that need, and returns its exit
-/// code.
-pub async fn land(
-    client: &Client,
-    repo: &str,
-    number: u64,
-    mut after: Option<String>,
-) -> Result<u8> {
+/// A PR in the land loop, and how its tools are called.
+pub struct Pr<'a> {
+    /// `owner/name`.
+    pub repo: &'a str,
+    pub number: u64,
+    /// Its workspace, for a signed-in caller that knows it. Without it, the server finds it.
+    pub workspace: Option<u64>,
+    /// Briefs for an agent that `mergeloop daemon` runs, which commits and pushes for it.
+    pub for_daemon: bool,
+}
+
+impl Pr<'_> {
+    fn args(&self) -> Value {
+        let mut args = json!({ "repo": self.repo, "number": self.number });
+        if let Some(workspace) = self.workspace {
+            args["workspace"] = workspace.into();
+        }
+        args
+    }
+}
+
+/// The PR's next need that the loop does not handle itself: a wait is waited out, and a PR that
+/// is not queued is queued, once per need. `after` is the need seen last, and moves on with the
+/// needs.
+pub async fn next(client: &Client, pr: &Pr<'_>, after: &mut Option<String>) -> Result<Value> {
     let mut said = String::new();
     loop {
-        let mut args = json!({ "repo": repo, "number": number, "wait": LONGEST_WAIT });
-        if let Some(after) = &after {
-            args["after"] = after.as_str().into();
+        let mut args = pr.args();
+        args["wait"] = LONGEST_WAIT.into();
+        if pr.for_daemon {
+            args["for_daemon"] = true.into();
+        }
+        if let Some(after) = after.as_deref() {
+            args["after"] = after.into();
         }
         let need = client.json("next_need", args).await?;
         let id = need["id"].as_str().unwrap_or_default().to_owned();
@@ -98,27 +119,46 @@ pub async fn land(
                 // for a caller of `next_need`: this keeps waiting itself.
                 let brief = need["brief"].as_str().unwrap_or_default();
                 if brief != said {
-                    eprintln!("mergeloop: {}; waiting", waiting(brief));
+                    eprintln!(
+                        "mergeloop: {}#{}: {}; waiting",
+                        pr.repo,
+                        pr.number,
+                        waiting(brief)
+                    );
                     said = brief.to_owned();
                 }
             }
             Some("queue") => {
                 if after.as_deref() != Some(id.as_str()) {
-                    client
-                        .json("queue_pull", json!({ "repo": repo, "number": number }))
-                        .await?;
-                    eprintln!("mergeloop: queued {repo}#{number}");
+                    client.json("queue_pull", pr.args()).await?;
+                    eprintln!("mergeloop: queued {}#{}", pr.repo, pr.number);
                 }
-                after = Some(id);
+                *after = Some(id);
             }
-            Some(_) => {
-                println!("{}", serde_json::to_string_pretty(&printed(&need))?);
-                let code = need["exit_code"].as_u64().unwrap_or(2);
-                return Ok(u8::try_from(code).unwrap_or(2));
-            }
+            Some(_) => return Ok(need),
             None => bail!("the server answered no need: {need}"),
         }
     }
+}
+
+/// Queues the PR, and waits until it needs the agent: prints that need, and returns its exit
+/// code.
+pub async fn land(
+    client: &Client,
+    repo: &str,
+    number: u64,
+    mut after: Option<String>,
+) -> Result<u8> {
+    let pr = Pr {
+        repo,
+        number,
+        workspace: None,
+        for_daemon: false,
+    };
+    let need = next(client, &pr, &mut after).await?;
+    println!("{}", serde_json::to_string_pretty(&printed(&need))?);
+    let code = need["exit_code"].as_u64().unwrap_or(2);
+    Ok(u8::try_from(code).unwrap_or(2))
 }
 
 /// The need as the agent reads it: what to do, without the whole status.

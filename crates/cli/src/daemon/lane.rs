@@ -26,6 +26,16 @@ pub struct Task {
     pub pr: Option<u64>,
 }
 
+impl Task {
+    /// What its heartbeats say it is at: building until its PR is open, then landing.
+    pub fn stage(&self) -> Stage {
+        match self.pr {
+            None => Stage::Building,
+            Some(_) => Stage::Landing,
+        }
+    }
+}
+
 /// A build this login holds, as `list_builds` lists it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Held {
@@ -42,17 +52,29 @@ pub struct Identity {
 }
 
 /// What a build stage says in its heartbeat.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Building,
+    /// Its PR is open: the land loop has it, and the heartbeat names no stage.
+    Landing,
 }
 
 impl Stage {
-    fn name(self) -> &'static str {
+    fn name(self) -> Option<&'static str> {
         match self {
-            Stage::Building => "building",
+            Stage::Building => Some("building"),
+            Stage::Landing => None,
         }
     }
+}
+
+/// How a build's PR stands, as `report_build` hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// The daemon acts on what the queue needs of the PR's author.
+    Landing,
+    /// The PR waits on a human.
+    Waiting,
 }
 
 /// One workspace's lane, as one daemon.
@@ -83,9 +105,11 @@ impl Lane {
     }
 
     pub async fn heartbeat(&self, task: &Task, stage: Stage) -> Result<()> {
-        self.on(task, "heartbeat_build", json!({ "stage": stage.name() }))
-            .await
-            .map(drop)
+        let args = match stage.name() {
+            Some(stage) => json!({ "stage": stage }),
+            None => json!({}),
+        };
+        self.on(task, "heartbeat_build", args).await.map(drop)
     }
 
     /// A token that pushes the build's branch, as the App's bot.
@@ -116,6 +140,26 @@ impl Lane {
         self.on(task, "report_build", json!({ "standing": "merged" }))
             .await
             .map(drop)
+    }
+
+    /// Says how the build's PR stands while it lands.
+    pub async fn report(&self, task: &Task, standing: Standing) -> Result<()> {
+        let standing = match standing {
+            Standing::Landing => "landing",
+            Standing::Waiting => "waiting",
+        };
+        self.on(task, "report_build", json!({ "standing": standing }))
+            .await
+            .map(drop)
+    }
+
+    /// The task of a build this daemon holds from before it stopped.
+    pub async fn task_of(&self, held: &Held) -> Result<Task> {
+        let answer = self
+            .on_build(held.id, held.claim, "get_build_task", json!({}))
+            .await?;
+        serde_json::from_value(answer.clone())
+            .with_context(|| format!("get_build_task answered no task: {answer}"))
     }
 
     /// Gives the build back, or marks it stuck with why.

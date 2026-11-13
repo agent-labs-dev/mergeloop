@@ -8,21 +8,28 @@
 //! - `folder`: the workspace folder: clones, worktrees, transcripts, and their cleanup.
 //! - `groups`: the process groups builds run, stopped with them.
 //! - `verify`: the repo's verify commands, confined like the agent.
+//! - `env`: what a build's agent and commands may act as: never the developer.
 //! - `build`: one build, from a claimed task to its open PR.
+//! - `landing`: a built PR, from its opening until it merges.
+//! - `github`: what the daemon says on a PR's threads, as the App's bot.
 
 pub mod build;
 pub mod config;
+pub mod env;
 pub mod folder;
+pub mod github;
 pub mod groups;
+pub mod landing;
 pub mod lane;
 pub mod verify;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -40,6 +47,8 @@ pub struct Daemon {
     pub poll: Duration,
     /// How often a build heartbeats.
     pub heartbeat_every: Duration,
+    /// GitHub's API, where the daemon replies on threads as the App's bot.
+    pub github: String,
     /// Runs in each build once its room is made: for tests.
     pub in_room: Option<build::InRoom>,
 }
@@ -51,6 +60,7 @@ impl Daemon {
             client,
             poll: Duration::from_secs(30),
             heartbeat_every: Duration::from_secs(5 * 60),
+            github: "https://api.github.com".into(),
             in_room: None,
         }
     }
@@ -93,44 +103,61 @@ impl Daemon {
                 daemon: folder.id().to_owned(),
             })
             .collect();
+        let mut resumed = Vec::new();
         for lane in &lanes {
-            give_back_held(lane).await?;
+            resumed.extend(take_up_held(lane).await?);
         }
         let builder = Builder {
             agent: self.config.builder.clone(),
             access,
             folder,
             heartbeat_every: self.heartbeat_every,
+            pause: self.poll,
+            slots: Arc::new(Semaphore::new(self.config.slots)),
+            http: crate::client::http()?,
+            github: self.github,
             in_room: self.in_room,
         };
         Slots {
             lanes,
             builder,
-            slots: self.config.slots,
             poll: self.poll,
         }
-        .run(stop)
+        .run(resumed, stop)
         .await
     }
 }
 
-/// Gives back the builds without a PR that this daemon holds from before it stopped: their work
-/// went with it. A build with a PR is the land loop's. Another daemon's builds, of the same login
-/// too, are not listed.
-async fn give_back_held(lane: &Lane) -> Result<()> {
+/// Takes up the builds this daemon holds from before it stopped: those with a PR, to land them
+/// again, and gives back those without, whose work went with it. Another daemon's builds, of the
+/// same login too, are not listed.
+async fn take_up_held(lane: &Lane) -> Result<Vec<(Lane, Task)>> {
     let held = match lane.held().await {
         Ok(held) => held,
-        Err(e) if refusal(&e) == Some(Refusal::LaneOff) => return Ok(()),
+        Err(e) if refusal(&e) == Some(Refusal::LaneOff) => return Ok(vec![]),
         Err(e) => return Err(e),
     };
-    for build in held.iter().filter(|b| b.pr.is_none()) {
-        match lane.give_back(build).await {
-            Ok(()) => eprintln!("mergeloop: gave back build {}, left from before", build.id),
+    let mut resumed = Vec::new();
+    for build in &held {
+        let taken = match build.pr {
+            Some(_) => lane.task_of(build).await.map(|task| {
+                eprintln!(
+                    "mergeloop: lands build {}'s PR again, from before",
+                    build.id
+                );
+                resumed.push((lane.clone(), task));
+            }),
+            None => lane.give_back(build).await.map(|()| {
+                eprintln!("mergeloop: gave back build {}, left from before", build.id);
+            }),
+        };
+        match taken {
+            Ok(()) => {}
             Err(e) if needs_sign_in(&e) => return Err(e),
-            Err(e) => eprintln!("mergeloop: could not give back build {}: {e:#}", build.id),
+            Err(e) => eprintln!("mergeloop: could not take up build {}: {e:#}", build.id),
         }
     }
-    Ok(())
+    Ok(resumed)
 }
 
 /// When the claim loop next asks for a task: when the first workspace wakes, or a poll from now
@@ -167,8 +194,10 @@ fn panicked(e: tokio::task::JoinError) -> String {
 
 /// What the claim loop keeps between its turns.
 struct State {
+    /// The builds and the landings. A build holds its slot; a landing takes one only while its
+    /// agent works a need.
     builds: JoinSet<Result<Ended>>,
-    /// The build each task runs, to settle it should the task fail.
+    /// The build each task runs, to settle it should the task fail, or land its PR once open.
     running: HashMap<tokio::task::Id, (Lane, Task)>,
     /// When each workspace may be asked for a task again.
     asleep: HashMap<u64, Instant>,
@@ -177,16 +206,16 @@ struct State {
     failed: Option<anyhow::Error>,
 }
 
-/// The claim loop: fills free slots with tasks, round the workspaces.
+/// The claim loop: fills free slots with tasks, round the workspaces, and lands the PRs they
+/// open.
 struct Slots {
     lanes: Vec<Lane>,
     builder: Builder,
-    slots: usize,
     poll: Duration,
 }
 
 impl Slots {
-    async fn run(self, stop: impl Future<Output = ()>) -> Result<()> {
+    async fn run(self, resumed: Vec<(Lane, Task)>, stop: impl Future<Output = ()>) -> Result<()> {
         let (stopping, stop_rx) = watch::channel(false);
         let mut state = State {
             builds: JoinSet::new(),
@@ -195,6 +224,9 @@ impl Slots {
             next: 0,
             failed: None,
         };
+        for (lane, task) in resumed {
+            self.land(&mut state, &stop_rx, lane, task);
+        }
         tokio::pin!(stop);
         loop {
             if !*stopping.borrow()
@@ -206,13 +238,22 @@ impl Slots {
             if *stopping.borrow() && state.builds.is_empty() {
                 break;
             }
-            let wake = wake(&state.asleep, state.builds.len() < self.slots, self.poll);
+            let slots = &self.builder.slots;
+            let free = slots.available_permits() > 0;
+            let wake = wake(&state.asleep, free, self.poll);
             tokio::select! {
                 Some(done) = state.builds.join_next_with_id() => {
                     let ended = match done {
                         Ok((id, ended)) => {
-                            state.running.remove(&id);
-                            ended.map(drop)
+                            let ran = state.running.remove(&id);
+                            match (ended, ran) {
+                                (Ok(Ended::Opened(pr)), Some((lane, mut task))) => {
+                                    task.pr = Some(pr);
+                                    self.land(&mut state, &stop_rx, lane, task);
+                                    Ok(())
+                                }
+                                (ended, _) => ended.map(drop),
+                            }
                         }
                         Err(e) => match state.running.remove(&e.id()) {
                             Some((lane, task)) => {
@@ -228,8 +269,10 @@ impl Slots {
                     }
                 }
                 () = sleep_until(wake), if !*stopping.borrow() => {}
+                // A landing's agent gave its slot back.
+                _ = slots.acquire(), if !free && !*stopping.borrow() => {}
                 () = &mut stop, if !*stopping.borrow() => {
-                    eprintln!("mergeloop: stopping: giving back what it holds");
+                    eprintln!("mergeloop: stopping: giving back the builds without a PR");
                     stopping.send_replace(true);
                 }
             }
@@ -237,10 +280,20 @@ impl Slots {
         state.failed.map_or(Ok(()), Err)
     }
 
+    /// Lands the PR of `task` from `lane`, holding no slot while it waits.
+    fn land(&self, state: &mut State, stop: &watch::Receiver<bool>, lane: Lane, task: Task) {
+        let (builder, stop) = (self.builder.clone(), stop.clone());
+        let (l, t) = (lane.clone(), task.clone());
+        let spawned = state
+            .builds
+            .spawn(async move { builder.land(&l, &t, stop).await });
+        state.running.insert(spawned.id(), (lane, task));
+    }
+
     /// Claims tasks round the workspaces that are awake, until every slot is taken or none is
     /// awake. An error only when the sign-in is no good.
     async fn fill(&self, state: &mut State, stop: &watch::Receiver<bool>) -> Result<()> {
-        while state.builds.len() < self.slots {
+        while let Ok(slot) = self.builder.slots.clone().try_acquire_owned() {
             let now = Instant::now();
             let Some(lane) = (0..self.lanes.len())
                 .map(|i| &self.lanes[(state.next + i) % self.lanes.len()])
@@ -250,12 +303,15 @@ impl Slots {
             };
             state.next = (state.next + 1) % self.lanes.len();
             match self.claim(lane).await {
+                // Claimed with its PR, from a holder that went quiet or gave it back.
+                Ok(Some(task)) if task.pr.is_some() => self.land(state, stop, lane.clone(), task),
                 Ok(Some(task)) => {
                     let (builder, stop) = (self.builder.clone(), stop.clone());
                     let (l, t) = (lane.clone(), task.clone());
-                    let spawned = state
-                        .builds
-                        .spawn(async move { builder.build(&l, &t, stop).await });
+                    let spawned = state.builds.spawn(async move {
+                        let _slot = slot;
+                        builder.build(&l, &t, stop).await
+                    });
                     state.running.insert(spawned.id(), (lane.clone(), task));
                 }
                 Ok(None) => _ = state.asleep.insert(lane.workspace, now + self.poll),
@@ -269,8 +325,7 @@ impl Slots {
         Ok(())
     }
 
-    /// A task to build from `lane`, or none for now. A task that already has its PR is given
-    /// back: landing it is not this daemon's yet.
+    /// A task to build, or to land, from `lane`, or none for now.
     async fn claim(&self, lane: &Lane) -> Result<Option<Task>> {
         let task = match lane.claim().await {
             Ok(task) => task,
@@ -280,14 +335,6 @@ impl Slots {
         let Some(task) = task else {
             return Ok(None);
         };
-        if let Some(pr) = task.pr {
-            eprintln!(
-                "mergeloop: build {} ({}#{}) has PR #{pr}: giving it back, landing is not built yet",
-                task.build, task.repo, task.issue
-            );
-            lane.release(&task, None).await?;
-            return Ok(None);
-        }
         eprintln!(
             "mergeloop: build {} ({}#{}): claimed: {}",
             task.build, task.repo, task.issue, task.title

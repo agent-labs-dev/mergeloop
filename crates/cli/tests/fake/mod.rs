@@ -36,6 +36,16 @@ pub struct Lane {
     /// Refusals to answer once each, in place of the tool's answer: the tool, the refusal's
     /// kind as `_meta.refusal` names it, its status, and its text.
     pub refusals: Vec<(String, String, u16, String)>,
+    /// The needs `next_need` gives a daemon for each PR, in order, each once. Then it waits.
+    pub needs: HashMap<u64, VecDeque<Value>>,
+    /// Each `report_build`: the build, and its standing.
+    pub reports: Vec<(u64, String)>,
+    /// What `get_build_task` gives for each build.
+    pub held_tasks: HashMap<u64, Value>,
+    /// The PR's review threads, as GitHub's GraphQL lists them: id, resolved.
+    pub threads: Vec<(String, bool)>,
+    /// Each call to GitHub's GraphQL: its bearer, query and variables.
+    pub graphql: Vec<(String, String, Value)>,
 }
 
 impl Lane {
@@ -43,6 +53,16 @@ impl Lane {
     pub fn ended(&self) -> usize {
         self.opened.len() + self.released.len()
     }
+
+    /// Whether a build was reported merged.
+    pub fn merged(&self, build: u64) -> bool {
+        self.reports.iter().any(|r| *r == (build, "merged".into()))
+    }
+}
+
+/// A need as `next_need` gives it.
+pub fn need(needs: &str, id: &str, brief: &str) -> Value {
+    json!({ "needs": needs, "id": id, "brief": brief, "exit_code": 0 })
 }
 
 #[derive(Default)]
@@ -72,6 +92,7 @@ impl Server {
             .route("/oauth/authorize", get(authorize))
             .route("/oauth/token", post(token))
             .route("/mcp", post(mcp))
+            .route("/graphql", post(graphql))
             .route("/auth/logout", post(logout))
             .with_state(seen.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -113,6 +134,12 @@ impl Server {
             .filter(|((_, t), _)| t == tool)
             .map(|(_, a)| a.clone())
             .collect()
+    }
+
+    /// Scripts the needs `next_need` gives a daemon for PR `pr`.
+    pub fn script(&self, pr: u64, needs: Vec<Value>) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.lane.needs.insert(pr, needs.into());
     }
 
     /// Adds a task for `claim_build` to give.
@@ -187,8 +214,27 @@ fn bearer(headers: &HeaderMap) -> String {
         .to_owned()
 }
 
-/// A tool's answer says which tool ran, and whether as a sign-in or a GitHub token.
+/// A tool's answer says which tool ran, and whether as a sign-in or a GitHub token. A daemon
+/// that asks for a need when none is scripted waits a moment, as the server would wait longer.
 async fn mcp(State(seen): Shared, headers: HeaderMap, Json(message): Json<Value>) -> Response {
+    let args = &message["params"]["arguments"];
+    if message["params"]["name"] == "next_need" && args["for_daemon"] == true {
+        let number = args["number"].as_u64().unwrap_or_default();
+        let scripted = seen
+            .lock()
+            .unwrap()
+            .lane
+            .needs
+            .get(&number)
+            .is_some_and(|needs| !needs.is_empty());
+        if !scripted {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    answer(seen, headers, message)
+}
+
+fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Response {
     let bearer = bearer(&headers);
     let tool = message["params"]["name"]
         .as_str()
@@ -234,6 +280,36 @@ async fn mcp(State(seen): Shared, headers: HeaderMap, Json(message): Json<Value>
             seen.lane.opened.push((build, said("title"), said("body")));
             json!({ "id": build, "status": "landing", "pr": 100 + build })
         }
+        "next_need" if args["for_daemon"] == true => {
+            let number = args["number"].as_u64().unwrap_or_default();
+            let next = seen
+                .lane
+                .needs
+                .get_mut(&number)
+                .and_then(VecDeque::pop_front);
+            next.unwrap_or_else(|| {
+                need(
+                    "wait",
+                    args["after"].as_str().unwrap_or("w"),
+                    "Nothing for you yet",
+                )
+            })
+        }
+        "report_build" => {
+            let build = args["build"].as_u64().unwrap_or_default();
+            let standing = args["standing"].as_str().unwrap_or_default().to_owned();
+            seen.lane.reports.push((build, standing));
+            json!({ "id": build })
+        }
+        "get_build_task" => {
+            let build = args["build"].as_u64().unwrap_or_default();
+            seen.lane
+                .held_tasks
+                .get(&build)
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+        "queue_pull" => json!({ "message": "queued" }),
         "release_build" => {
             let build = args["build"].as_u64().unwrap_or_default();
             let stuck = args["stuck"].as_str().map(str::to_owned);
@@ -251,6 +327,35 @@ async fn mcp(State(seen): Shared, headers: HeaderMap, Json(message): Json<Value>
     let result =
         json!({ "content": [{ "type": "text", "text": text.to_string() }], "isError": false });
     Json(json!({ "jsonrpc": "2.0", "id": message["id"], "result": result })).into_response()
+}
+
+/// GitHub's GraphQL, as far as the daemon reaches it: a PR's review threads, a reply in one, and
+/// resolving one.
+async fn graphql(State(seen): Shared, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let mut seen = seen.lock().unwrap();
+    let query = body["query"].as_str().unwrap_or_default().to_owned();
+    let vars = body["variables"].clone();
+    seen.lane
+        .graphql
+        .push((bearer(&headers), query.clone(), vars.clone()));
+    let data = if query.contains("reviewThreads") {
+        let nodes: Vec<Value> = seen
+            .lane
+            .threads
+            .iter()
+            .map(|(id, resolved)| json!({ "id": id, "isResolved": resolved }))
+            .collect();
+        json!({ "repository": { "pullRequest": { "reviewThreads": { "nodes": nodes } } } })
+    } else if query.contains("resolveReviewThread") {
+        let id = vars["thread"].as_str().unwrap_or_default();
+        for thread in seen.lane.threads.iter_mut().filter(|t| t.0 == id) {
+            thread.1 = true;
+        }
+        json!({ "resolveReviewThread": { "thread": { "id": id } } })
+    } else {
+        json!({ "addPullRequestReviewThreadReply": { "comment": { "id": "c" } } })
+    };
+    Json(json!({ "data": data })).into_response()
 }
 
 async fn logout(State(seen): Shared, headers: HeaderMap) -> StatusCode {

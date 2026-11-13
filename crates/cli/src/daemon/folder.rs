@@ -143,6 +143,37 @@ impl Folder {
         })
     }
 
+    /// A fresh room for the task's PR, its tree at the PR's branch as GitHub has it now: fetched
+    /// with `token`. A push replaces only that head.
+    pub async fn checkout_pr(&self, task: &Task, token: &str) -> Result<Checkout> {
+        let clone = self.clone_of(&task.repo);
+        let lock = self.clone_lock(&clone);
+        let _held = lock.lock().await;
+        if !clone.join("HEAD").exists() {
+            Git.ensure_cache(&clone, &task.clone_url).await?;
+        }
+        let pushed = format!("refs/remotes/origin/{}", task.branch);
+        Git.fetch(
+            &clone,
+            token,
+            &[&format!("+refs/heads/{}:{pushed}", task.branch)],
+        )
+        .await?;
+        let head = Git.run(&clone, &["rev-parse", &pushed]).await?;
+        let room = self.room(task.build);
+        self.remove_locked(&clone, &room.root, &task.branch).await?;
+        tokio::fs::create_dir_all(room.tmp()).await?;
+        let tree = Git
+            .add_tree(&clone, &room.tree, &task.branch, &pushed)
+            .await?;
+        Ok(Checkout {
+            clone,
+            room,
+            tree,
+            remote: Some(head.trim().to_owned()),
+        })
+    }
+
     /// Removes the build's room and its local branch. Nothing there is fine.
     pub async fn remove(&self, task: &Task) -> Result<()> {
         let clone = self.clone_of(&task.repo);

@@ -3,20 +3,25 @@
 //! co-author, pushes with a minted token, and has the server open the PR. However it ends, the
 //! worktree and branch go, and the server hears how it ended.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use mergepatrol_git::Git;
 use mergepatrol_resolver::{
-    Access, BuildRequest, LocalAgent, Outcome, Resolution, VerifyFailed, build_description,
+    Access, BuildRequest, Env, LocalAgent, Outcome, Resolution, VerifyFailed, build_description,
     build_prompt, commit_subject,
 };
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
+use super::env;
 use super::folder::{Checkout, Folder};
 use super::lane::{Lane, Stage, Task};
 use super::verify;
-use crate::client::{Refusal, needs_sign_in, refusal};
+use crate::client::{Refusal, Refused, needs_sign_in, refusal};
+
+/// How many times `open_build_pr` is called again when it says to.
+const OPEN_RETRIES: u32 = 3;
 
 /// The longest reason a stuck build gives: it goes on the issue as a comment.
 const REASON_MAX: usize = 3000;
@@ -29,6 +34,14 @@ pub struct Builder {
     pub access: Access,
     /// How often a build tells the server it is alive. The server lets 30 minutes pass.
     pub heartbeat_every: Duration,
+    /// How long to wait before calling again what said to, or what failed.
+    pub pause: Duration,
+    /// The slots: an agent runs only while it holds one.
+    pub slots: Arc<Semaphore>,
+    /// For GitHub's API, as the App's bot.
+    pub http: reqwest::Client,
+    /// GitHub's API: `https://api.github.com`, or a test's.
+    pub github: String,
     /// Runs in each build once its room is made: for tests.
     pub in_room: Option<InRoom>,
 }
@@ -47,20 +60,21 @@ pub enum Ended {
     GivenBack(String),
     /// Ended without a word to the server, which no longer has it for this daemon.
     Dropped(String),
-    /// Its PR merged before the daemon was done opening it.
+    /// Its PR merged.
     Merged,
 }
 
 /// What the work itself came to, before the server hears of it.
 #[derive(Debug)]
-enum Work {
+pub(super) enum Work {
     Opened(u64),
     Stuck(String),
+    Merged,
 }
 
 /// The daemon was stopped.
 #[derive(Debug)]
-struct Stopped;
+pub(super) struct Stopped;
 
 impl std::fmt::Display for Stopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -92,7 +106,11 @@ impl Builder {
     /// Settles a build whose task failed, as when the daemon has a bug: released as stuck, saying
     /// so, and cleaned up. An error only when the sign-in is no good.
     pub async fn failed(&self, lane: &Lane, task: &Task, why: &str) -> Result<()> {
-        let why = format!("The daemon failed while building it: {why}");
+        let doing = match task.stage() {
+            Stage::Building => "building it",
+            Stage::Landing => "landing its PR",
+        };
+        let why = format!("The daemon failed while {doing}: {why}");
         say(task, &why);
         let settled = settle(lane, task, Ok(Work::Stuck(why))).await;
         self.clean_up(task).await;
@@ -125,24 +143,55 @@ impl Builder {
             task,
             &format!("building in {}", checkout.room.tree.display()),
         );
-        let run = match self.change(task, &checkout).await? {
+        let prompt = |failed: Option<&VerifyFailed>| {
+            build_prompt(&BuildRequest {
+                repo: &task.repo,
+                issue: task.issue,
+                title: &task.title,
+                body: &task.body,
+                verify: &task.verify,
+                failed,
+            })
+        };
+        let env = env::nobody(&checkout.room);
+        let run = match self.change(task, &checkout, prompt, &env, "build").await? {
             Ok(run) => run,
             Err(why) => return Ok(Work::Stuck(why)),
         };
         // Ticket 07's review of the change goes here, before anything is pushed.
-        publish(lane, task, &checkout, &base, &run).await
+        self.publish(lane, task, &checkout, &base, &run).await
     }
 
     /// The agent's change, which the verify commands pass: the agent's last run that names its
-    /// commit. `Err` with why it is stuck when there is none.
-    async fn change(&self, task: &Task, checkout: &Checkout) -> Result<Result<Resolution, String>> {
+    /// commit. `prompt` is the agent's, given what failed in verify after its run, if anything
+    /// did. `Err` with why it is stuck when there is none.
+    pub(super) async fn change(
+        &self,
+        task: &Task,
+        checkout: &Checkout,
+        prompt: impl Fn(Option<&VerifyFailed>) -> String,
+        env: &Env,
+        step: &str,
+    ) -> Result<Result<Resolution, String>> {
         let room = &checkout.room;
-        let run = self.run_agent(task, checkout, None, "build").await?;
+        let run = self
+            .run_agent(task, checkout, &prompt(None), env, step)
+            .await?;
         if let Some(why) = stuck_by(&run.outcome) {
             return Ok(Err(why));
         }
         let groups = self.folder.groups();
-        let verify = || verify::run(&task.verify, room, &self.access, &groups, task.build);
+        let nobody = env::nobody(room);
+        let verify = || {
+            verify::run(
+                &task.verify,
+                room,
+                &self.access,
+                &nobody,
+                &groups,
+                task.build,
+            )
+        };
         let Some(failed) = verify().await? else {
             return Ok(Ok(run));
         };
@@ -150,7 +199,15 @@ impl Builder {
             task,
             &format!("`{}` failed: the agent fixes it", failed.command),
         );
-        let fix = self.run_agent(task, checkout, Some(&failed), "fix").await?;
+        let fix = self
+            .run_agent(
+                task,
+                checkout,
+                &prompt(Some(&failed)),
+                env,
+                &format!("{step}-fix"),
+            )
+            .await?;
         if let Some(why) = stuck_by(&fix.outcome) {
             return Ok(Err(why));
         }
@@ -172,17 +229,10 @@ impl Builder {
         &self,
         task: &Task,
         checkout: &Checkout,
-        failed: Option<&VerifyFailed>,
+        prompt: &str,
+        env: &Env,
         step: &str,
     ) -> Result<Resolution> {
-        let prompt = build_prompt(&BuildRequest {
-            repo: &task.repo,
-            issue: task.issue,
-            title: &task.title,
-            body: &task.body,
-            verify: &task.verify,
-            failed,
-        });
         let transcript = self
             .folder
             .transcripts(task.build)
@@ -191,7 +241,14 @@ impl Builder {
         let spawned = |pid| groups.track(task.build, pid);
         let run = self
             .agent
-            .run(&checkout.room, &prompt, &self.access, &transcript, spawned)
+            .run(
+                &checkout.room,
+                prompt,
+                &self.access,
+                env,
+                &transcript,
+                spawned,
+            )
             .await;
         // What the agent left running ends with its run.
         groups.stop(task.build).await?;
@@ -205,7 +262,7 @@ impl Builder {
 }
 
 /// Why the build is stuck, when the agent's run did not end with a change.
-fn stuck_by(outcome: &Outcome) -> Option<String> {
+pub(super) fn stuck_by(outcome: &Outcome) -> Option<String> {
     match outcome {
         Outcome::Resolved => None,
         Outcome::GaveUp(why) => Some(format!("The agent gave up: {why}")),
@@ -213,48 +270,82 @@ fn stuck_by(outcome: &Outcome) -> Option<String> {
     }
 }
 
-/// Commits the change as the App's bot, pushes it with a fresh token (the first may be near the
-/// end of its hour), and has the server open the PR.
-async fn publish(
-    lane: &Lane,
+impl Builder {
+    /// Commits the change as the App's bot, pushes it with a fresh token (the first may be near
+    /// the end of its hour), and has the server open the PR.
+    async fn publish(
+        &self,
+        lane: &Lane,
+        task: &Task,
+        checkout: &Checkout,
+        base: &str,
+        run: &Resolution,
+    ) -> Result<Work> {
+        let subject = commit_subject(&run.text)
+            .unwrap_or_else(|| format!("Build #{}: {}", task.issue, task.title));
+        let (bot, dev) = (&task.author, &task.co_author);
+        let message = format!(
+            "{subject}\n\nCo-authored-by: {} <{}>\n",
+            dev.name, dev.email
+        );
+        let author = (bot.name.as_str(), bot.email.as_str());
+        if !Git.squash(&checkout.tree, base, &message, author).await? {
+            return Ok(Work::Stuck("The agent changed nothing.".into()));
+        }
+        let head = Git.tree_head(&checkout.tree).await?;
+        let token = heard(lane, task, || lane.mint(task)).await?;
+        if !push(task, checkout, &token, &head).await? {
+            return Ok(Work::Stuck(format!(
+                "The branch {} changed on GitHub while the build ran, so the build did not push \
+             over it. Look at what is on it, then put the label on again to build anew.",
+                task.branch
+            )));
+        }
+        say(task, &format!("pushed {}", task.branch));
+        let description = build_description(&run.text);
+        let mut tries = 0;
+        let pr = loop {
+            match heard(lane, task, || lane.open_pr(task, &subject, &description)).await {
+                Err(e) if tries < OPEN_RETRIES && call_again(&e) => {
+                    tries += 1;
+                    say(task, &format!("{e:#}: calling again"));
+                    tokio::time::sleep(self.pause).await;
+                    lane.heartbeat(task, Stage::Building).await?;
+                }
+                opened => break opened?,
+            }
+        };
+        say(task, &format!("opened PR #{pr}"));
+        Ok(Work::Opened(pr))
+    }
+}
+
+/// Pushes `head` to the task's branch with `token`, leased on where the checkout saw the branch.
+/// `false` when the branch moved on GitHub since: that is someone's work, never pushed over.
+pub(super) async fn push(
     task: &Task,
     checkout: &Checkout,
-    base: &str,
-    run: &Resolution,
-) -> Result<Work> {
-    let subject = commit_subject(&run.text)
-        .unwrap_or_else(|| format!("Build #{}: {}", task.issue, task.title));
-    let (bot, dev) = (&task.author, &task.co_author);
-    let message = format!(
-        "{subject}\n\nCo-authored-by: {} <{}>\n",
-        dev.name, dev.email
-    );
-    let author = (bot.name.as_str(), bot.email.as_str());
-    if !Git.squash(&checkout.tree, base, &message, author).await? {
-        return Ok(Work::Stuck("The agent changed nothing.".into()));
-    }
-    let head = Git.tree_head(&checkout.tree).await?;
-    let token = heard(lane, task, || lane.mint(task)).await?;
-    // A branch that moved since checkout is someone's work: never pushed over.
+    token: &str,
+    head: &str,
+) -> Result<bool> {
     let seen = checkout.remote.as_deref().unwrap_or_default();
     let (clone, branch) = (&checkout.clone, &task.branch);
     if let Err(e) = Git
-        .push_leased(clone, &token, &task.clone_url, &head, branch, seen)
+        .push_leased(clone, token, &task.clone_url, head, branch, seen)
         .await
     {
-        if Git.remote_head(clone, &token, branch).await? != checkout.remote {
-            return Ok(Work::Stuck(format!(
-                "The branch {branch} changed on GitHub while the build ran, so the build did not \
-                 push over it. Look at what is on it, then put the label on again to build anew."
-            )));
+        if Git.remote_head(clone, token, branch).await? != checkout.remote {
+            return Ok(false);
         }
         return Err(e);
     }
-    say(task, &format!("pushed {}", task.branch));
-    let description = build_description(&run.text);
-    let pr = heard(lane, task, || lane.open_pr(task, &subject, &description)).await?;
-    say(task, &format!("opened PR #{pr}"));
-    Ok(Work::Opened(pr))
+    Ok(true)
+}
+
+/// Whether the server says to call again: GitHub refused part of it, or limits for now.
+fn call_again(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>()
+        .is_some_and(|r| matches!(r.status, Some(502 | 503)))
 }
 
 /// What the server must hear of how the work ended.
@@ -274,6 +365,7 @@ fn settlement(work: Result<Work>) -> Settle {
     let e = match work {
         Ok(Work::Opened(pr)) => return Settle::Nothing(Ended::Opened(pr)),
         Ok(Work::Stuck(why)) => return Settle::Release(Some(shorten(&why)), Ended::Stuck(why)),
+        Ok(Work::Merged) => return Settle::Merged,
         Err(e) => e,
     };
     let said = format!("{e:#}");
@@ -294,7 +386,7 @@ fn settlement(work: Result<Work>) -> Settle {
 }
 
 /// Tells the server how the work ended, and says how the build ended.
-async fn settle(lane: &Lane, task: &Task, work: Result<Work>) -> Result<Ended> {
+pub(super) async fn settle(lane: &Lane, task: &Task, work: Result<Work>) -> Result<Ended> {
     let (stuck, ended) = match settlement(work) {
         Settle::Nothing(ended) => return Ok(ended),
         Settle::Fatal(e) => {
@@ -321,14 +413,14 @@ async fn settle(lane: &Lane, task: &Task, work: Result<Work>) -> Result<Ended> {
 
 /// `call`'s answer, heartbeating and asking once more when the server went too long without a
 /// heartbeat: it acts only for a live claim.
-async fn heard<T, F: std::future::Future<Output = Result<T>>>(
+pub(super) async fn heard<T, F: std::future::Future<Output = Result<T>>>(
     lane: &Lane,
     task: &Task,
     call: impl Fn() -> F,
 ) -> Result<T> {
     match call().await {
         Err(e) if refusal(&e) == Some(Refusal::Unheard) => {
-            lane.heartbeat(task, Stage::Building).await?;
+            lane.heartbeat(task, task.stage()).await?;
             call().await
         }
         answered => answered,
@@ -336,21 +428,21 @@ async fn heard<T, F: std::future::Future<Output = Result<T>>>(
 }
 
 /// Heartbeats the build every `every`, until a heartbeat fails: that error.
-async fn heartbeats(lane: &Lane, task: &Task, every: Duration) -> anyhow::Error {
+pub(super) async fn heartbeats(lane: &Lane, task: &Task, every: Duration) -> anyhow::Error {
     loop {
         tokio::time::sleep(every).await;
-        if let Err(e) = lane.heartbeat(task, Stage::Building).await {
+        if let Err(e) = lane.heartbeat(task, task.stage()).await {
             return e;
         }
     }
 }
 
 /// Waits until `stop` turns true, or its sender goes.
-async fn stopped(mut stop: watch::Receiver<bool>) {
+pub(super) async fn stopped(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|stop| *stop).await;
 }
 
-fn shorten(why: &str) -> String {
+pub(super) fn shorten(why: &str) -> String {
     if why.len() <= REASON_MAX {
         return why.to_owned();
     }
@@ -361,7 +453,7 @@ fn shorten(why: &str) -> String {
     format!("{}…", &why[..end])
 }
 
-fn say(task: &Task, what: &str) {
+pub(super) fn say(task: &Task, what: &str) {
     eprintln!(
         "mergeloop: build {} ({}#{}): {what}",
         task.build, task.repo, task.issue

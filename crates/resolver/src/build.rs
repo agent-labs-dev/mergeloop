@@ -42,15 +42,10 @@ what you could not check."
 nothing until they do:\n{listed}"
         )
     };
-    let failed = match req.failed {
-        None => String::new(),
-        Some(f) => format!(
-            "\nYour earlier run left the change in this checkout, and `{}` failed on it. Fix the \
-change so it passes. The end of its output:\n```\n{}\n```\n",
-            f.command,
-            f.output.trim_end()
-        ),
-    };
+    let failed = req
+        .failed
+        .map(|f| format!("\n{}\n", failed_note(f)))
+        .unwrap_or_default();
     format!(
         "You are building a GitHub issue of {repo} in this checkout, a git worktree of its \
 default branch. MergeLoop opens a pull request with your change once it passes its checks.
@@ -71,6 +66,16 @@ before it a short description of the change for the pull request.
 If the issue cannot be built as asked, because it is unclear, needs a decision a human must \
 make, or needs access you do not have, stop and end your last message with a line \
 `{GIVE_UP} <reason>`."
+    )
+}
+
+/// What the agent's next run is told when a verify command failed on its change.
+pub fn failed_note(f: &VerifyFailed) -> String {
+    format!(
+        "Your earlier run left the change in this checkout, and `{}` failed on it. Fix the change \
+so it passes. The end of its output:\n```\n{}\n```",
+        f.command,
+        f.output.trim_end()
     )
 }
 

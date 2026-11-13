@@ -15,14 +15,14 @@ mod local;
 mod vote;
 
 pub use answers::{REPLY, RESOLVE, ThreadAnswers, thread_answers};
-pub use build::{BuildRequest, VerifyFailed, build_description, build_prompt};
+pub use build::{BuildRequest, VerifyFailed, build_description, build_prompt, failed_note};
 #[cfg(any(test, feature = "testing"))]
 pub use chatgpt::testing;
 pub use chatgpt::{ChatGptAuth, ChatGptLogin, DeviceLogin};
 pub use claude::ClaudeResolver;
 pub use codex::CodexResolver;
 pub use keys::{KeyCheck, check_api_key};
-pub use local::{Access, LocalAgent, Room, Vendor};
+pub use local::{Access, Env, LocalAgent, Room, Vendor};
 pub use vote::{DOES_NOT_HOLD, HOLDS, claim, vote};
 
 use std::path::Path;

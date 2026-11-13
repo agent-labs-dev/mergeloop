@@ -7,10 +7,10 @@ use mergepatrol_core::{Provider, Usage};
 use serde_json::Value;
 
 use crate::cli::{self, Ended};
+use crate::vote::verify_prompt;
 use crate::{
     FixRequest, Outcome, QuestionRequest, Resolution, ResolveRequest, Resolver, ReviewRequest,
     VerifyRequest, fix_prompt, gave_up, prompt, question_prompt, review_prompt,
-    vote::verify_prompt,
 };
 
 /// The environment variable Codex reads the API key from.

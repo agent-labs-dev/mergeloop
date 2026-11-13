@@ -332,7 +332,8 @@ impl Default for ReviewerFile {
 
 mod vendor {
     use mergepatrol_resolver::Vendor;
-    use serde::{Deserialize, Deserializer, de::Error};
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer};
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vendor, D::Error> {
         match String::deserialize(d)?.as_str() {

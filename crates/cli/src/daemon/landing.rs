@@ -221,7 +221,7 @@ impl Builder {
     ) -> Result<Option<String>> {
         lane.heartbeat(task, task.stage()).await?;
         let token = heard(lane, task, || lane.mint(task)).await?;
-        let checkout = self.folder.checkout_pr(task, &token).await?;
+        let checkout = self.folder.checkout_pr(task, &token, &self.access).await?;
         if let Some(in_room) = &self.in_room {
             in_room(task);
         }

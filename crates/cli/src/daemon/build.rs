@@ -134,7 +134,7 @@ impl Builder {
     async fn work(&self, lane: &Lane, task: &Task) -> Result<Work> {
         lane.heartbeat(task, Stage::Building).await?;
         let token = heard(lane, task, || lane.mint(task)).await?;
-        let checkout = self.folder.checkout(task, &token).await?;
+        let checkout = self.folder.checkout(task, &token, &self.access).await?;
         if let Some(in_room) = &self.in_room {
             in_room(task);
         }

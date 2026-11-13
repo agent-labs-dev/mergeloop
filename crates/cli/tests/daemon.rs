@@ -384,6 +384,7 @@ fn hostile(ws: &Path, fired: &Path, session: &Path) -> String {
         format!("printf '{trip}' > {clone}/hooks/post-commit && chmod +x {clone}/hooks/post-commit && echo hook wrote || echo hook denied"),
         format!("printf '{trip}' > {clone}/hooks/reference-transaction && echo ref-hook wrote || echo ref-hook denied"),
         format!("printf '[filter \"evil\"]\\n\\tclean = {fired}/clean\\n' >> {clone}/config && echo filter wrote || echo filter denied"),
+        format!("cd {clone}/worktrees/tree && (printf '[core]\\n\\tfsmonitor = {fired}/monitor\\n' >> config.worktree && echo worktree-config wrote || echo worktree-config denied)"),
         format!("rm -f {ws}/daemon/lock && echo lock wrote || echo lock denied"),
         format!("mkdir -p {ws}/builds/2/tree && echo other-build wrote || echo other-build denied"),
         format!("cat {session} && echo session wrote || echo session denied"),
@@ -398,16 +399,25 @@ fn hostile(ws: &Path, fired: &Path, session: &Path) -> String {
     .join("; ")
 }
 
+/// Whether `workspace` access can be confined here. A Linux machine may have no working
+/// bubblewrap, and the test is skipped, unless `MERGELOOP_REQUIRE_SANDBOX` is set, as on CI;
+/// macOS always has sandbox-exec.
+async fn sandboxed() -> bool {
+    let probe = mergepatrol_resolver::Access::workspace(&[]);
+    let Err(e) = mergeloop_cli::daemon::verify::check(&probe).await else {
+        return true;
+    };
+    if !cfg!(target_os = "linux") || std::env::var_os("MERGELOOP_REQUIRE_SANDBOX").is_some() {
+        panic!("{e:#}");
+    }
+    eprintln!("skipped: {e:#}");
+    false
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hostile_verify_command_writes_only_its_own_tree_and_reads_no_session() {
-    let probe = mergepatrol_resolver::Access::workspace(&[]);
-    if let Err(e) = mergeloop_cli::daemon::verify::check(&probe).await {
-        // A Linux runner may have no working bubblewrap; macOS always has sandbox-exec.
-        if !cfg!(target_os = "linux") {
-            panic!("{e:#}");
-        }
-        eprintln!("skipped: {e:#}");
+    if !sandboxed().await {
         return;
     }
     let w = World::new().await;
@@ -434,6 +444,7 @@ async fn a_hostile_verify_command_writes_only_its_own_tree_and_reads_no_session(
         "hook",
         "ref-hook",
         "filter",
+        "worktree-config",
         "lock",
         "other-build",
         "session",
@@ -464,6 +475,59 @@ async fn a_hostile_verify_command_writes_only_its_own_tree_and_reads_no_session(
         .map(|e| e.unwrap().file_name())
         .collect();
     assert!(ran.is_empty(), "ran {ran:?}");
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+/// Whether the repo at `repo` holds a blob of `content`.
+fn holds_blob(repo: &Path, content: &str) -> bool {
+    let hash = std::process::Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(content.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    let hash = String::from_utf8(hash.stdout).unwrap();
+    std::process::Command::new("git")
+        .args(["cat-file", "-e", hash.trim()])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_that_swaps_its_tree_for_a_link_to_a_denied_folder_is_stuck_and_pushes_none_of_it()
+{
+    if !sandboxed().await {
+        return;
+    }
+    let w = World::new().await;
+    let decoy = w.root().canonicalize().unwrap().join("decoy");
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::write(decoy.join("token"), "DECOY CREDENTIAL\n").unwrap();
+    // The last verify command passes, having put a link to the decoy where the tree was.
+    let swap = format!("cd .. && mv tree saved && ln -s {} tree", decoy.display());
+    w.fake.add_task(w.task(8, 18, &[&swap]));
+    let agent = w.agent("builder", "echo x > x.txt", BUILT);
+    let config = w.confined(&agent, std::slice::from_ref(&decoy));
+
+    w.run(config, |w| w.fake.lane(|l| l.ended() == 1)).await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    assert_eq!(released.len(), 1, "{released:?}");
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("replaced"), "{why}");
+    assert!(w.fake.lane(|l| l.opened.is_empty()));
+    assert!(w.pushed("mergeloop/build-18").is_none());
+    let clone = w.workspace().join("repos/o/r.git");
+    assert!(!holds_blob(&clone, "DECOY CREDENTIAL\n"), "the clone");
+    assert!(!holds_blob(&w.remote(), "DECOY CREDENTIAL\n"), "the remote");
     assert_eq!(w.left(), (vec![], vec![]));
 }
 
@@ -1173,6 +1237,45 @@ async fn a_restarted_daemon_lands_the_pr_it_holds_and_a_human_need_runs_no_agent
         (&json!(5), &json!(1), &json!("this-one"))
     );
     assert!(w.fake.lane(|l| l.released.is_empty()), "not given back");
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_need_whose_tree_is_swapped_for_a_link_to_a_denied_folder_is_stuck_and_pushes_none_of_it()
+{
+    if !sandboxed().await {
+        return;
+    }
+    let w = World::new().await;
+    let decoy = w.root().canonicalize().unwrap().join("decoy");
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::write(decoy.join("token"), "DECOY CREDENTIAL\n").unwrap();
+    w.held(5, 12, 105);
+    let swap = format!("cd .. && mv tree saved && ln -s {} tree", decoy.display());
+    w.fake
+        .seen
+        .lock()
+        .unwrap()
+        .lane
+        .held_tasks
+        .get_mut(&5)
+        .unwrap()["verify"] = json!([swap]);
+    w.fake
+        .script(105, vec![fake::need("threads", "t1", THREADS)]);
+    let agent = w.lander();
+    let config = w.confined(&agent, std::slice::from_ref(&decoy));
+
+    w.run(config, |w| w.fake.lane(|l| !l.released.is_empty()))
+        .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("replaced"), "{why}");
+    assert_eq!(w.runs(), 1);
+    let clone = w.workspace().join("repos/o/r.git");
+    assert!(!holds_blob(&clone, "DECOY CREDENTIAL\n"), "the clone");
+    assert!(!holds_blob(&w.remote(), "DECOY CREDENTIAL\n"), "the remote");
     assert_eq!(w.left(), (vec![], vec![]));
 }
 

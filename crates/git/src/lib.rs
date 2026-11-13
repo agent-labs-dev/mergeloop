@@ -1,6 +1,7 @@
 //! Local git, through the `git` CLI. MergeLoop never pushes: `fetch` is the only network call,
 //! and the `github` crate publishes the commits.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -20,12 +21,72 @@ pub struct Git;
 
 /// A worktree whose files someone else may have written, such as a build's agent. Git runs on
 /// it by its git dir, named here, never found through the tree's `.git`, which could point at a
-/// repo with hooks or config of its writer's. Make one with `Git::add_tree`.
+/// repo with hooks or config of its writer's; and only while the tree's root is the folder
+/// `Git::add_tree` made, so that its writer cannot point git at another folder to read. Make
+/// one with `Git::add_tree`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tree {
     /// The worktree's own git dir, in its clone's `worktrees/`.
     pub git_dir: PathBuf,
     pub work_tree: PathBuf,
+    /// The device and inode of the root as made. `None` only through `Tree::unpinned`.
+    root: Option<(u64, u64)>,
+    /// What git runs under, as `sandbox-exec -p <profile>`: none, git runs as it is.
+    under: Vec<OsString>,
+}
+
+/// The tree's root is no longer the folder `Git::add_tree` made: a link, or another folder.
+#[derive(Debug)]
+pub struct TreeReplaced(pub PathBuf);
+
+impl std::fmt::Display for TreeReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the worktree at {} was replaced since it was made, so git did not read it",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for TreeReplaced {}
+
+impl Tree {
+    /// The tree, with git run on it under `program`: its first item and the rest its
+    /// arguments, before `git`.
+    pub fn under(self, program: Vec<OsString>) -> Self {
+        Tree {
+            under: program,
+            ..self
+        }
+    }
+
+    /// The tree, without the check that its root is the folder made. For tests of what holds
+    /// without it.
+    #[doc(hidden)]
+    pub fn unpinned(self) -> Self {
+        Tree { root: None, ..self }
+    }
+
+    /// An error when the root is not the folder made.
+    fn check(&self) -> Result<()> {
+        let Some(made) = self.root else {
+            return Ok(());
+        };
+        let now = std::fs::symlink_metadata(&self.work_tree)
+            .ok()
+            .filter(|m| m.is_dir())
+            .map(|m| root_id(&m));
+        if now != Some(made) {
+            return Err(TreeReplaced(self.work_tree.clone()).into());
+        }
+        Ok(())
+    }
+}
+
+fn root_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -256,9 +317,12 @@ impl Git {
                 dir.display()
             );
         }
+        let root = std::fs::symlink_metadata(dir)?;
         Ok(Tree {
             git_dir,
             work_tree: dir.to_owned(),
+            root: Some(root_id(&root)),
+            under: vec![],
         })
     }
 
@@ -272,7 +336,7 @@ impl Git {
         message: &str,
         author: (&str, &str),
     ) -> Result<bool> {
-        let run = |args: &[&str]| output(self.on_tree(tree, args), "git");
+        let run = async |args: &[&str]| output(self.on_tree(tree, args)?, "git").await;
         run(&["reset", "-q", "--soft", base]).await?;
         run(&["add", "-A"]).await?;
         if run(&["diff", "--cached", "--quiet"]).await.is_ok() {
@@ -289,7 +353,7 @@ impl Git {
                 "-F",
                 "-",
             ],
-        );
+        )?;
         cmd.env("GIT_AUTHOR_NAME", author.0)
             .env("GIT_AUTHOR_EMAIL", author.1)
             .env("GIT_COMMITTER_NAME", author.0)
@@ -301,19 +365,22 @@ impl Git {
     /// The commit `tree` is at.
     pub async fn tree_head(&self, tree: &Tree) -> Result<String> {
         let out = output(
-            self.on_tree(tree, &["rev-parse", "--verify", "HEAD"]),
+            self.on_tree(tree, &["rev-parse", "--verify", "HEAD"])?,
             "git rev-parse",
         )
         .await?;
         Ok(String::from_utf8(out)?.trim().to_owned())
     }
 
-    fn on_tree(&self, tree: &Tree, args: &[&str]) -> tokio::process::Command {
+    /// `git args` on `tree`, by its git dir, under what the tree names; an error when the tree
+    /// was replaced. It starts in the git dir, so that not even its start follows the tree.
+    fn on_tree(&self, tree: &Tree, args: &[&str]) -> Result<tokio::process::Command> {
+        tree.check()?;
         let git_dir = format!("--git-dir={}", tree.git_dir.display());
         let work_tree = format!("--work-tree={}", tree.work_tree.display());
         let mut all = vec![git_dir.as_str(), work_tree.as_str()];
         all.extend(args);
-        self.git(&tree.work_tree, &all)
+        Ok(self.command(&tree.under, &tree.git_dir, &all))
     }
 
     pub async fn remove_worktree(&self, cache: &Path, dir: &Path) -> Result<()> {
@@ -717,9 +784,23 @@ impl Git {
     }
 
     /// Every git MergeLoop runs: with no hooks, whatever the repo or its config says, so that
-    /// nothing a repo's writer left there runs as MergeLoop.
+    /// nothing a repo's writer left there runs as MergeLoop. Git still reads the system's, the
+    /// user's and the repo's configuration, which repos need (git-lfs's filter): keeping a
+    /// tree's writer from writing any of it is the caller's.
     fn git(&self, cwd: &Path, args: &[&str]) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new("git");
+        self.command(&[], cwd, args)
+    }
+
+    /// `git`, run under `under` when it names a program.
+    fn command(&self, under: &[OsString], cwd: &Path, args: &[&str]) -> tokio::process::Command {
+        let mut cmd = match under {
+            [program, rest @ ..] => {
+                let mut cmd = tokio::process::Command::new(program);
+                cmd.args(rest).arg("git");
+                cmd
+            }
+            [] => tokio::process::Command::new("git"),
+        };
         cmd.current_dir(cwd)
             .kill_on_drop(true)
             .args(["-c", "core.hooksPath=/dev/null"])

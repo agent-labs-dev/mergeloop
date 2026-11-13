@@ -12,8 +12,11 @@
 //!   transcripts/<build>/      the agents' output, kept 7 days
 //! ```
 //!
-//! Nothing of the daemon's, nor any git metadata, is in a room: what a build runs cannot change
-//! what the daemon runs next. A build's room and branch go when the build ends, however it
+//! Nothing of the daemon's, nor any git metadata or configuration, is in a room: what a build
+//! runs cannot change what the daemon runs next. The daemon's git reads a build's tree only while
+//! its root is the folder made (`Tree`), and in `workspace` access under the verify commands'
+//! confinement (`verify::confine_tree`), so a tree pointed elsewhere gives it nothing denied to
+//! read. A build's room and branch go when the build ends, however it
 //! ends. Every removal is idempotent, and `reconcile` on start removes whatever a crash left of
 //! builds the daemon does not hold.
 
@@ -24,10 +27,11 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_git::{Git, Tree};
-use mergepatrol_resolver::Room;
+use mergepatrol_resolver::{Access, Room};
 
 use super::groups::Groups;
 use super::lane::Task;
+use super::verify;
 
 /// How long transcripts are kept.
 pub const TRANSCRIPTS_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -117,8 +121,8 @@ impl Folder {
     }
 
     /// A fresh room for the task, its tree on the task's branch at the default branch as GitHub
-    /// has it now: fetched with `token`.
-    pub async fn checkout(&self, task: &Task, token: &str) -> Result<Checkout> {
+    /// has it now: fetched with `token`. The daemon's git on the tree is confined to `access`.
+    pub async fn checkout(&self, task: &Task, token: &str, access: &Access) -> Result<Checkout> {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
@@ -134,6 +138,7 @@ impl Folder {
         let tree = Git
             .add_tree(&clone, &room.tree, &task.branch, &base)
             .await?;
+        let tree = verify::confine_tree(tree, &clone, access)?;
         let remote = Git.remote_head(&clone, token, &task.branch).await?;
         Ok(Checkout {
             clone,
@@ -144,8 +149,9 @@ impl Folder {
     }
 
     /// A fresh room for the task's PR, its tree at the PR's branch as GitHub has it now: fetched
-    /// with `token`. A push replaces only that head.
-    pub async fn checkout_pr(&self, task: &Task, token: &str) -> Result<Checkout> {
+    /// with `token`. A push replaces only that head. The daemon's git on the tree is confined to
+    /// `access`.
+    pub async fn checkout_pr(&self, task: &Task, token: &str, access: &Access) -> Result<Checkout> {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
@@ -166,6 +172,7 @@ impl Folder {
         let tree = Git
             .add_tree(&clone, &room.tree, &task.branch, &pushed)
             .await?;
+        let tree = verify::confine_tree(tree, &clone, access)?;
         Ok(Checkout {
             clone,
             room,

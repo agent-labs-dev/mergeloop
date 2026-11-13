@@ -443,6 +443,9 @@ impl GitHub for Cached<'_> {
     async fn pr_body(&self, repo: &RepoName, number: PrNumber) -> Result<String> {
         GitHub::pr_body(self.gh, repo, number).await
     }
+    async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32> {
+        GitHub::unresolved_threads(self.gh, repo, number).await
+    }
     async fn dismiss_reviews_marked(
         &self,
         repo: &RepoName,

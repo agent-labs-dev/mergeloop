@@ -810,7 +810,10 @@ async fn review_hold(
             // caught up. It runs again.
             Some(r) if r.head_sha == head && r.status != ReviewStatus::Stale => {
                 // The author resolved every thread of what it sent back to them: it goes on.
-                if resolved(&r, unresolved) && ctx.store.approve_resolved(r.id).await? {
+                if resolved(&r, unresolved)
+                    && none_open_now(gh, &key.repo, number).await
+                    && ctx.store.approve_resolved(r.id).await?
+                {
                     record(
                         ctx,
                         key,
@@ -917,6 +920,18 @@ async fn pass_review(
             format!("MergeLoop's review approves `{short}`: nothing it found holds this PR.");
         if let Err(e) = gh.approve(repo, pr.number, head, &body).await {
             tracing::warn!(%repo, pr = pr.number, error = %format!("{e:#}"), "could not approve the PR");
+        }
+    }
+}
+
+/// Whether GitHub has no unresolved thread on the PR now. The lane's read can predate the threads
+/// a review just posted, and would let it on before its author saw them.
+async fn none_open_now(gh: &dyn GitHub, repo: &RepoName, number: PrNumber) -> bool {
+    match gh.unresolved_threads(repo, number).await {
+        Ok(n) => n == 0,
+        Err(e) => {
+            tracing::warn!(%repo, pr = number, error = %format!("{e:#}"), "could not read the PR's unresolved threads");
+            false
         }
     }
 }

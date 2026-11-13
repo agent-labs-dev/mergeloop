@@ -940,6 +940,10 @@ struct Mem {
     events: Mutex<Vec<(PrNumber, String, String)>>,
     /// Each exit's PR, outcome, and title.
     exits: Mutex<Vec<(PrNumber, String, String)>>,
+    /// Each exit's PR, and its author's login as the history keeps it.
+    exit_authors: Mutex<Vec<(PrNumber, Option<String>)>>,
+    /// The PRs the build lane opened, each with the developer who holds its build.
+    builders: Mutex<Vec<(PrNumber, String)>>,
     config_error: Mutex<Option<String>>,
     /// What the queue last read of the repo: whether it is private, and its agent's tasks.
     repo_read: Mutex<Option<(bool, Vec<AgentTask>)>>,
@@ -1403,7 +1407,12 @@ impl Store for Mem {
     ) -> Result<Option<StepTimes>> {
         let exit = (pr, outcome.into(), summary.title.clone());
         self.exits.lock().unwrap().push(exit);
+        let author = summary.author.as_ref().map(|a| a.login.clone());
+        self.exit_authors.lock().unwrap().push((pr, author));
         Ok(None)
+    }
+    async fn builders(&self, _: u64, _: &RepoName) -> Result<Vec<(PrNumber, String)>> {
+        Ok(self.builders.lock().unwrap().clone())
     }
     async fn has_left(&self, _: &LaneKey, pr: PrNumber) -> Result<bool> {
         let events = self.events.lock().unwrap();
@@ -4886,9 +4895,18 @@ fn billed(run: &mut Run, plans: &Arc<Plans>) {
 }
 
 fn by(login: &str) -> mergepatrol_github::PrDetails {
+    opened_by(login, "User")
+}
+
+/// Opened by the App, as the build lane opens a PR.
+fn by_the_app() -> mergepatrol_github::PrDetails {
+    opened_by("mp[bot]", "Bot")
+}
+
+fn opened_by(login: &str, typename: &str) -> mergepatrol_github::PrDetails {
     serde_json::from_value(serde_json::json!({
         "url": "", "createdAt": "", "additions": 0, "deletions": 0, "changedFiles": 0,
-        "author": { "login": login, "avatarUrl": "", "__typename": "User" },
+        "author": { "login": login, "avatarUrl": "", "__typename": typename },
         "latestOpinionatedReviews": { "nodes": [] }, "reviewRequests": { "nodes": [] },
         "commits": null,
     }))
@@ -4951,6 +4969,105 @@ async fn a_public_repo_over_its_fair_use_waits_for_the_hour() {
         .collect();
     assert_eq!(kinds, [FairUse::Pr]);
     assert!(plans.seats.lock().unwrap().is_empty());
+}
+
+impl Run {
+    /// The login each exit of `number` was recorded under.
+    fn exit_authors(&self, number: PrNumber) -> Vec<Option<String>> {
+        let exits = self.store.exit_authors.lock().unwrap();
+        exits
+            .iter()
+            .filter(|(n, _)| *n == number)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    /// The build lane opened PR `number`, and `login` holds its build now.
+    fn built(&self, number: PrNumber, login: &str) {
+        let mut builders = self.store.builders.lock().unwrap();
+        builders.retain(|(n, _)| *n != number);
+        builders.push((number, login.into()));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_built_pr_is_its_developers_for_seats_and_history() {
+    let mut run = Run::new(Fake::new(|s| {
+        s.private = true;
+        for n in [1, 2] {
+            s.add_pr(n);
+            s.prs.get_mut(&n).unwrap().details = by_the_app();
+        }
+    }));
+    let plans = Arc::new(Plans::default());
+    billed(&mut run, &plans);
+    run.built(1, "bob");
+
+    assert!(matches!(run.tick().await, Ran::Idle));
+    // The PR the lane built takes its developer's seat; a PR another App opened takes none.
+    assert_eq!(*plans.seats.lock().unwrap(), ["bob"]);
+
+    plans.subscribe();
+    run.drain().await;
+    assert_eq!(run.merged(), [1, 2]);
+    assert_eq!(run.exit_authors(1), [Some("bob".to_owned())]);
+    assert_eq!(run.exit_authors(2), [Some("mp[bot]".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_developer_with_a_built_pr_and_their_own_takes_one_seat() {
+    let mut run = Run::new(Fake::new(|s| {
+        s.private = true;
+        s.add_pr(1);
+        s.prs.get_mut(&1).unwrap().details = by_the_app();
+        s.add_pr(2);
+        s.prs.get_mut(&2).unwrap().details = by("ada");
+    }));
+    let plans = Arc::new(Plans::default());
+    billed(&mut run, &plans);
+    run.built(1, "ada");
+
+    run.tick().await;
+    assert_eq!(*plans.seats.lock().unwrap(), ["ada"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pr_a_person_opened_stays_theirs_whatever_a_build_records() {
+    let mut run = Run::new(Fake::new(|s| {
+        s.private = true;
+        s.add_pr(1);
+        s.prs.get_mut(&1).unwrap().details = by("ada");
+    }));
+    let plans = Arc::new(Plans::default());
+    billed(&mut run, &plans);
+    run.built(1, "bob");
+
+    run.tick().await;
+    assert_eq!(*plans.seats.lock().unwrap(), ["ada"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_build_taken_over_counts_for_whoever_holds_it_when_the_count_is_made() {
+    let mut run = Run::new(Fake::new(|s| {
+        s.private = true;
+        s.add_pr(1);
+        s.prs.get_mut(&1).unwrap().details = by_the_app();
+    }));
+    let plans = Arc::new(Plans::default());
+    billed(&mut run, &plans);
+    run.built(1, "bob");
+
+    run.tick().await;
+    assert_eq!(*plans.seats.lock().unwrap(), ["bob"]);
+
+    // Carol takes the stale claim over before the PR merges: its exit is hers, and the seat
+    // it took when it joined stays Bob's, with none added for her.
+    run.built(1, "carol");
+    plans.subscribe();
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert_eq!(run.exit_authors(1), [Some("carol".to_owned())]);
+    assert_eq!(*plans.seats.lock().unwrap(), ["bob"]);
 }
 
 /// The settings that give `release` a queue.

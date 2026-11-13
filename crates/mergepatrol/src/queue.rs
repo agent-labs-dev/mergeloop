@@ -14,9 +14,9 @@ use mergepatrol_analytics::{Analytics, Exit};
 use mergepatrol_billing::Billing;
 use mergepatrol_core::{
     BatchStep, BuiltBatch, CHECKS_MISSING_FOR, CHECKS_TIMEOUT, Candidate, CheckFailure, ConfigPath,
-    EjectReason, EntryState, Event, Hold, Job, Lane, LaneChange, LayerHead, PendingMerge, Phase,
-    PrNumber, PrSummary, RECHECK_MESSAGE, RepoName, RepoSettings, ReviewSettings, ReviewStatus,
-    SpendTask, Transition, body_closing_commit_issues,
+    EjectReason, EntryState, Event, Hold, Job, Lane, LaneChange, LayerHead, PendingMerge, Person,
+    Phase, PrNumber, PrSummary, RECHECK_MESSAGE, RepoName, RepoSettings, ReviewSettings,
+    ReviewStatus, SpendTask, Transition, body_closing_commit_issues,
 };
 use mergepatrol_executor::protocol::{
     ApiAccess, BUNDLE_FILE, JobEvent, JobOutcome, JobSpec, MAX_BUNDLE_BYTES, ResolverSpec, Task,
@@ -157,10 +157,17 @@ pub struct Prs(std::sync::Mutex<HashMap<(u64, RepoName), HashMap<PrNumber, PrSum
 impl Prs {
     /// The PRs of the repo's lanes before they sync, so a PR that just left is still here, and
     /// the labeled PRs, so one that just joined is.
-    fn update(&self, installation: u64, repo: &RepoName, lanes: &[Lane], labeled: &[PullRequest]) {
+    fn update(
+        &self,
+        installation: u64,
+        repo: &RepoName,
+        lanes: &[Lane],
+        labeled: &[PullRequest],
+        builders: &Builders,
+    ) {
         let left = lanes.iter().flat_map(|lane| &lane.entries);
         let left = left.map(|e| (e.number, e.summary.clone()));
-        let labeled = labeled.iter().map(|pr| (pr.number, pr.summary()));
+        let labeled = labeled.iter().map(|pr| (pr.number, builders.summary(pr)));
         let prs = left.chain(labeled).collect();
         let mut map = self.0.lock().unwrap();
         map.insert((installation, repo.clone()), prs);
@@ -177,6 +184,38 @@ impl Prs {
     fn author(&self, key: &LaneKey, number: PrNumber) -> Option<String> {
         let author = self.get(key, number)?.author?;
         (!author.bot).then_some(author.login)
+    }
+}
+
+/// The developers behind the repo's PRs that the build lane opened, by PR. The App opens a built
+/// PR, so GitHub has the App's bot as its author: for seats and history it is the PR of the
+/// developer who holds its build when the count is made.
+#[derive(Default)]
+struct Builders(HashMap<PrNumber, String>);
+
+impl Builders {
+    async fn read(ctx: &Ctx, installation: u64, repo: &RepoName) -> Result<Self> {
+        Ok(Self(
+            ctx.store
+                .builders(installation, repo)
+                .await?
+                .into_iter()
+                .collect(),
+        ))
+    }
+
+    /// What the dashboard and the history show of `pr`: a PR the lane built is its developer's.
+    fn summary(&self, pr: &PullRequest) -> PrSummary {
+        let mut summary = pr.summary();
+        let by_an_app = summary.author.as_ref().is_some_and(|a| a.bot);
+        if let Some(login) = self.0.get(&pr.number).filter(|_| by_an_app) {
+            summary.author = Some(Person {
+                login: login.clone(),
+                avatar_url: format!("https://github.com/{login}.png"),
+                bot: false,
+            });
+        }
+        summary
     }
 }
 
@@ -627,6 +666,7 @@ struct RepoRead {
     /// The repo's lanes as saved, each with its trunk.
     lanes: Vec<(String, Lane)>,
     gate: Option<mergepatrol_billing::Hold>,
+    builders: Builders,
 }
 
 impl RepoRead {
@@ -710,7 +750,9 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     let units = units(gh, repo, &snap.labeled).await?;
     let layers: Vec<PullRequest> = units.iter().flat_map(|u| u.layers.clone()).collect();
     let saved: Vec<Lane> = lanes.iter().map(|(_, lane)| lane.clone()).collect();
-    ctx.prs.update(installation, repo, &saved, &layers);
+    let builders = Builders::read(ctx, installation, repo).await?;
+    ctx.prs
+        .update(installation, repo, &saved, &layers, &builders);
     let gate = match &ctx.billing {
         Some(b) => {
             b.gate(installation, &repo.owner, snap.private, unix_now())
@@ -757,6 +799,7 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
         units,
         lanes,
         gate,
+        builders,
     }))
 }
 
@@ -1254,11 +1297,11 @@ async fn sync_lane(
                     true => unit
                         .layers
                         .iter()
-                        .map(|pr| (pr.number, pr.summary()).into())
+                        .map(|pr| (pr.number, read.builders.summary(pr)).into())
                         .collect(),
                     false => Vec::new(),
                 },
-                ..unit.layers[0].summary()
+                ..read.builders.summary(&unit.layers[0])
             },
             layers: if unit.stacked { unit.prs() } else { Vec::new() },
             pin,
@@ -1300,7 +1343,8 @@ async fn sync_lane(
             LaneChange::Enqueued(n) => {
                 if let Some(b) = &ctx.billing {
                     let unit = units.iter().find(|u| u.number == n);
-                    let authors = unit.map(|u| u.authors()).unwrap_or_default();
+                    let authors = unit.map(|u| u.authors(&read.builders));
+                    let authors = authors.unwrap_or_default();
                     b.queued(installation, snap.private, &authors, unix_now())
                         .await?;
                 }
@@ -1433,12 +1477,13 @@ impl Unit {
         self.layers.iter().any(|pr| pr.has_label(label))
     }
 
-    /// The people who opened its PRs: no App, nor a deleted account.
-    fn authors(&self) -> Vec<String> {
+    /// The people whose PRs it has: who opened them, or the developer behind a PR the lane
+    /// built. No App, nor a deleted account.
+    fn authors(&self, builders: &Builders) -> Vec<String> {
         let mut authors: Vec<String> = self
             .layers
             .iter()
-            .filter_map(|pr| pr.summary().author)
+            .filter_map(|pr| builders.summary(pr).author)
             .filter(|a| !a.bot)
             .map(|a| a.login)
             .collect();

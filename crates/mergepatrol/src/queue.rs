@@ -2924,11 +2924,7 @@ async fn run_job(
                 record_all(ctx, key, &prs, "rebasing", &format!("onto {}", key.trunk)).await?;
                 let comment = format!("Rebasing onto `{}`.", key.trunk);
                 comment_all(gh, repo, &prs, &comment).await?;
-                let conflicts = match agent {
-                    true => Conflicts::Resolve,
-                    false => Conflicts::Leave,
-                };
-                let event = sandbox.rebase(at, &now, conflicts).await?;
+                let event = sandbox.rebase(at, &now, Conflicts::when(agent)).await?;
                 if event == Event::RebaseConflict {
                     ctx.prep
                         .conflicted(key, unit.number, &now.top().head_ref_oid);
@@ -3183,6 +3179,16 @@ enum Runs {
 enum Conflicts {
     Resolve,
     Leave,
+}
+
+impl Conflicts {
+    /// `Resolve` where the `agent` may run.
+    fn when(agent: bool) -> Self {
+        match agent {
+            true => Conflicts::Resolve,
+            false => Conflicts::Leave,
+        }
+    }
 }
 
 /// The jobs that change a unit's branches, and publish the result to them.

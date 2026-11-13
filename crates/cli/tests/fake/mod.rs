@@ -89,6 +89,12 @@ pub fn rename(to: &str, clone_url: &str) -> Value {
     json!({ "rename": to, "clone_url": clone_url })
 }
 
+/// `rename`, moving only `builds`: the old name's other builds are of another repo, as when two
+/// repos swap names.
+pub fn rename_builds(to: &str, clone_url: &str, builds: &[u64]) -> Value {
+    json!({ "rename": to, "clone_url": clone_url, "builds": builds })
+}
+
 #[derive(Default)]
 pub struct Seen {
     /// Each `/mcp` call: its bearer and tool.
@@ -325,11 +331,23 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
             let next = lane.needs.get_mut(&number).and_then(VecDeque::pop_front);
             if let Some(to) = next.as_ref().and_then(|n| n["rename"].as_str()) {
                 let old = args["repo"].as_str().unwrap_or_default().to_owned();
-                for task in lane.held_tasks.values_mut().filter(|t| t["repo"] == old) {
+                let rename = next.as_ref().unwrap();
+                let moves = |build: &u64| match rename["builds"].as_array() {
+                    Some(only) => only.contains(&Value::from(*build)),
+                    None => true,
+                };
+                for (_, task) in lane
+                    .held_tasks
+                    .iter_mut()
+                    .filter(|(b, t)| t["repo"] == old && moves(b))
+                {
                     task["repo"] = to.into();
-                    task["clone_url"] = next.as_ref().unwrap()["clone_url"].clone();
+                    task["clone_url"] = rename["clone_url"].clone();
                 }
-                lane.gone.insert(old.clone());
+                if rename["builds"].is_null() {
+                    lane.gone.insert(old.clone());
+                }
+                lane.gone.remove(to);
                 return not_found(&message, &old);
             }
             if let Some(next) = next {

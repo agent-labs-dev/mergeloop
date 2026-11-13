@@ -1347,6 +1347,53 @@ impl World {
         self.agent("lander", &body, BUILT)
     }
 
+    /// `lander`, holding build `waits`'s agent until build `first`'s is running, and `first`'s
+    /// until `gate` opens the gate.
+    fn gated(&self, first: u64, waits: u64) -> PathBuf {
+        let (entered, go) = (self.root().join("in"), self.root().join("go"));
+        let worked = self.output("worked", WORKED);
+        let body = format!(
+            "case \"$PWD\" in\n\
+             */builds/{first}/*) touch '{i}'; while [ ! -f '{g}' ]; do sleep 0.05; done;;\n\
+             */builds/{waits}/*) while [ ! -f '{i}' ]; do sleep 0.05; done;;\n\
+             esac\n\
+             case \"$prompt\" in '{THREADS}') echo checked >> feature.txt; cat '{w}'; exit 0;; esac\n\
+             echo built > feature.txt",
+            i = entered.display(),
+            g = go.display(),
+            w = worked.display(),
+        );
+        self.agent("gated", &body, BUILT)
+    }
+
+    /// Opens the gate of `gated` once `opener` merged or any build is stuck; then whether every
+    /// one of `builds` merged, or any is stuck.
+    fn gate(&self, opener: u64, builds: &[u64]) -> bool {
+        let (opened, done) = self.fake.lane(|l| {
+            let stuck = !l.released.is_empty();
+            (
+                stuck || l.merged(opener),
+                stuck || builds.iter().all(|b| l.merged(*b)),
+            )
+        });
+        if opened {
+            std::fs::write(self.root().join("go"), "").unwrap();
+        }
+        done
+    }
+
+    /// The names in `repos/o` of the workspace folder, sorted.
+    fn clones(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.workspace().join("repos/o"))
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     fn tokens(&self) -> Vec<String> {
         let tokens = std::fs::read_to_string(self.root().join("tokens")).unwrap_or_default();
         tokens.lines().map(str::to_owned).collect()
@@ -1708,6 +1755,7 @@ async fn a_repo_renamed_while_its_pr_lands_is_landed_under_its_new_name() {
     w.fake.script(
         105,
         vec![
+            fake::need("threads", "t0", THREADS),
             fake::rename("o/new", moved.to_str().unwrap()),
             fake::need("threads", "t1", THREADS),
             fake::need("merged", "m1", "#105 merged."),
@@ -1726,13 +1774,126 @@ async fn a_repo_renamed_while_its_pr_lands_is_landed_under_its_new_name() {
     assert_eq!(asked.last().unwrap()["repo"], "o/new");
     assert_eq!(
         git(&w.remote(), &["show", "mergeloop/build-12:feature.txt"]),
-        "checked\n"
+        "checked\nchecked\n"
     );
     let clone = w.workspace().join("repos/o/new.git");
     assert_eq!(
         git(&clone, &["remote", "get-url", "origin"]).trim(),
         moved.to_str().unwrap()
     );
+    assert_eq!(w.clones(), ["new.git"], "no clone under the old name");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_repos_old_clone_stays_while_a_build_runs_in_it_and_goes_after() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.held(6, 13, 106);
+    let moved = w.root().join("moved.git");
+    std::os::unix::fs::symlink(w.remote(), &moved).unwrap();
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    // Build 5 learns of the rename while build 6's agent runs in the old clone.
+    w.fake.script(
+        105,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::rename("o/new", moved.to_str().unwrap()),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    w.fake.script(
+        106,
+        vec![
+            fake::need("threads", "t2", THREADS),
+            fake::need("merged", "m2", "#106 merged."),
+        ],
+    );
+    let agent = w.gated(6, 5);
+
+    w.run(w.config(2, &agent), |w| w.gate(5, &[5, 6])).await;
+
+    assert_eq!(w.fake.lane(|l| l.released.clone()), [], "not stuck");
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-13:feature.txt"]),
+        "checked\n",
+        "build 6 pushed from the old clone"
+    );
+    assert_eq!(
+        w.clones(),
+        Vec::<String>::new(),
+        "no clone under the old name"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_repos_that_swap_names_lose_no_clone_a_build_runs_in() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.held(6, 13, 106);
+    // Build 6 is of another repo, `o/s`, at another URL.
+    let other = w.root().join("other.git");
+    std::os::unix::fs::symlink(w.remote(), &other).unwrap();
+    let mut task = w.fake.lane(|l| l.held_tasks[&6].clone());
+    task["repo"] = "o/s".into();
+    task["clone_url"] = other.to_str().unwrap().into();
+    w.fake.seen.lock().unwrap().lane.held_tasks.insert(6, task);
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    let (r, s) = (w.remote(), other.clone());
+    // `o/r` becomes `o/s`, and works in `o/s`'s clone while build 6 still runs there; then
+    // `o/s` becomes `o/r`.
+    w.fake.script(
+        105,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::rename_builds("o/s", s.to_str().unwrap(), &[5]),
+            fake::need("threads", "t3", THREADS),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    w.fake.script(
+        106,
+        vec![
+            fake::need("threads", "t2", THREADS),
+            fake::rename_builds("o/r", r.to_str().unwrap(), &[6]),
+            fake::need("merged", "m2", "#106 merged."),
+        ],
+    );
+    let agent = w.gated(6, 5);
+
+    w.run(w.config(2, &agent), |w| w.gate(5, &[5, 6])).await;
+
+    assert_eq!(w.fake.lane(|l| l.released.clone()), [], "not stuck");
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-12:feature.txt"]),
+        "checked\nchecked\n"
+    );
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-13:feature.txt"]),
+        "checked\n",
+        "build 6 pushed from the clone build 5 moved into"
+    );
+    let asked: Vec<Value> = w.fake.args_of("next_need");
+    assert_eq!(asked.last().unwrap()["repo"], "o/r");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_start_a_renamed_repos_clone_and_one_half_removed_are_cleaned_up() {
+    let w = World::new().await;
+    w.mark();
+    let repos = w.workspace().join("repos/o");
+    std::fs::create_dir_all(&repos).unwrap();
+    let remote = w.remote();
+    let remote = remote.to_str().unwrap();
+    git(&repos, &["clone", "-q", "--bare", remote, "r.git"]);
+    git(&repos, &["clone", "-q", "--bare", remote, "old.git"]);
+    // A crash left the old name's clone marked, and another halfway through its removal.
+    std::fs::write(repos.join("old.git/mergeloop-renamed"), "o/r\n").unwrap();
+    git(&repos, &["clone", "-q", "--bare", remote, "older.git.gone"]);
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.claims() >= 1).await;
+
+    assert_eq!(w.clones(), ["r.git"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

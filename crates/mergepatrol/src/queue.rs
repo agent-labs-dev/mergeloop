@@ -1047,14 +1047,19 @@ async fn tick_lane(
         repo: repo.clone(),
         trunk: trunk.to_owned(),
     };
+    let at = LaneRead {
+        key: &key,
+        snap: &snap,
+        settings: &settings,
+    };
     let mut lane = read.lane(trunk);
     if let Some(merge) = lane.merging.clone() {
         let number = merge.number;
-        if resume_merge(ctx, &settings, gh, &key, &snap, &mut lane, &units, merge).await? {
+        if resume_merge(ctx, gh, at, &mut lane, &units, merge).await? {
             units.retain(|u| u.number != number);
         }
     }
-    sync_lane(ctx, gh, read, &snap, &key, &mut lane, &units, &[]).await?;
+    sync_lane(ctx, gh, read, at, &mut lane, &units, &[]).await?;
 
     // Jobs run inside the tick, so a job still active here was cut short by a restart. A single
     // PR runs again. A batch picks up where it was, unless what it tests changed: then it is
@@ -1098,17 +1103,7 @@ async fn tick_lane(
     lane.activate(number);
     ctx.store.save_lane(&key, &lane).await?;
 
-    let job = run_job(
-        ctx,
-        &settings,
-        &read.review,
-        gh,
-        sandbox,
-        &key,
-        &snap,
-        &mut lane,
-        &unit,
-    );
+    let job = run_job(ctx, gh, sandbox, at, &read.review, &mut lane, &unit);
     let outcome = match job.await {
         Ok(o) => o,
         // Not the PR's fault, and likely to pass: it stays active, so the next tick runs it again.
@@ -1186,7 +1181,12 @@ async fn sync_while_running(
             // or the next sync would find them and say nothing of them.
             let running = lane.active();
             let mut synced = lane.clone();
-            sync_lane(ctx, gh, &read, &snap, key, &mut synced, &units, &running).await?;
+            let at = LaneRead {
+                key,
+                snap: &snap,
+                settings: &read.settings,
+            };
+            sync_lane(ctx, gh, &read, at, &mut synced, &units, &running).await?;
             *lane = synced;
             continue;
         }
@@ -1199,7 +1199,12 @@ async fn sync_while_running(
             trunk: trunk.clone(),
             ..key.clone()
         };
-        sync_lane(ctx, gh, &read, &snap, &other_key, &mut other, &units, &[]).await?;
+        let at = LaneRead {
+            key: &other_key,
+            snap: &snap,
+            settings: &read.settings,
+        };
+        sync_lane(ctx, gh, &read, at, &mut other, &units, &[]).await?;
     }
     Ok(())
 }
@@ -1207,21 +1212,23 @@ async fn sync_while_running(
 /// Makes the lane match `units`, the labeled PRs and stacks that merge into its trunk: each
 /// joins, waits, goes on hold or leaves, with an event and a comment, and the lane is saved. The
 /// entries of `running`, a job's that is under way, stay as they are.
-#[allow(clippy::too_many_arguments)]
 async fn sync_lane(
     ctx: &Ctx,
     gh: &dyn GitHub,
     read: &RepoRead,
-    snap: &RepoSnapshot,
-    key: &LaneKey,
+    at: LaneRead<'_>,
     lane: &mut Lane,
     units: &[Unit],
     running: &[PrNumber],
 ) -> Result<()> {
+    let LaneRead {
+        key,
+        snap,
+        settings,
+    } = at;
     let installation = key.installation_id;
     let repo = &key.repo;
     let trunk = key.trunk.as_str();
-    let settings = &read.settings;
     let gate = read.gate.clone();
     let labels = settings.labels();
     let units: Vec<&Unit> = units
@@ -1967,7 +1974,8 @@ async fn finish(
     lane.merging = None;
     match outcome {
         Outcome::Merged(sha) => {
-            merged(ctx, settings, gh, key, lane, unit.number, &prs, &sha).await?
+            lane.remove(unit.number);
+            merged(ctx, settings, gh, key, &prs, &sha).await?
         }
         Outcome::Ejected(reason) => {
             lane.eject(unit.number);
@@ -2011,19 +2019,15 @@ async fn finish(
 }
 
 /// The entry `number` merged as `sha`, with its PRs `prs`.
-#[allow(clippy::too_many_arguments)]
 async fn merged(
     ctx: &Ctx,
     settings: &RepoSettings,
     gh: &dyn GitHub,
     key: &LaneKey,
-    lane: &mut Lane,
-    number: PrNumber,
     prs: &[PrNumber],
     sha: &str,
 ) -> Result<()> {
     let repo = &key.repo;
-    lane.remove(number);
     exit_once(ctx, key, prs, "merged", sha).await?;
     let labels = settings.labels();
     comment_all(gh, repo, prs, &format!("Merged as {sha}.")).await?;
@@ -2099,17 +2103,19 @@ async fn carry_layer(
 /// Sees through the merge a restart cut short, and whether it merged. Asked again while it is
 /// still open, GitHub waits for the merge pending, or merges it as the job would have. Otherwise
 /// it merged, or it left the queue unmerged.
-#[allow(clippy::too_many_arguments)]
 async fn resume_merge(
     ctx: &Ctx,
-    settings: &RepoSettings,
     gh: &dyn GitHub,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
+    at: LaneRead<'_>,
     lane: &mut Lane,
     units: &[Unit],
     merge: PendingMerge,
 ) -> Result<bool> {
+    let LaneRead {
+        key,
+        snap,
+        settings,
+    } = at;
     let repo = &key.repo;
     let open = units.iter().any(|u| {
         u.number == merge.number
@@ -2127,7 +2133,8 @@ async fn resume_merge(
     };
     lane.merging = None;
     if let Some(sha) = &sha {
-        merged(ctx, settings, gh, key, lane, merge.number, &merge.prs, sha).await?;
+        lane.remove(merge.number);
+        merged(ctx, settings, gh, key, &merge.prs, sha).await?;
     }
     ctx.store.save_lane(key, lane).await?;
     Ok(sha.is_some())
@@ -2824,18 +2831,20 @@ async fn eject(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_job(
     ctx: &Ctx,
-    settings: &RepoSettings,
-    review: &ReviewSettings,
     gh: &dyn GitHub,
     sandbox: &dyn Sandbox,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
+    at: LaneRead<'_>,
+    review: &ReviewSettings,
     lane: &mut Lane,
     unit: &Unit,
 ) -> Result<Outcome> {
+    let LaneRead {
+        key,
+        snap,
+        settings,
+    } = at;
     let repo = &key.repo;
     let prs = unit.prs();
     // No agent fixes a fork PR: its code could read the agent's key.
@@ -2915,16 +2924,7 @@ async fn run_job(
                 record_all(ctx, key, &prs, "rebasing", &format!("onto {}", key.trunk)).await?;
                 let comment = format!("Rebasing onto `{}`.", key.trunk);
                 comment_all(gh, repo, &prs, &comment).await?;
-                let conflicts = match agent {
-                    true => Conflicts::Resolve,
-                    false => Conflicts::Leave,
-                };
-                let at = LaneRead {
-                    key,
-                    snap,
-                    settings,
-                };
-                let event = sandbox.rebase(at, &now, conflicts).await?;
+                let event = sandbox.rebase(at, &now, Conflicts::when(agent)).await?;
                 if event == Event::RebaseConflict {
                     ctx.prep
                         .conflicted(key, unit.number, &now.top().head_ref_oid);
@@ -3050,11 +3050,6 @@ async fn run_job(
                     &heads[failing - 1]
                 };
                 let failures = gh.check_failures(repo, head, failed).await?;
-                let at = LaneRead {
-                    key,
-                    snap,
-                    settings,
-                };
                 let event = sandbox
                     .fix(at, &now, failing, head, below, &failures)
                     .await?;
@@ -3093,11 +3088,6 @@ async fn run_job(
                     "The agent found nothing to fix in the code for {what}. Running the checks again."
                 );
                 comment_all(gh, repo, &prs, &comment).await?;
-                let at = LaneRead {
-                    key,
-                    snap,
-                    settings,
-                };
                 let event = sandbox.recheck(at, &now, failing, &heads[failing]).await?;
                 published_at = Instant::now();
                 if let Event::Fixed { head } = &event {
@@ -3189,6 +3179,16 @@ enum Runs {
 enum Conflicts {
     Resolve,
     Leave,
+}
+
+impl Conflicts {
+    /// `Resolve` where the `agent` may run.
+    fn when(agent: bool) -> Self {
+        match agent {
+            true => Conflicts::Resolve,
+            false => Conflicts::Leave,
+        }
+    }
 }
 
 /// The jobs that change a unit's branches, and publish the result to them.

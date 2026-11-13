@@ -305,12 +305,7 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
             "#{number} is not queued. Queue it with `mergeloop call queue_pull {args}`, then run `{then}`."
         ),
         NeedKind::Wait => format!("Nothing for you yet: {detail}. Run `{then}`."),
-        NeedKind::Threads => THREADS
-            .replace("{on}", &on)
-            .replace("{detail}", detail)
-            .replace("{threads}", &threads(repo, pr))
-            .replace("{args}", &args)
-            .replace("{then}", then),
+        NeedKind::Threads => fill(THREADS, need, status).replace("{then}", then),
         NeedKind::Changes => format!(
             "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch and rebase onto the remote branch, push once, and reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
         ),
@@ -348,29 +343,31 @@ fn threads(repo: &str, pr: u32) -> String {
 
 /// What the agent the daemon runs does about the need, when it is one an agent works.
 fn daemon_brief(need: &Need, status: &PullStateView) -> Option<String> {
+    match need.kind {
+        NeedKind::Threads => Some(fill(DAEMON_THREADS, need, status)),
+        NeedKind::Changes => Some(fill(DAEMON_CHANGES, need, status)),
+        _ => None,
+    }
+}
+
+/// A brief's template with the need's placeholders filled: every one but `{then}`.
+fn fill(text: &str, need: &Need, status: &PullStateView) -> String {
     let (repo, number) = (status.repo.as_str(), status.number);
     let pr = need.layer.unwrap_or(number);
     let on = match need.layer {
         Some(layer) if layer != number => format!(" on #{layer}, a layer of its stack,"),
         _ => String::new(),
     };
-    let fill = |text: &str| {
-        text.replace("{on}", &on)
-            .replace("{detail}", &need.detail)
-            .replace("{repo}", repo)
-            .replace("{pr}", &pr.to_string())
-            .replace("{threads}", &threads(repo, pr))
-            .replace("{args}", &args(repo, pr))
-            .replace("{after}", DAEMON_AFTER)
-            .replace("{REPLY}", REPLY)
-            .replace("{RESOLVE}", RESOLVE)
-            .replace("{COMMIT}", COMMIT)
-    };
-    match need.kind {
-        NeedKind::Threads => Some(fill(DAEMON_THREADS)),
-        NeedKind::Changes => Some(fill(DAEMON_CHANGES)),
-        _ => None,
-    }
+    text.replace("{on}", &on)
+        .replace("{detail}", &need.detail)
+        .replace("{repo}", repo)
+        .replace("{pr}", &pr.to_string())
+        .replace("{threads}", &threads(repo, pr))
+        .replace("{args}", &args(repo, pr))
+        .replace("{after}", DAEMON_AFTER)
+        .replace("{REPLY}", REPLY)
+        .replace("{RESOLVE}", RESOLVE)
+        .replace("{COMMIT}", COMMIT)
 }
 
 /// What the daemon does once its agent ends.
@@ -571,6 +568,61 @@ mod tests {
         assert!(v.brief.contains("on #4, a layer of its stack"));
         assert!(v.brief.contains("pullRequest(number: 4)"));
         assert!(v.brief.ends_with(&format!("Then run `{}`.", v.then)));
+    }
+
+    /// The first `{name}` left in `text`, a placeholder no one filled.
+    fn unfilled(text: &str) -> Option<&str> {
+        text.match_indices('{').find_map(|(at, _)| {
+            let rest = &text[at + 1..];
+            let end = rest.find('}')?;
+            let name = &rest[..end];
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic()))
+                .then_some(&text[at..at + end + 2])
+        })
+    }
+
+    #[test]
+    fn no_brief_leaves_a_placeholder_unfilled_and_a_threads_brief_names_its_pr() {
+        use HoldReasonView::*;
+        let reasons = [
+            Draft,
+            ReviewRequired,
+            ChangesRequested,
+            WorkflowApproval,
+            ForkEditsOff,
+            NoQueue,
+            NoSubscription,
+            FairUseLimit,
+            PrepRebasing,
+            PrepChecks,
+            PrepFixing,
+            Reviewing,
+            ReviewAsks,
+            ReviewChanges,
+            UnresolvedThreads,
+        ];
+        for reader in [Reader::Agent, Reader::Daemon] {
+            for layer in [None, Some(4)] {
+                for reason in reasons {
+                    let v = super::view(status(held(reason, layer)), None, None, None, reader);
+                    assert_eq!(
+                        unfilled(&v.brief),
+                        None,
+                        "{reason:?} {layer:?}:\n{}",
+                        v.brief
+                    );
+                    if v.needs == NeedKind::Threads {
+                        let pr = layer.unwrap_or(6);
+                        let named = format!("review threads of #{pr}:");
+                        assert!(
+                            v.brief.contains(&named),
+                            "{reason:?} {layer:?}:\n{}",
+                            v.brief
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

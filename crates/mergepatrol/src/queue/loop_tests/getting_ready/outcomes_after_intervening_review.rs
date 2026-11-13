@@ -65,16 +65,14 @@ async fn a_fix_after_an_intervening_failed_review_settles_the_original_request()
         .await
         .unwrap();
     let settings = world.ctx.config.repo_defaults.clone();
-    conclude(
-        &world.ctx,
+    Reviewing::new(
         &world.installation,
-        &world.key(),
         &world.pr(1),
         &failed,
         &settings,
         &ReviewSettings::default(),
-        Err("The review agent could not run".into()),
     )
+    .conclude(&world.ctx, Err("The review agent could not run".into()))
     .await
     .unwrap();
     let failed = world.store.review(failed.id).await.unwrap().unwrap();

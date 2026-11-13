@@ -18,7 +18,7 @@ use tokio::sync::Barrier;
 
 use super::*;
 use crate::job::LEFT_CONFLICT;
-use crate::review::conclude;
+use crate::review::Reviewing;
 use mergepatrol_executor::protocol::ReviewOutput;
 
 mod outcomes_after_intervening_review;
@@ -782,20 +782,12 @@ impl World {
             summary: "s".into(),
             findings: vec![finding],
         };
-        let (key, pr) = (self.key(), self.pr(1));
+        let pr = self.pr(1);
         let bars = ReviewSettings::default();
-        conclude(
-            &self.ctx,
-            &self.installation,
-            &key,
-            &pr,
-            r,
-            settings,
-            &bars,
-            Ok(output),
-        )
-        .await
-        .unwrap();
+        Reviewing::new(&self.installation, &pr, r, settings, &bars)
+            .conclude(&self.ctx, Ok(output))
+            .await
+            .unwrap();
     }
 
     /// The PR's checks fail, and the agent's fix of them starts off the lane: the drain that

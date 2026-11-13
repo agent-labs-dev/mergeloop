@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
-use mergepatrol_analytics::{Analytics, Exit};
+use mergepatrol_analytics::{Analytics, Exit, QueuedPr};
 use mergepatrol_billing::Billing;
 use mergepatrol_core::{
     BatchStep, BuiltBatch, CHECKS_MISSING_FOR, CHECKS_TIMEOUT, Candidate, CheckFailure, ConfigPath,
@@ -2737,15 +2737,19 @@ pub(crate) async fn record(
     kind: &str,
     message: &str,
 ) -> Result<()> {
-    ctx.analytics.queue_event(
-        key.installation_id,
-        &key.repo.to_string(),
-        &key.trunk,
-        number,
-        kind,
-        ctx.prs.author(key, number).as_deref(),
-    );
+    ctx.analytics.queue_event(&queued(ctx, key, number), kind);
     log(ctx, key, number, kind, message).await
+}
+
+/// The PR a queue event is about, for analytics.
+fn queued(ctx: &Ctx, key: &LaneKey, number: PrNumber) -> QueuedPr {
+    QueuedPr {
+        installation_id: key.installation_id,
+        repo: key.repo.to_string(),
+        trunk: key.trunk.clone(),
+        number,
+        author: ctx.prs.author(key, number),
+    }
 }
 
 /// A queue event, shown on the dashboard and logged but not counted.
@@ -2771,18 +2775,12 @@ async fn exit(
         .store
         .record_exit(key, number, outcome, detail, &summary)
         .await?;
-    ctx.analytics.queue_exit(
-        key.installation_id,
-        &key.repo.to_string(),
-        &key.trunk,
-        number,
-        outcome,
-        ctx.prs.author(key, number).as_deref(),
-        &Exit {
-            steps: steps.as_ref(),
-            reason,
-        },
-    );
+    let exit = Exit {
+        steps: steps.as_ref(),
+        reason,
+    };
+    ctx.analytics
+        .queue_exit(&queued(ctx, key, number), outcome, &exit);
     Ok(())
 }
 

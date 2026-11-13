@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_core::{
-    Answered, Depth, Evidence, FINDING_MARKS as MARKS, Finding, Judged, Lean, PrNumber,
-    REPLY_MARKS, RepoName, RepoSettings, ReviewSettings, ReviewStatus, SentBack, TITLE_CHARS,
-    Verdict, Verification, clip, finding_title, review_status, settled_by, thread_title as norm,
+    Answered, Evidence, FINDING_MARKS as MARKS, Finding, Judged, Lean, PrNumber, REPLY_MARKS,
+    RepoName, RepoSettings, ReviewSettings, ReviewStatus, SentBack, TITLE_CHARS, Verdict,
+    Verification, clip, finding_title, review_status, settled_by, thread_title as norm,
 };
 use mergepatrol_executor::protocol::{
     ANSWER_FILE, JobOutcome, JobSpec, REVIEW_FILE, ReviewOutput, Task,
@@ -142,6 +142,36 @@ fn lane_key(r: &ReviewRecord, pr: &PullRequest) -> LaneKey {
     }
 }
 
+/// A review of a PR's head, and what it runs with: the PR as GitHub had it when it started, its
+/// lane, the repo's settings, and the workspace's bars over them.
+pub(crate) struct Reviewing<'a> {
+    gh: &'a Installation,
+    key: LaneKey,
+    pr: &'a PullRequest,
+    record: &'a ReviewRecord,
+    settings: &'a RepoSettings,
+    bars: &'a ReviewSettings,
+}
+
+impl<'a> Reviewing<'a> {
+    pub(crate) fn new(
+        gh: &'a Installation,
+        pr: &'a PullRequest,
+        record: &'a ReviewRecord,
+        settings: &'a RepoSettings,
+        bars: &'a ReviewSettings,
+    ) -> Self {
+        Self {
+            gh,
+            key: lane_key(record, pr),
+            pr,
+            record,
+            settings,
+            bars,
+        }
+    }
+}
+
 async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
     let (gh, pr) = pull(ctx, &r).await?;
     // A fork PR's head is its pull ref's, which its GraphQL lags behind: no run, so no check.
@@ -149,7 +179,6 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         // A newer head has its own review, which the next tick starts.
         return ctx.store.stale_review(r.id, r.claim).await;
     }
-    let key = lane_key(&r, &pr);
     let settings = settings(ctx, &gh, &r.repo).await?;
     // Only a PR told to merge gets the agent's review: no label, or no place in the lane, and the
     // review is dropped rather than run. Nothing is run and nothing is posted.
@@ -162,11 +191,12 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         .await?
         .unwrap_or_default();
     let bars = workspace.with(&settings.review);
+    let reviewing = Reviewing::new(&gh, &pr, &r, &settings, &bars);
 
     let found = match pr.is_cross_repository {
         // A fork's code is not trusted: no agent reads it, as none rebases or fixes it.
         true => Err("The agent does not review PRs from forks.".to_owned()),
-        false => run_review(ctx, &gh, &key, &pr, (&settings, bars.depth), &r).await,
+        false => reviewing.run(ctx).await,
     };
     let output = match found {
         Ok(output) => Ok(output),
@@ -178,7 +208,7 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         }
         Err(why) => Err(why),
     };
-    conclude(ctx, &gh, &key, &pr, &r, &settings, &bars, output).await
+    reviewing.conclude(ctx, output).await
 }
 
 /// The PR as GitHub has it now, if it is still the one the review is of: the head it reviewed,
@@ -249,52 +279,55 @@ fn below(pr: &PullRequest) -> Option<String> {
     (pr.base_ref_name != pr.merges_into()).then(|| pr.base_ref_name.clone())
 }
 
-/// Runs the review in the sandbox. `Err` says why the agent could not review.
-async fn run_review(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-    (settings, depth): (&RepoSettings, Depth),
-    r: &ReviewRecord,
-) -> std::result::Result<ReviewOutput, String> {
-    let Earlier {
-        answered,
-        sent_back,
-        reviewed,
-    } = earlier(ctx, gh, r).await.map_err(|e| format!("{e:#}"))?;
-    let job_id = format!(
-        "{}-{}-{}-review-{}",
-        r.repo.owner,
-        r.repo.name,
-        r.number,
-        &r.head_sha[..8]
-    );
-    let ran = async {
-        let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
-        let task = Task::Review {
+impl Reviewing<'_> {
+    /// Runs the review in the sandbox. `Err` says why the agent could not review.
+    async fn run(&self, ctx: &Ctx) -> std::result::Result<ReviewOutput, String> {
+        let Self {
+            gh,
+            ref key,
+            pr,
+            record: r,
+            settings,
+            bars,
+        } = *self;
+        let Earlier {
             answered,
             sent_back,
-            since: r.since_head.clone(),
             reviewed,
-            depth,
+        } = earlier(ctx, gh, r).await.map_err(|e| format!("{e:#}"))?;
+        let job_id = format!(
+            "{}-{}-{}-review-{}",
+            r.repo.owner,
+            r.repo.name,
+            r.number,
+            &r.head_sha[..8]
+        );
+        let ran = async {
+            let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
+            let task = Task::Review {
+                answered,
+                sent_back,
+                since: r.since_head.clone(),
+                reviewed,
+                depth: bars.depth,
+            };
+            let (mut spec, granted) =
+                job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
+            spec.base_ref = below(pr);
+            if granted.is_none() {
+                bail!(
+                    "{NO_KEY} in the workspace's settings for {}: the agent cannot review.",
+                    spec.resolver.provider.name()
+                );
+            }
+            let out = run_job(ctx, gh, settings, key, r.number, &job_id, &spec).await?;
+            let text = tokio::fs::read(out.join(REVIEW_FILE))
+                .await
+                .context("the job wrote no review")?;
+            anyhow::Ok(serde_json::from_slice::<ReviewOutput>(&text)?)
         };
-        let (mut spec, granted) =
-            job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
-        spec.base_ref = below(pr);
-        if granted.is_none() {
-            bail!(
-                "{NO_KEY} in the workspace's settings for {}: the agent cannot review.",
-                spec.resolver.provider.name()
-            );
-        }
-        let out = run_job(ctx, gh, settings, key, r.number, &job_id, &spec).await?;
-        let text = tokio::fs::read(out.join(REVIEW_FILE))
-            .await
-            .context("the job wrote no review")?;
-        anyhow::Ok(serde_json::from_slice::<ReviewOutput>(&text)?)
-    };
-    ran.await.map_err(|e| format!("{e:#}"))
+        ran.await.map_err(|e| format!("{e:#}"))
+    }
 }
 
 /// Runs a job in the sandbox, on one of its slots: the directory its output is in. Hosted, it
@@ -388,33 +421,37 @@ fn rounds_spent(earlier: &[ReviewRecord]) -> bool {
             .all(|e| e.answered_by.is_none() && e.findings.iter().any(|j| j.sent_back))
 }
 
-/// Ends the review: approved when it holds nothing, sent back to the author when it found what
-/// they should fix, else it asks the people who own the code in question. `Err` is why the
-/// agent could not review: a human reviews the whole PR. Then posts it on GitHub.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn conclude(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-    r: &ReviewRecord,
-    settings: &RepoSettings,
-    bars: &ReviewSettings,
-    output: std::result::Result<ReviewOutput, String>,
-) -> Result<()> {
-    // The PR may have moved while the agent ran: then the review posts nothing and the PR ends no
-    // hold. It is dropped, for a review of a later head to take its place.
-    let Some(now) = as_reviewed(ctx, gh, key, r, settings).await? else {
-        return ctx.store.stale_review(r.id, r.claim).await;
-    };
-    let done = judge(ctx, gh, pr, r, bars, output).await?;
-    if !ctx.store.finish_review(r.id, r.claim, &done).await? {
-        return Ok(());
+impl Reviewing<'_> {
+    /// Ends the review: approved when it holds nothing, sent back to the author when it found
+    /// what they should fix, else it asks the people who own the code in question. `Err` is why
+    /// the agent could not review: a human reviews the whole PR. Then posts it on GitHub.
+    pub(crate) async fn conclude(
+        &self,
+        ctx: &Ctx,
+        output: std::result::Result<ReviewOutput, String>,
+    ) -> Result<()> {
+        let Self {
+            gh,
+            ref key,
+            pr,
+            record: r,
+            settings,
+            bars,
+        } = *self;
+        // The PR may have moved while the agent ran: then the review posts nothing and the PR ends no
+        // hold. It is dropped, for a review of a later head to take its place.
+        let Some(now) = as_reviewed(ctx, gh, key, r, settings).await? else {
+            return ctx.store.stale_review(r.id, r.claim).await;
+        };
+        let done = judge(ctx, gh, pr, r, bars, output).await?;
+        if !ctx.store.finish_review(r.id, r.claim, &done).await? {
+            return Ok(());
+        }
+        settle_earlier(ctx, r, &done).await?;
+        let (kind, message) = ended(&done);
+        record(ctx, key, r.number, kind, &message).await?;
+        publish(ctx, gh, key, &now, r, &done).await
     }
-    settle_earlier(ctx, r, &done).await?;
-    let (kind, message) = ended(&done);
-    record(ctx, key, r.number, kind, &message).await?;
-    publish(ctx, gh, key, &now, r, &done).await
 }
 
 /// What the review holds the PR for, and who it asks: what the agent found, judged by the

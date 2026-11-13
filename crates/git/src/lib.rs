@@ -1,5 +1,6 @@
-//! Local git, through the `git` CLI. MergeLoop never pushes: `fetch` is the only network call,
-//! and the `github` crate publishes the commits.
+//! Local git, through the `git` CLI. The server never pushes through it: it fetches, and the
+//! `github` crate publishes its commits. The build lane's daemon pushes its builds with
+//! `push_leased`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

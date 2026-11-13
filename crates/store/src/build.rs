@@ -2,7 +2,8 @@
 //! developer's daemon claims, builds, opens a PR for and lands, or gives back or marks stuck.
 //!
 //! A build records whether its issue is a task, and webhooks and syncs change that record: they
-//! never delete a build, so a held one keeps its holder and its PR. The intake writes of a repo
+//! never delete a held or stuck build, so it keeps its holder and its PR. A sync deletes only
+//! a ready or merged build that stopped being a task more than a day before. The intake writes of a repo
 //! (a webhook's change, a sync's reconciliation) run one at a time under the repo's lock, each
 //! with a new generation it stamps on the rows it writes; a sync's reconciliation writes only
 //! rows no newer than the generation it noted before it read GitHub's list.

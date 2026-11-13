@@ -81,6 +81,8 @@ struct State {
     /// The review threads those started, in order: their first comment, the replies in them, and
     /// whether they are resolved.
     threads: Vec<(String, Vec<String>, bool)>,
+    /// The unresolved threads GitHub has on a PR now, where the PR's read lags behind them.
+    live_threads: HashMap<PrNumber, u32>,
     merges: u32,
     /// Merged PRs stay, closed, as on GitHub.
     merged: Vec<PrNumber>,
@@ -564,6 +566,11 @@ impl GitHub for Fake {
             .get(&number)
             .map(|pr| pr.body.clone())
             .unwrap_or_default())
+    }
+    async fn unresolved_threads(&self, _: &RepoName, number: PrNumber) -> Result<u32> {
+        let s = self.state.lock().unwrap();
+        let read = s.prs.get(&number).map_or(0, |pr| pr.unresolved_threads);
+        Ok(s.live_threads.get(&number).copied().unwrap_or(read))
     }
     async fn set_body(&self, _: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -2671,6 +2678,30 @@ async fn a_pr_goes_on_once_its_author_resolves_every_comment_with_no_human() {
     threads(0);
     run.drain().await;
     assert_eq!(run.gh.with(|s| s.dismissed.clone()), [1]);
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
+    assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_from_before_the_reviews_threads_never_lets_the_pr_on() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    run.tick().await;
+    // The review posted its thread, but the lane's read of the PR is from before it.
+    run.store.finish_review(1, ReviewStatus::Changes);
+    run.store.with_finding(1, |f| {
+        f.sent_back = true;
+        f.threaded = true;
+    });
+    run.gh.with_mut(|s| s.live_threads.insert(1, 1));
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(ReviewChanges)".into())]);
+    assert!(run.gh.with(|s| s.approved.is_empty()));
+    let status = run.store.reviews.lock().unwrap().last().unwrap().status;
+    assert_eq!(status, ReviewStatus::Changes);
+    // The author resolves it: it goes on.
+    run.gh.with_mut(|s| s.live_threads.insert(1, 0));
+    run.drain().await;
     assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
     assert_eq!(run.merged(), [1]);
 }

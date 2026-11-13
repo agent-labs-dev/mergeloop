@@ -85,6 +85,9 @@ pub trait GitHub: Send + Sync {
     async fn commit_messages(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<String>>;
     /// The PR's description as GitHub has it now, never from a cache.
     async fn pr_body(&self, repo: &RepoName, number: PrNumber) -> Result<String>;
+    /// How many of the PR's review threads are unresolved as GitHub has them now, never from a
+    /// cache.
+    async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32>;
     async fn set_body(&self, repo: &RepoName, number: PrNumber, body: &str) -> Result<()>;
     /// Dismisses each request for changes on the PR whose body holds one of `marks`.
     async fn dismiss_reviews_marked(
@@ -231,6 +234,9 @@ impl GitHub for Installation {
     }
     async fn pr_body(&self, repo: &RepoName, number: PrNumber) -> Result<String> {
         Installation::pr_body(self, repo, number).await
+    }
+    async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32> {
+        Installation::unresolved_threads(self, repo, number).await
     }
     async fn dismiss_reviews_marked(
         &self,

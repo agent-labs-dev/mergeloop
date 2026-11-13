@@ -660,6 +660,36 @@ impl Installation {
         Ok(pr)
     }
 
+    /// How many of the PR's review threads are unresolved, of the first 100, as GitHub has them
+    /// now: never from a snapshot, which can predate a thread just posted.
+    pub async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32> {
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Repo,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repo {
+            pull_request: Pr,
+        }
+        #[derive(Deserialize)]
+        struct Pr {
+            #[serde(rename = "reviewThreads", deserialize_with = "unresolved")]
+            unresolved: u32,
+        }
+        let data: Data = self
+            .graphql(
+                "unresolved threads",
+                "query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+                    reviewThreads(first: 100) { nodes { isResolved } } } }
+                }",
+                json!({ "owner": repo.owner, "name": repo.name, "number": number }),
+            )
+            .await?;
+        Ok(data.repository.pull_request.unresolved)
+    }
+
     /// The open PRs of the stack, bottom to top. Its merged layers are left out.
     pub async fn stack_layers(&self, repo: &RepoName, stack: PrNumber) -> Result<Vec<PrNumber>> {
         let r: Value = self

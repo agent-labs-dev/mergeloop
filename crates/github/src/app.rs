@@ -315,6 +315,14 @@ impl Installation {
             .await
     }
 
+    /// A token that can read `repo` and its PRs, and nothing else: the build lane gives it to the
+    /// agent that works a built PR's need, which reads what anyone who comments wrote.
+    pub async fn pr_read_token(&self, repo: &RepoName) -> Result<ScopedToken> {
+        let permissions = json!({ "contents": "read", "pull_requests": "read" });
+        self.scoped_token(repo, permissions, "create a PR read token")
+            .await
+    }
+
     /// Revokes a token this installation minted.
     pub async fn revoke(&self, token: &str) -> Result<()> {
         revoke_token_at(&self.app.api, token).await

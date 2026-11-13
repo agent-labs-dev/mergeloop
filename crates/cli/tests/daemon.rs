@@ -263,8 +263,8 @@ async fn a_task_is_built_pushed_as_the_bot_with_the_developer_and_its_pr_opened(
             &[
                 "claim_build",
                 "heartbeat_build",
-                "mint_push_token",
-                "mint_push_token",
+                "mint_build_token",
+                "mint_build_token",
                 "open_build_pr"
             ]
         ),
@@ -717,7 +717,7 @@ async fn a_build_it_no_longer_holds_is_dropped_without_a_word_and_cleaned_up() {
     let w = World::new().await;
     w.fake.add_task(w.task(5, 14, &[]));
     w.fake.refuse(
-        "mint_push_token",
+        "mint_build_token",
         "lost",
         409,
         "You no longer hold build 5.",
@@ -1165,8 +1165,8 @@ async fn its_prs_threads_are_worked_by_the_agent_as_the_bot_and_the_build_ends_o
     assert_eq!(w.runs(), 2, "the build, then the need");
     assert_eq!(
         w.tokens(),
-        ["none", "ghs_fake"],
-        "the builder acts as nobody; the need's agent as the bot, with the minted token"
+        ["none", fake::READ_TOKEN],
+        "the builder acts as nobody; the need's agent as the bot, with a token that only reads"
     );
     let [subject, author, _, body] = w.pushed("mergeloop/build-7").unwrap();
     assert_eq!(subject, "Check it");
@@ -1182,7 +1182,9 @@ async fn its_prs_threads_are_worked_by_the_agent_as_the_bot_and_the_build_ends_o
     );
     let graphql = w.fake.lane(|l| l.graphql.clone());
     assert!(
-        graphql.iter().all(|(bearer, ..)| bearer == "ghs_fake"),
+        graphql
+            .iter()
+            .all(|(bearer, ..)| bearer == fake::PUSH_TOKEN),
         "{graphql:?}"
     );
     let replies: Vec<&Value> = graphql
@@ -1211,6 +1213,65 @@ async fn its_prs_threads_are_worked_by_the_agent_as_the_bot_and_the_build_ends_o
     assert!(w.fake.lane(|l| l.released.is_empty()));
     assert_eq!(w.left(), (vec![], vec![]), "no worktree, no branch");
     assert_eq!(w.transcripts(), ["1"], "only its transcripts");
+}
+
+/// A shell line that notes in `notes`, as `<who> <tokens>`, which of the fake's two tokens are
+/// anywhere in its environment: `none`, `none+read`, `none+push`, `none+push+read`.
+fn which_tokens(notes: &Path, who: &str) -> String {
+    let (push, read) = (fake::PUSH_TOKEN, fake::READ_TOKEN);
+    format!(
+        "held=none; env | grep -q '{push}' && held=\"$held+push\"; env | grep -q '{read}' && held=\"$held+read\"; echo \"{who} $held\" >> '{}'",
+        notes.display()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_agent_run_nor_verify_command_ever_holds_the_push_token() {
+    let w = World::new().await;
+    let notes = w.root().join("notes");
+    let verify = which_tokens(&notes, "verify");
+    w.fake.add_task(w.task(1, 7, &[verify.as_str()]));
+    w.fake.script(
+        101,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#101 merged."),
+        ],
+    );
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    let worked = w.output("worked", WORKED);
+    let body = format!(
+        "{}\ncase \"$prompt\" in '{THREADS}') echo checked >> feature.txt; cat '{}'; exit 0;; esac\n\
+         echo built > feature.txt",
+        which_tokens(&notes, "agent"),
+        worked.display()
+    );
+    let agent = w.agent("noter", &body, BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(1)))
+        .await;
+
+    let notes = std::fs::read_to_string(&notes).unwrap();
+    assert_eq!(
+        notes.lines().collect::<Vec<_>>(),
+        [
+            "agent none",
+            "verify none",
+            "agent none+read",
+            "verify none"
+        ],
+        "the build, its verify, the need, its verify"
+    );
+    let scopes: Vec<Value> = w
+        .fake
+        .args_of("mint_build_token")
+        .into_iter()
+        .map(|a| a["scope"].clone())
+        .collect();
+    assert!(
+        scopes.contains(&json!("push")) && scopes.contains(&json!("read")),
+        "{scopes:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

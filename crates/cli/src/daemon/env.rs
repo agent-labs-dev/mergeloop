@@ -2,7 +2,9 @@
 //! GitHub or MergeLoop: a reply or a resolved thread from the developer's own login would count
 //! as a human's answer to MergeLoop's review. So every run loses the developer's tokens, `gh`
 //! finds no login of theirs, and git asks no credential helper and no SSH agent of theirs. An
-//! agent that works a PR's need acts as the App's bot instead, with the token minted for it.
+//! agent that works a PR's need reads as the App's bot, with a token minted to read only: it
+//! reads what anyone who can comment wrote, so it holds nothing that writes. The daemon's push
+//! token reaches only its own git and GraphQL calls.
 
 use mergepatrol_resolver::{Env, Room};
 
@@ -42,11 +44,12 @@ pub fn nobody(room: &Room) -> Env {
     }
 }
 
-/// A run that acts as the App's bot, with `token`: `gh`, and `mergeloop call` on `server`.
-pub fn bot(room: &Room, token: &str, server: &str) -> Env {
+/// A run that reads as the App's bot, with `read`, a token that only reads: `gh`, and
+/// `mergeloop call` on `server`.
+pub fn bot(room: &Room, read: &str, server: &str) -> Env {
     let mut env = nobody(room);
     for name in ["GH_TOKEN", "GITHUB_TOKEN", "MERGELOOP_TOKEN"] {
-        env.set.push((name.into(), token.into()));
+        env.set.push((name.into(), read.into()));
     }
     env.set.push(("MERGELOOP_URL".into(), server.into()));
     env

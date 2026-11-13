@@ -68,6 +68,16 @@ impl Stage {
     }
 }
 
+/// What a minted token may do on the build's repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Push the branch and act on the PR: the daemon's own, for git and its GraphQL calls.
+    Push,
+    /// Read the repo and its PRs: the most an agent holds, as it reads what anyone who can
+    /// comment on the PR wrote.
+    Read,
+}
+
 /// How a build's PR stands, as `report_build` hears it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
@@ -112,13 +122,19 @@ impl Lane {
         self.on(task, "heartbeat_build", args).await.map(drop)
     }
 
-    /// A token that pushes the build's branch, as the App's bot.
-    pub async fn mint(&self, task: &Task) -> Result<String> {
-        let answer = self.on(task, "mint_push_token", json!({})).await?;
+    /// A token for the build's repo, as the App's bot, of `scope`.
+    pub async fn mint(&self, task: &Task, scope: Scope) -> Result<String> {
+        let scope = match scope {
+            Scope::Push => "push",
+            Scope::Read => "read",
+        };
+        let answer = self
+            .on(task, "mint_build_token", json!({ "scope": scope }))
+            .await?;
         answer["token"]
             .as_str()
             .map(str::to_owned)
-            .context("mint_push_token answered no token")
+            .context("mint_build_token answered no token")
     }
 
     /// Has the App open the build's PR, and returns its number.

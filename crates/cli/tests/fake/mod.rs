@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 
 /// The GitHub token the fake takes.
 pub const GITHUB_TOKEN: &str = "ghp_fake";
+/// The token `mint_build_token` gives for `push`: the daemon's alone.
+pub const PUSH_TOKEN: &str = "ghs_fake_push";
+/// The token `mint_build_token` gives for `read`: what an agent may hold.
+pub const READ_TOKEN: &str = "ghs_fake_read";
 /// Who a session signs in as.
 pub const LOGIN: &str = "ana";
 
@@ -273,7 +277,14 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
                 .collect::<Vec<_>>(),
         ),
         "heartbeat_build" => json!({ "id": args["build"], "status": "claimed" }),
-        "mint_push_token" => json!({ "token": "ghs_fake", "expires_at": "2026-11-12T13:00:00Z" }),
+        "mint_build_token" => {
+            let token = match args["scope"].as_str() {
+                Some("push") => PUSH_TOKEN,
+                Some("read") => READ_TOKEN,
+                _ => "no scope",
+            };
+            json!({ "token": token, "expires_at": "2026-11-12T13:00:00Z" })
+        }
         "open_build_pr" => {
             let build = args["build"].as_u64().unwrap_or_default();
             let said = |k: &str| args[k].as_str().unwrap_or_default().to_owned();

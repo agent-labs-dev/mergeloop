@@ -16,7 +16,7 @@ use tokio::sync::{Semaphore, watch};
 
 use super::env;
 use super::folder::{Checkout, Folder};
-use super::lane::{Lane, Stage, Task};
+use super::lane::{Lane, Scope, Stage, Task};
 use super::verify;
 use crate::client::{Refusal, Refused, needs_sign_in, refusal};
 
@@ -133,7 +133,7 @@ impl Builder {
 
     async fn work(&self, lane: &Lane, task: &Task) -> Result<Work> {
         lane.heartbeat(task, Stage::Building).await?;
-        let token = heard(lane, task, || lane.mint(task)).await?;
+        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         let checkout = self.folder.checkout(task, &token, &self.access).await?;
         if let Some(in_room) = &self.in_room {
             in_room(task);
@@ -293,7 +293,7 @@ impl Builder {
             return Ok(Work::Stuck("The agent changed nothing.".into()));
         }
         let head = Git.tree_head(&checkout.tree).await?;
-        let token = heard(lane, task, || lane.mint(task)).await?;
+        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         if !push(task, checkout, &token, &head).await? {
             return Ok(Work::Stuck(format!(
                 "The branch {} changed on GitHub while the build ran, so the build did not push \

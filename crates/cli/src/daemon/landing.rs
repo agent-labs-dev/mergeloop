@@ -15,7 +15,7 @@ use super::build::{Builder, Ended, Stopped, Work, heard, heartbeats, push, say, 
 use super::env;
 use super::folder::Checkout;
 use super::github::Bot;
-use super::lane::{Lane, Standing, Task};
+use super::lane::{Lane, Scope, Standing, Task};
 use crate::client::{needs_sign_in, refusal};
 use crate::land::{self, Pr};
 
@@ -220,7 +220,7 @@ impl Builder {
         round: u32,
     ) -> Result<Option<String>> {
         lane.heartbeat(task, task.stage()).await?;
-        let token = heard(lane, task, || lane.mint(task)).await?;
+        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         let checkout = self.folder.checkout_pr(task, &token, &self.access).await?;
         if let Some(in_room) = &self.in_room {
             in_room(task);
@@ -236,7 +236,8 @@ impl Builder {
             None => brief.to_owned(),
             Some(f) => format!("{brief}\n\n{}", failed_note(f)),
         };
-        let env = env::bot(&checkout.room, &token, lane.client.server().url());
+        let read = heard(lane, task, || lane.mint(task, Scope::Read)).await?;
+        let env = env::bot(&checkout.room, &read, lane.client.server().url());
         let step = format!("need-{round}");
         let run = match self.change(task, &checkout, prompt, &env, &step).await? {
             Ok(run) => run,
@@ -287,7 +288,7 @@ impl Builder {
             return Ok(Some(None));
         }
         let head = Git.tree_head(&checkout.tree).await?;
-        let token = heard(lane, task, || lane.mint(task)).await?;
+        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         if !push(task, checkout, &token, &head).await? {
             return Ok(None);
         }
@@ -310,7 +311,7 @@ impl Builder {
         if answers.replies.is_empty() && answers.resolve.is_empty() {
             return Ok(());
         }
-        let token = heard(lane, task, || lane.mint(task)).await?;
+        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
         let bot = Bot {
             http: &self.http,
             api: &self.github,

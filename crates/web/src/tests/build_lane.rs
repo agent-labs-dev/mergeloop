@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use super::*;
 
 const SECRET: &str = "whs";
+/// What the fake mints for a token that only reads.
+const READ_TOKEN: &str = "ghs_read";
 
 /// What the fake GitHub has, and what it was asked to change.
 #[derive(Default)]
@@ -112,6 +114,11 @@ async fn github(hub: Shared) -> GitHub {
             return (422, r#"{"message":"Validation Failed"}"#.into());
         }
         let issues = "/repos/o/r/issues?labels=mergeloop&state=open&per_page=100&page=";
+        // GitHub refuses a read-only installation token every REST write but revoking itself.
+        let own = ["/graphql", "/installation/token"];
+        if call.token == READ_TOKEN && call.method != "GET" && !own.contains(&call.path) {
+            return (403, r#"{"message":"Resource not accessible by integration"}"#.into());
+        }
         match (call.method, call.path) {
             ("GET", "/rate_limit") => (200, "{}".into()),
             ("GET", "/repos/o/r") => push(
@@ -119,8 +126,13 @@ async fn github(hub: Shared) -> GitHub {
                     && !hub.revoked.iter().any(|t| t == call.token),
             ),
             ("POST", "/app/installations/1/access_tokens") => {
-                hub.mints.push(serde_json::from_str(call.body).unwrap());
-                (201, json!({ "token": "ghs_push", "expires_at": "2026-11-12T13:00:00Z" }).to_string())
+                let body: Value = serde_json::from_str(call.body).unwrap();
+                let token = match body["permissions"]["contents"].as_str() {
+                    Some("read") => READ_TOKEN,
+                    _ => "ghs_push",
+                };
+                hub.mints.push(body);
+                (201, json!({ "token": token, "expires_at": "2026-11-12T13:00:00Z" }).to_string())
             }
             ("DELETE", "/installation/token") => {
                 hub.revoked_tokens.push(call.token.into());
@@ -382,7 +394,11 @@ async fn on_build(
 }
 
 async fn mint(router: &Router, who: &str, claimed: &Value) -> (StatusCode, Value) {
-    on_build(router, who, claimed, "token", json!({})).await
+    mint_as(router, who, claimed, "push").await
+}
+
+async fn mint_as(router: &Router, who: &str, claimed: &Value, scope: &str) -> (StatusCode, Value) {
+    on_build(router, who, claimed, "token", json!({ "scope": scope })).await
 }
 
 async fn open_pr(router: &Router, who: &str, claimed: &Value) -> (StatusCode, Value) {
@@ -821,6 +837,57 @@ async fn the_holder_gets_a_token_for_its_one_repo_that_pushes_and_opens_prs(pool
 }
 
 #[sqlx::test(migrations = false)]
+async fn the_holder_gets_a_token_for_its_one_repo_that_only_reads_it_and_its_prs(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+
+    let (status, token) = mint_as(&router, "ana", &ana, "read").await;
+    assert_eq!(status, StatusCode::OK, "{token}");
+    assert_eq!(token["token"], READ_TOKEN);
+    assert_eq!(
+        hub.lock().unwrap().mints,
+        [json!({
+            "repositories": ["r"],
+            "permissions": { "contents": "read", "pull_requests": "read" },
+        })]
+    );
+    let (status, body) = mint_as(&router, "ana", &ana, "admin").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = on_build(&router, "ana", &ana, "token", json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "no scope: {body}");
+    assert_eq!(hub.lock().unwrap().mints.len(), 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_read_token_reads_a_pr_through_mergeloop_and_changes_nothing(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    assert_eq!(open_pr(&router, "ana", &ana).await.0, StatusCode::OK);
+    let (_, token) = mint_as(&router, "ana", &ana, "read").await;
+    let token = token["token"].as_str().unwrap();
+    let writes = hub.lock().unwrap().writes.len();
+    let pr = json!({ "workspace": 1, "repo": "o/r", "number": 40 });
+
+    for reads in ["pull_status", "get_agent_review"] {
+        let read = mcp_tool(&router, token, reads, pr.clone()).await;
+        assert_eq!(read["isError"], false, "{reads}: {read}");
+    }
+    let mut queue = pr.clone();
+    queue["priority"] = true.into();
+    let refused = mcp_tool(&router, token, "queue_pull", queue).await;
+    assert_eq!(refusal(&refused), (json!(403), Value::Null), "{refused}");
+    assert_eq!(
+        hub.lock().unwrap().writes.len(),
+        writes,
+        "GitHub changed nothing"
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn no_token_without_a_live_claim_held_by_the_caller_who_may_push(pool: PgPool) {
     let hub = shared(vec![issue(7, &[])]);
     let (router, _) = lane(pool.clone(), &hub).await;
@@ -846,7 +913,9 @@ async fn no_token_without_a_live_claim_held_by_the_caller_who_may_push(pool: PgP
     let token = Request::post(format!("/api/w/1/builds/{}/token", ana["build"]))
         .header("authorization", "Bearer ghu_ana")
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "claim": ana["claim"] }).to_string()))
+        .body(Body::from(
+            json!({ "claim": ana["claim"], "scope": "push" }).to_string(),
+        ))
         .unwrap();
     assert_eq!(
         send(&router, token).await.status(),
@@ -1356,6 +1425,19 @@ async fn a_token_minted_while_the_claim_is_given_back_is_revoked_and_refused(poo
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_read_token_minted_while_the_claim_is_given_back_is_revoked_and_refused(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool.clone(), &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    given_back_during(&hub, &pool, "/app/installations/1/access_tokens", &ana);
+
+    let (status, body) = mint_as(&router, "ana", &ana, "read").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(hub.lock().unwrap().revoked_tokens, [READ_TOKEN]);
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_token_minted_while_the_lane_is_turned_off_is_revoked_and_refused(pool: PgPool) {
     let hub = shared(vec![issue(7, &[])]);
     let (router, _) = lane(pool.clone(), &hub).await;
@@ -1565,12 +1647,13 @@ async fn mcp_says_which_refusal_a_daemon_must_act_on(pool: PgPool) {
     assert!(ok.get("_meta").is_none(), "{ok}");
 
     hub.lock().unwrap().revoked.push("ghu_ana".into());
-    let barred = mcp_tool(&router, "ana", "mint_push_token", on(&ana)).await;
+    let push = |claimed: &Value| json!({ "workspace": 1, "build": claimed["build"], "claim": claimed["claim"], "scope": "push" });
+    let barred = mcp_tool(&router, "ana", "mint_build_token", push(&ana)).await;
     assert_eq!(refusal(&barred), (json!(403), json!("may_not_push")));
     hub.lock().unwrap().revoked.clear();
 
     age_claims(&pool).await;
-    let unheard = mcp_tool(&router, "ana", "mint_push_token", on(&ana)).await;
+    let unheard = mcp_tool(&router, "ana", "mint_build_token", push(&ana)).await;
     assert_eq!(refusal(&unheard), (json!(409), json!("unheard")));
 
     let lost = mcp_tool(&router, "ben", "heartbeat_build", on(&ana)).await;

@@ -733,39 +733,56 @@ fn may_not_push(repo: &RepoName) -> ApiError {
 
 #[derive(Deserialize, TS)]
 #[ts(export)]
-pub struct MintPushToken {
+pub struct MintBuildToken {
     pub claim: u64,
     /// The daemon that claimed it, as `claim_build` was told.
     #[serde(default)]
     #[ts(optional)]
     pub daemon: Option<String>,
+    pub scope: TokenScope,
 }
 
-/// A token for the build's repo alone, that pushes and opens PRs.
+/// What a build's token may do, on its repo alone.
+#[derive(Clone, Copy, Debug, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TokenScope {
+    /// Push the branch and act on the PR: `contents: write`, `pull_requests: write`. The
+    /// daemon's own.
+    Push,
+    /// Read the repo and its PRs: `contents: read`, `pull_requests: read`. For an agent, which
+    /// reads what anyone who comments on the PR wrote.
+    Read,
+}
+
+/// A token for the build's repo alone.
 #[derive(Serialize, TS)]
 #[ts(export)]
-pub struct PushTokenView {
+pub struct BuildTokenView {
     pub token: String,
     /// When GitHub stops taking it, an hour after it was made, as RFC 3339.
     pub expires_at: String,
 }
 
-/// Gives the holder of a live claim a token for its build's repo, while GitHub says they may
-/// push there. Asks GitHub afresh: the token outlives any cached answer. Once minted, checks
-/// the claim and the lane again, and revokes the token if either was lost meanwhile. A token
-/// already given outlives a later release by up to its hour, which GitHub fixes.
-pub(crate) async fn mint_push_token(
+/// Gives the holder of a live claim a token for its build's repo, of `scope`, while GitHub says
+/// they may push there. Asks GitHub afresh: the token outlives any cached answer. Once minted,
+/// checks the claim and the lane again, and revokes the token if either was lost meanwhile. A
+/// token already given outlives a later release by up to its hour, which GitHub fixes.
+pub(crate) async fn mint_build_token(
     State(app): State<AppState>,
     caller: Caller,
     Path((id, build)): Path<(u64, u64)>,
-    Json(body): Json<MintPushToken>,
-) -> Result<Json<PushTokenView>, ApiError> {
+    Json(body): Json<MintBuildToken>,
+) -> Result<Json<BuildTokenView>, ApiError> {
     let (id, build) = held(&app, &caller, id, build, body.daemon.as_deref(), body.claim).await?;
     require_heard(&build)?;
     let user = caller.user()?;
     require_push_now(&app, user, &build.repo).await?;
     let gh = installation(&app, id).await?;
-    let ScopedToken { token, expires_at } = gh.push_token(&build.repo).await?;
+    let ScopedToken { token, expires_at } = match body.scope {
+        TokenScope::Push => gh.push_token(&build.repo).await?,
+        TokenScope::Read => gh.pr_read_token(&build.repo).await?,
+    };
     let held = holder(
         id,
         build.id,
@@ -774,8 +791,8 @@ pub(crate) async fn mint_push_token(
         body.claim,
     );
     still_held(&app, &gh, held, &build.repo, &token).await?;
-    tracing::info!(installation = id, repo = %build.repo, issue = build.issue, login = user.login(), "minted a push token");
-    Ok(Json(PushTokenView { token, expires_at }))
+    tracing::info!(installation = id, repo = %build.repo, issue = build.issue, login = user.login(), scope = ?body.scope, "minted a build token");
+    Ok(Json(BuildTokenView { token, expires_at }))
 }
 
 /// `held` still holds its build in a lane that is on, now that `token` was minted for it: or
@@ -793,7 +810,7 @@ async fn still_held(
     }
     // GitHub's answer to a failed revoke may echo what it was sent: only the failure is logged.
     if gh.revoke(token).await.is_err() {
-        tracing::warn!(installation = held.installation_id, %repo, "could not revoke a push token");
+        tracing::warn!(installation = held.installation_id, %repo, "could not revoke a build token");
     }
     holds?;
     require_lane(app, held.installation_id).await?;

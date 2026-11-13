@@ -478,9 +478,7 @@ async fn claimed_view(
 ) -> Result<ClaimedBuildView, ApiError> {
     let build = &claimed.build;
     let gh = installation(app, id).await?;
-    let (settings, default_branch) = settings(app, &gh, id, &build.repo).await?;
-    let author = identity(app, &gh, &bot(app).await?).await?;
-    let co_author = identity(app, &gh, user.login()).await?;
+    let view = task_view(app, &gh, id, user, build).await?;
     if build.mirrored {
         mirror(
             gh.assign(&build.repo, build.issue, user.login()).await,
@@ -497,6 +495,20 @@ async fn claimed_view(
             "unassign",
         );
     }
+    Ok(view)
+}
+
+/// What a daemon needs to work on `build` for `user`.
+async fn task_view(
+    app: &AppState,
+    gh: &Installation,
+    id: u64,
+    user: &SignedIn,
+    build: &Build,
+) -> Result<ClaimedBuildView, ApiError> {
+    let (settings, default_branch) = settings(app, gh, id, &build.repo).await?;
+    let author = identity(app, gh, &bot(app).await?).await?;
+    let co_author = identity(app, gh, user.login()).await?;
     Ok(ClaimedBuildView {
         build: build.id,
         claim: build.claim,
@@ -583,6 +595,32 @@ pub(crate) async fn heartbeat_build(
         return Err(cancelled(build));
     }
     Ok(Json(beat.into()))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct GetBuildTask {
+    pub claim: u64,
+    /// The daemon that claimed it, as `claim_build` was told.
+    #[serde(default)]
+    #[ts(optional)]
+    pub daemon: Option<String>,
+}
+
+/// The task of a build the caller holds, as `claim_build` gave it: for a daemon that restarted
+/// and lands the PRs it holds. Changes nothing.
+pub(crate) async fn get_build_task(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path((id, build)): Path<(u64, u64)>,
+    Query(query): Query<GetBuildTask>,
+) -> Result<Json<ClaimedBuildView>, ApiError> {
+    let daemon = query.daemon.as_deref();
+    let (id, build) = held(&app, &caller, id, build, daemon, query.claim).await?;
+    let gh = installation(&app, id).await?;
+    Ok(Json(
+        task_view(&app, &gh, id, caller.user()?, &build).await?,
+    ))
 }
 
 #[derive(Deserialize, TS)]

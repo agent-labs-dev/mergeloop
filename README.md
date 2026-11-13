@@ -389,6 +389,7 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `list_builds` | The build lane's builds: each issue, its status, who holds it and how lately they were heard from | Yes |
 | `claim_build` | Claims one task for you to build, in a repo you may push to | Yes |
 | `heartbeat_build` | Says you still work on a build you claimed | Yes |
+| `get_build_task` | The task of a build you hold, as its claim gave it, for a daemon that restarted | Yes |
 | `release_build` | Gives a build back, or marks it stuck with a reason | Yes |
 | `mint_push_token` | A token that pushes to the repo of a build you hold, and nothing else | Yes |
 | `open_build_pr` | Has the App open the PR of a build you hold, once its branch is pushed | Yes |

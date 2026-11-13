@@ -4,6 +4,7 @@
 //! commits it. A review may run the repo and write tests to show what it finds, which the caller
 //! throws away but for its evidence: its answer is its last message.
 
+mod answers;
 mod build;
 mod chatgpt;
 mod claude;
@@ -13,6 +14,7 @@ mod keys;
 mod local;
 mod vote;
 
+pub use answers::{REPLY, RESOLVE, ThreadAnswers, thread_answers};
 pub use build::{BuildRequest, VerifyFailed, build_description, build_prompt};
 #[cfg(any(test, feature = "testing"))]
 pub use chatgpt::testing;
@@ -216,7 +218,7 @@ pub trait Resolver: Send + Sync {
 
 pub(crate) const GIVE_UP: &str = "MERGEPATROL_GIVE_UP:";
 const RETITLE: &str = "MERGEPATROL_RETITLE:";
-pub(crate) const COMMIT: &str = "MERGELOOP_COMMIT:";
+pub const COMMIT: &str = "MERGELOOP_COMMIT:";
 
 /// The reason the agent gave up, if its last message says it did.
 pub(crate) fn gave_up(text: &str) -> Option<String> {

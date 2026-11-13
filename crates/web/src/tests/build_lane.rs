@@ -156,6 +156,7 @@ async fn github(hub: Shared) -> GitHub {
                 (201, json!({ "number": number }).to_string())
             }
             ("GET", "/repos/o/y") => push(true),
+            ("GET", "/repos/o/r/installation") => (200, r#"{"id":1}"#.into()),
             ("POST", "/graphql") if call.body.contains("timelineItems") => timeline(&mut hub, call.body),
             ("PATCH", path) if path.starts_with("/repos/o/r/pulls/") => {
                 let number: u64 = path["/repos/o/r/pulls/".len()..].parse().unwrap();
@@ -1952,4 +1953,64 @@ async fn a_recorded_pr_closed_or_merged_is_not_labeled_and_says_which(pool: PgPo
         "{:?}",
         hub.writes
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_restarted_daemon_gets_the_task_of_a_build_it_holds_and_nobody_else_does(pool: PgPool) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let laptop = json!({ "daemon": "laptop-1" });
+    let (_, claimed) = call(&router, "ana", "POST", "/builds/claim", laptop).await;
+    let body =
+        json!({ "claim": claimed["claim"], "daemon": "laptop-1", "title": "T", "body": "B" });
+    let path = format!("/builds/{}/pr", claimed["build"]);
+    assert_eq!(
+        call(&router, "ana", "POST", &path, body).await.0,
+        StatusCode::OK
+    );
+    let writes = hub.lock().unwrap().writes.len();
+
+    let task = |who: &'static str, daemon: &'static str| {
+        let path = format!(
+            "/builds/{}/task?claim={}&daemon={daemon}",
+            claimed["build"], claimed["claim"]
+        );
+        let router = router.clone();
+        async move { call(&router, who, "GET", &path, Value::Null).await }
+    };
+    let (status, resumed) = task("ana", "laptop-1").await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    let mut want = claimed.clone();
+    want["pr"] = json!(40);
+    assert_eq!(resumed, want, "the claim's task, with its PR");
+    assert_eq!(
+        hub.lock().unwrap().writes.len(),
+        writes,
+        "nothing changed on GitHub"
+    );
+    for (who, daemon) in [("ana", "desktop-1"), ("ben", "laptop-1")] {
+        let (status, said) = task(who, daemon).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{who} {daemon}: {said}");
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_signed_in_daemon_reaches_the_land_loops_tools_for_its_pr(pool: PgPool) {
+    let hub = shared(vec![]);
+    let (router, _) = lane(pool, &hub).await;
+    for args in [
+        json!({ "repo": "o/r", "number": 40 }),
+        json!({ "workspace": 1, "repo": "o/r", "number": 40 }),
+    ] {
+        let mut need = args.clone();
+        need["for_daemon"] = true.into();
+        let answer = mcp_tool(&router, "ana", "next_need", need).await;
+        assert_eq!(answer["isError"], false, "{answer}");
+        let text: Value =
+            serde_json::from_str(answer["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["needs"], "queue", "{text}");
+        let review = mcp_tool(&router, "ana", "get_agent_review", args).await;
+        assert_eq!(review["isError"], false, "{review}");
+    }
 }

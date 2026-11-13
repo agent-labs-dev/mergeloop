@@ -1608,6 +1608,108 @@ async fn a_thread_past_the_first_page_is_answered() {
     assert!(threads.iter().any(|t| *t == ("T140".into(), true)));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_that_leaves_a_thread_open_does_not_settle_the_need_nor_is_posted_again() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake
+        .script(105, vec![fake::need("threads", "t1", THREADS)]);
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false), ("T2".into(), false)];
+    let prompts = w.root().join("prompts");
+    let body = format!(
+        "printf '%s\\n=====\\n' \"$prompt\" >> '{}'",
+        prompts.display()
+    );
+    let answer =
+        "MERGELOOP_REPLY: T1 Fixed it.\nMERGELOOP_RESOLVE: T1\nMERGELOOP_REPLY: T2 Not this PR's.";
+    let agent = w.agent("replier", &body, answer);
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| !l.released.is_empty())
+    })
+    .await;
+
+    assert_eq!(w.runs(), 10, "each run that left the need counts");
+    assert_eq!(
+        replies(&w),
+        ["T1", "T2"],
+        "each reply posted once over all runs"
+    );
+    let prompts = std::fs::read_to_string(prompts).unwrap();
+    let prompts: Vec<&str> = prompts.split("=====\n").collect();
+    assert!(!prompts[0].contains("still open"), "{}", prompts[0]);
+    for later in &prompts[1..10] {
+        assert!(
+            later.contains("still open: T2.") && !later.contains("T1"),
+            "{later}"
+        );
+        assert!(later.contains("A reply alone does not close"), "{later}");
+    }
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("as it was"), "{why}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_cannot_answer_for_now_never_ends_a_landing_build() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    for tool in [
+        "get_build_task",
+        "next_need",
+        "report_build",
+        "mint_build_token",
+    ] {
+        w.fake
+            .refuse(tool, "", 502, "GitHub did not answer in time");
+    }
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert_eq!(w.runs(), 1);
+    assert_eq!(replies(&w), ["T1"]);
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+    let reports = w.fake.args_of("report_build");
+    assert_eq!(reports[0]["standing"], "landing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_whose_answer_was_lost_is_not_posted_a_second_time() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    {
+        let mut seen = w.fake.seen.lock().unwrap();
+        seen.lane.threads = vec![("T1".into(), false)];
+        seen.lane.graphql_lost = vec![("addPullRequestReviewThreadReply".into(), 1)];
+    }
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert_eq!(replies(&w), ["T1"], "asked once: the retry saw it there");
+    let comments = w.fake.lane(|l| l.comments["T1"].clone());
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert_eq!(w.fake.lane(|l| l.threads.clone()), [("T1".into(), true)]);
+}
+
 const CLOSED: &str = "PR #105 was closed without merging. Release the build as stuck, saying so.";
 
 #[tokio::test(flavor = "multi_thread")]

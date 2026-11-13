@@ -13,24 +13,41 @@ pub struct Bot<'a> {
     pub token: &'a str,
 }
 
+/// A review thread of a PR, as the bot sees it.
+pub struct Thread {
+    pub id: String,
+    pub resolved: bool,
+    /// The body of the bot's newest comment among the thread's last 20.
+    pub bot_said: Option<String>,
+}
+
 impl Bot<'_> {
-    /// The ids of the PR's review threads, and whether each is resolved: every page of them.
-    pub async fn threads(&self, repo: &str, pr: u64) -> Result<Vec<(String, bool)>> {
+    /// The PR's review threads: every page of them.
+    pub async fn threads(&self, repo: &str, pr: u64) -> Result<Vec<Thread>> {
         let (owner, name) = repo.split_once('/').context("a repo is owner/name")?;
         let mut threads = Vec::new();
         let mut after = Value::Null;
         loop {
             let data = self
                 .graphql(
-                    "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100, after: $after) { nodes { id isResolved } pageInfo { hasNextPage endCursor } } } } }",
+                    "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100, after: $after) { nodes { id isResolved comments(last: 20) { nodes { body viewerDidAuthor } } } pageInfo { hasNextPage endCursor } } } } }",
                     json!({ "owner": owner, "name": name, "pr": pr, "after": after }),
                 )
                 .await?;
             let page = &data["repository"]["pullRequest"]["reviewThreads"];
             let nodes = page["nodes"].as_array().into_iter().flatten();
-            threads.extend(
-                nodes.filter_map(|n| Some((n["id"].as_str()?.to_owned(), n["isResolved"] == true))),
-            );
+            threads.extend(nodes.filter_map(|n| {
+                let comments = n["comments"]["nodes"].as_array().into_iter().flatten();
+                let bot_said = comments
+                    .filter(|c| c["viewerDidAuthor"] == true)
+                    .filter_map(|c| c["body"].as_str())
+                    .next_back();
+                Some(Thread {
+                    id: n["id"].as_str()?.to_owned(),
+                    resolved: n["isResolved"] == true,
+                    bot_said: bot_said.map(str::to_owned),
+                })
+            }));
             if page["pageInfo"]["hasNextPage"] != true {
                 return Ok(threads);
             }

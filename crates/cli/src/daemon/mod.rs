@@ -123,7 +123,7 @@ impl Daemon {
             .collect();
         let mut resumed = Vec::new();
         for lane in &lanes {
-            resumed.extend(take_up_held(lane).await?);
+            resumed.extend(take_up_held(lane, self.poll).await?);
         }
         let builder = Builder {
             agent: self.config.builder.clone(),
@@ -150,8 +150,9 @@ impl Daemon {
 /// Takes up the builds this daemon holds from before it stopped: those with a PR, to land them
 /// again, and gives back those without, whose work went with it. Another daemon's builds, of the
 /// same login too, are not listed.
-async fn take_up_held(lane: &Lane) -> Result<Vec<(Lane, Task)>> {
-    let held = match lane.held().await {
+async fn take_up_held(lane: &Lane, pause: Duration) -> Result<Vec<(Lane, Task)>> {
+    let said = |e: &anyhow::Error| eprintln!("mergeloop: could not list the builds held: {e:#}");
+    let held = match lane::answered(pause, said, || lane.held()).await {
         Ok(held) => held,
         Err(e) if refusal(&e) == Some(Refusal::LaneOff) => return Ok(vec![]),
         Err(e) => return Err(e),
@@ -159,13 +160,20 @@ async fn take_up_held(lane: &Lane) -> Result<Vec<(Lane, Task)>> {
     let mut resumed = Vec::new();
     for build in &held {
         let taken = match build.pr {
-            Some(_) => lane.task_of(build).await.map(|task| {
-                eprintln!(
-                    "mergeloop: lands build {}'s PR again, from before",
-                    build.id
-                );
-                resumed.push((lane.clone(), task));
-            }),
+            Some(_) => {
+                let said = |e: &anyhow::Error| {
+                    eprintln!("mergeloop: could not read build {}'s task: {e:#}", build.id);
+                };
+                lane::answered(pause, said, || lane.task_of(build))
+                    .await
+                    .map(|task| {
+                        eprintln!(
+                            "mergeloop: lands build {}'s PR again, from before",
+                            build.id
+                        );
+                        resumed.push((lane.clone(), task));
+                    })
+            }
             None => lane.give_back(build).await.map(|()| {
                 eprintln!("mergeloop: gave back build {}, left from before", build.id);
             }),

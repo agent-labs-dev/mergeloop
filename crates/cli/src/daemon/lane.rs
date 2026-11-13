@@ -1,10 +1,13 @@
 //! The build lane's tools, as the daemon calls them for one workspace, signed in.
 
+use std::future::Future;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::client::Client;
+use crate::client::{Client, unanswered};
 
 /// A task the daemon claimed: what `claim_build` gives.
 #[derive(Debug, Clone, Deserialize)]
@@ -238,4 +241,34 @@ pub async fn workspaces(client: &Client) -> Result<Vec<u64>> {
                 .context("a workspace without an installation_id")
         })
         .collect()
+}
+
+/// What a failed call to the server comes to: when the server failed to answer for now
+/// (`unanswered`), it is said with `said` and, after `pause`, `Ok`: the caller asks again. A
+/// refusal, or another error, is returned: only those settle a build.
+pub async fn again(
+    pause: Duration,
+    e: anyhow::Error,
+    said: impl FnOnce(&anyhow::Error),
+) -> Result<()> {
+    if !unanswered(&e) {
+        return Err(e);
+    }
+    said(&e);
+    tokio::time::sleep(pause).await;
+    Ok(())
+}
+
+/// `call`'s answer, asked again (`again`) for as long as the server fails to answer.
+pub async fn answered<T, F: Future<Output = Result<T>>>(
+    pause: Duration,
+    said: impl Fn(&anyhow::Error),
+    call: impl Fn() -> F,
+) -> Result<T> {
+    loop {
+        match call().await {
+            Ok(answer) => return Ok(answer),
+            Err(e) => again(pause, e, &said).await?,
+        }
+    }
 }

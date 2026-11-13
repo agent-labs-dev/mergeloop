@@ -100,18 +100,19 @@ impl Pr<'_> {
 /// The PR's next need that the loop does not handle itself: a wait is waited out, and a PR that
 /// is not queued is queued, once per need. `after` is the need seen last, and moves on with the
 /// needs.
-pub async fn next(client: &Client, pr: &Pr<'_>, after: &mut Option<String>) -> Result<Value> {
+/// `first` is a need already asked for, which the loop starts from.
+pub async fn next(
+    client: &Client,
+    pr: &Pr<'_>,
+    after: &mut Option<String>,
+    mut first: Option<Value>,
+) -> Result<Value> {
     let mut said = String::new();
     loop {
-        let mut args = pr.args();
-        args["wait"] = LONGEST_WAIT.into();
-        if pr.for_daemon {
-            args["for_daemon"] = true.into();
-        }
-        if let Some(after) = after.as_deref() {
-            args["after"] = after.into();
-        }
-        let need = client.json("next_need", args).await?;
+        let need = match first.take() {
+            Some(need) => need,
+            None => ask(client, pr, after.as_deref()).await?,
+        };
         let id = need["id"].as_str().unwrap_or_default().to_owned();
         match need["needs"].as_str() {
             Some("wait") => {
@@ -141,6 +142,20 @@ pub async fn next(client: &Client, pr: &Pr<'_>, after: &mut Option<String>) -> R
     }
 }
 
+/// The PR's need once it is not `after`, or `after` again, as a `wait`, when that is still its
+/// need after the longest wait: one call, as the server answers it.
+pub async fn ask(client: &Client, pr: &Pr<'_>, after: Option<&str>) -> Result<Value> {
+    let mut args = pr.args();
+    args["wait"] = LONGEST_WAIT.into();
+    if pr.for_daemon {
+        args["for_daemon"] = true.into();
+    }
+    if let Some(after) = after {
+        args["after"] = after.into();
+    }
+    client.json("next_need", args).await
+}
+
 /// Queues the PR, and waits until it needs the agent: prints that need, and returns its exit
 /// code.
 pub async fn land(
@@ -155,7 +170,7 @@ pub async fn land(
         workspace: None,
         for_daemon: false,
     };
-    let need = next(client, &pr, &mut after).await?;
+    let need = next(client, &pr, &mut after, None).await?;
     println!("{}", serde_json::to_string_pretty(&printed(&need))?);
     let code = need["exit_code"].as_u64().unwrap_or(2);
     Ok(u8::try_from(code).unwrap_or(2))

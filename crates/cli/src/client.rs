@@ -213,7 +213,13 @@ impl Client {
         }
         let body = res.text().await.map_err(|e| Retry::Yes(e.into()))?;
         if status.is_server_error() {
-            return Err(Retry::Yes(anyhow!("{url} answered {status}")));
+            return Err(Retry::Yes(
+                Unanswered {
+                    url: url.to_owned(),
+                    status: status.as_u16(),
+                }
+                .into(),
+            ));
         }
         if !status.is_success() {
             return Err(Retry::No(anyhow!("{url} answered {status}: {body}")));
@@ -315,6 +321,31 @@ pub fn refusal(e: &anyhow::Error) -> Option<Refusal> {
     e.downcast_ref::<Refused>().and_then(|r| r.kind)
 }
 
+/// The server answered 5xx: it failed, and refused nothing.
+#[derive(Debug)]
+struct Unanswered {
+    url: String,
+    status: u16,
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} answered {}", self.url, self.status)
+    }
+}
+
+impl std::error::Error for Unanswered {}
+
+/// Whether `e` is the server failing to answer for now, which asking again may mend: it could
+/// not be reached, or it answered 5xx, as when its own read of GitHub failed. A refusal of a kind,
+/// a 4xx, or an answer that makes no sense is not.
+pub fn unanswered(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<Refused>() {
+        Some(r) => r.kind.is_none() && r.status.is_some_and(|s| s >= 500),
+        None => e.is::<Unanswered>() || e.downcast_ref::<reqwest::Error>().is_some(),
+    }
+}
+
 /// Whether a failed call is worth making again.
 enum Retry {
     Yes(anyhow::Error),
@@ -327,6 +358,35 @@ mod tests {
 
     fn url(s: &str) -> String {
         Server::parse(s).unwrap().url().to_owned()
+    }
+
+    #[test]
+    fn only_a_server_that_failed_is_unanswered_never_one_that_refused() {
+        let refused = |status, kind| -> anyhow::Error {
+            Refused {
+                tool: "report_build".into(),
+                status,
+                kind,
+                text: "no".into(),
+            }
+            .into()
+        };
+        for status in [500, 502, 503] {
+            assert!(unanswered(&refused(Some(status), None)), "{status}");
+        }
+        let failed: anyhow::Error = Unanswered {
+            url: "https://mergeloop.ai".into(),
+            status: 502,
+        }
+        .into();
+        assert!(unanswered(&failed.context("report_build")));
+        assert!(!unanswered(&refused(Some(409), None)));
+        assert!(!unanswered(&refused(Some(401), None)));
+        assert!(!unanswered(&refused(None, None)));
+        assert!(!unanswered(&refused(Some(503), Some(Refusal::LaneOff))));
+        assert!(!unanswered(&anyhow!(
+            "report_build answered no JSON: <html>"
+        )));
     }
 
     #[test]

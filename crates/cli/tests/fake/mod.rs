@@ -40,8 +40,11 @@ pub struct Lane {
     /// Refusals to answer once each, in place of the tool's answer: the tool, the refusal's
     /// kind as `_meta.refusal` names it, its status, and its text.
     pub refusals: Vec<(String, String, u16, String)>,
-    /// The needs `next_need` gives a daemon for each PR, in order, each once. Then it waits.
+    /// The needs `next_need` gives a daemon for each PR, in order, each once. Then the last
+    /// one given stays the PR's need, as the server's stays until something changes it.
     pub needs: HashMap<u64, VecDeque<Value>>,
+    /// Each PR's need as it is now: the last one `next_need` gave.
+    pub current: HashMap<u64, Value>,
     /// Each `report_build`: the build, and its standing.
     pub reports: Vec<(u64, String)>,
     /// What `get_build_task` gives for each build.
@@ -52,6 +55,11 @@ pub struct Lane {
     pub graphql: Vec<(String, String, Value)>,
     /// GraphQL calls GitHub refuses: those whose query has the text, so many more times.
     pub graphql_refusals: Vec<(String, u32)>,
+    /// GraphQL calls GitHub does but whose answer is lost on the way: those whose query has
+    /// the text, so many more times. They answer 502.
+    pub graphql_lost: Vec<(String, u32)>,
+    /// The replies in each review thread, oldest first: all the bot's, as only it replies here.
+    pub comments: HashMap<String, Vec<String>>,
 }
 
 impl Lane {
@@ -293,20 +301,27 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
             seen.lane.opened.push((build, said("title"), said("body")));
             json!({ "id": build, "status": "landing", "pr": 100 + build })
         }
+        // The next scripted need, else the PR's need as it is now, unless the daemon saw it:
+        // then a wait that names it, as the server's "nothing new since" does.
         "next_need" if args["for_daemon"] == true => {
             let number = args["number"].as_u64().unwrap_or_default();
-            let next = seen
-                .lane
-                .needs
-                .get_mut(&number)
-                .and_then(VecDeque::pop_front);
-            next.unwrap_or_else(|| {
-                need(
-                    "wait",
-                    args["after"].as_str().unwrap_or("w"),
-                    "Nothing for you yet",
-                )
-            })
+            let lane = &mut seen.lane;
+            if let Some(next) = lane.needs.get_mut(&number).and_then(VecDeque::pop_front) {
+                lane.current.insert(number, next.clone());
+                next
+            } else {
+                match lane.current.get(&number) {
+                    Some(now) if now["needs"] != "wait" && args["after"] != now["id"] => {
+                        now.clone()
+                    }
+                    Some(now) => need("wait", now["id"].as_str().unwrap_or("w"), "Nothing new"),
+                    None => need(
+                        "wait",
+                        args["after"].as_str().unwrap_or("w"),
+                        "Nothing for you yet",
+                    ),
+                }
+            }
         }
         "report_build" => {
             let build = args["build"].as_u64().unwrap_or_default();
@@ -362,6 +377,13 @@ async fn graphql(State(seen): Shared, headers: HeaderMap, Json(body): Json<Value
             json!([{ "type": "FORBIDDEN", "message": "Resource not accessible by integration" }]);
         return Json(json!({ "data": null, "errors": errors })).into_response();
     }
+    let lost = seen
+        .lane
+        .graphql_lost
+        .iter_mut()
+        .find(|(text, times)| *times > 0 && query.contains(text.as_str()))
+        .map(|(_, times)| *times -= 1)
+        .is_some();
     let data = if query.contains("reviewThreads") {
         // 100 a page, as GitHub's most; a page's cursor is the index it starts at.
         let from: usize = vars["after"].as_str().map_or(0, |a| a.parse().unwrap());
@@ -370,7 +392,13 @@ async fn graphql(State(seen): Shared, headers: HeaderMap, Json(body): Json<Value
             .iter()
             .skip(from)
             .take(100)
-            .map(|(id, resolved)| json!({ "id": id, "isResolved": resolved }))
+            .map(|(id, resolved)| {
+                let said = seen.lane.comments.get(id).into_iter().flatten();
+                let comments: Vec<Value> = said
+                    .map(|body| json!({ "body": body, "viewerDidAuthor": true }))
+                    .collect();
+                json!({ "id": id, "isResolved": resolved, "comments": { "nodes": comments } })
+            })
             .collect();
         let next = from + 100 < threads.len();
         let info =
@@ -383,8 +411,14 @@ async fn graphql(State(seen): Shared, headers: HeaderMap, Json(body): Json<Value
         }
         json!({ "resolveReviewThread": { "thread": { "id": id } } })
     } else {
+        let thread = vars["thread"].as_str().unwrap_or_default().to_owned();
+        let body = vars["body"].as_str().unwrap_or_default().to_owned();
+        seen.lane.comments.entry(thread).or_default().push(body);
         json!({ "addPullRequestReviewThreadReply": { "comment": { "id": "c" } } })
     };
+    if lost {
+        return (StatusCode::BAD_GATEWAY, "Bad gateway").into_response();
+    }
     Json(json!({ "data": data })).into_response()
 }
 

@@ -149,6 +149,27 @@ impl World {
             .unwrap();
     }
 
+    /// Makes the workspace folder the daemon's, as its first start does: its name in
+    /// `daemon/id`. A test that puts things in the folder before a run marks it first.
+    fn mark(&self) {
+        let own = self.workspace().join("daemon");
+        std::fs::create_dir_all(&own).unwrap();
+        if !own.join("id").exists() {
+            std::fs::write(own.join("id"), "this-one\n").unwrap();
+        }
+    }
+
+    /// Starts the daemon, which must refuse to start: what it says, and that it claimed nothing.
+    async fn refused(&self, config: Config) -> String {
+        let daemon = Daemon::new(config, self.client());
+        let ran = tokio::time::timeout(Duration::from_secs(20), daemon.run(std::future::pending()))
+            .await
+            .expect("the daemon refuses to start");
+        let e = ran.expect_err("the daemon refuses to start");
+        assert!(!self.fake.tools().contains(&"claim_build".to_owned()));
+        format!("{e:#}")
+    }
+
     /// The remote's commit on `branch`, if it has one: subject, author, committer, body.
     fn pushed(&self, branch: &str) -> Option<[String; 4]> {
         let out = std::process::Command::new("git")
@@ -614,6 +635,7 @@ async fn a_build_that_panics_is_released_as_stuck_and_cleaned_up_and_the_daemon_
 #[tokio::test(flavor = "multi_thread")]
 async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed() {
     let w = World::new().await;
+    w.mark();
     // What a crash left: the clone, a worktree on its branch, and a branch alone.
     let clone = w.workspace().join("repos/o/r.git");
     std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
@@ -641,7 +663,8 @@ async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed(
         ],
     );
     git(&clone, &["branch", "mergeloop/build-6", "main"]);
-    std::fs::create_dir_all(w.workspace().join("builds/half-made")).unwrap();
+    // A room a crash left half made.
+    std::fs::create_dir_all(w.workspace().join("builds/98/tree")).unwrap();
     // And a clone a crash left before `git init`.
     std::fs::create_dir_all(w.workspace().join("repos/o/half.git")).unwrap();
     assert_eq!(w.left().1.len(), 2);
@@ -663,19 +686,17 @@ async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn on_start_nothing_a_crash_left_half_made_stops_the_daemon_and_the_next_build_runs() {
+async fn on_start_what_a_crash_left_half_made_of_its_own_is_made_again_and_the_next_build_runs() {
     let w = World::new().await;
+    w.mark();
     // A clone a crash left after `git init`, before it had its origin.
     let clone = w.workspace().join("repos/o/r.git");
     std::fs::create_dir_all(&clone).unwrap();
     git(&clone, &["init", "-q", "--bare"]);
     assert!(clone.join("HEAD").exists());
-    // And a process-group record that is no file the daemon can read or remove as one.
-    let groups = w.workspace().join("daemon/groups");
-    std::fs::create_dir_all(groups.join("77.999999/x")).unwrap();
-    // And a lock and a name that are folders.
+    // And a lock that is a folder, and a file where the process-group records go.
     std::fs::create_dir_all(w.workspace().join("daemon/lock/x")).unwrap();
-    std::fs::create_dir_all(w.workspace().join("daemon/id/x")).unwrap();
+    std::fs::write(w.workspace().join("daemon/groups"), "").unwrap();
     w.fake.add_task(w.task(1, 7, &[]));
     let agent = w.agent("my-agent", "echo built > feature.txt", BUILT);
 
@@ -684,9 +705,176 @@ async fn on_start_nothing_a_crash_left_half_made_stops_the_daemon_and_the_next_b
 
     assert_eq!(w.fake.lane(|l| l.opened.len()), 1, "{:?}", w.fake.tools());
     assert!(w.pushed("mergeloop/build-7").is_some());
-    assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0);
-    assert!(w.workspace().join("daemon/id").is_file());
+    assert!(w.workspace().join("daemon/lock").is_file());
     assert_eq!(w.left(), (vec![], vec![]));
+}
+
+/// A developer's checkout, made by the test outside the workspace folder: a project folder with
+/// a file, and no git origin, as a reconcile would find broken.
+fn checkout(w: &World) -> PathBuf {
+    let dev = w.root().join("dev/acme/project");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("work.txt"), "unsaved work\n").unwrap();
+    dev
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_folder_with_other_things_in_it_and_no_daemon_name_is_refused_and_left_alone() {
+    let w = World::new().await;
+    // The developer points `workspace` at a folder of their own.
+    let project = w.workspace().join("repos/acme/project.git");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("work.txt"), "unsaved work\n").unwrap();
+    std::fs::create_dir_all(w.workspace().join("builds/12")).unwrap();
+    let agent = w.agent("idle", "", BUILT);
+
+    let said = w.refused(w.config(1, &agent)).await;
+
+    assert!(
+        said.contains(w.workspace().canonicalize().unwrap().to_str().unwrap()),
+        "{said}"
+    );
+    assert!(said.contains("not a mergeloop daemon's"), "{said}");
+    assert!(project.join("work.txt").exists());
+    assert!(w.workspace().join("builds/12").exists());
+    assert!(
+        !w.workspace().join("daemon").exists(),
+        "nothing was made in it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlink_where_the_daemon_keeps_a_folder_of_its_own_refuses_the_start_and_its_target_is_untouched()
+ {
+    for link in [
+        "repos",
+        "repos/acme",
+        "repos/acme/project.git",
+        "builds",
+        "builds/99",
+        "reviews",
+        "reviews/99",
+        "transcripts",
+        "transcripts/99",
+        "daemon/groups",
+        "daemon",
+    ] {
+        let w = World::new().await;
+        w.mark();
+        let dev = checkout(&w);
+        // What each link stands for: a developer's folder holding the checkout, or the checkout.
+        let target = match link.matches('/').count() {
+            0 => dev.parent().unwrap().parent().unwrap().to_owned(),
+            1 if link.starts_with("repos") => dev.parent().unwrap().to_owned(),
+            _ => dev.clone(),
+        };
+        let at = w.workspace().join(link);
+        if link == "daemon" {
+            std::fs::remove_dir_all(&at).unwrap();
+        }
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &at).unwrap();
+        let agent = w.agent("idle", "", BUILT);
+
+        let said = w.refused(w.config(1, &agent)).await;
+
+        assert!(said.contains(&format!("/{link}")), "{link}: {said}");
+        assert!(said.contains("symlink"), "{link}: {said}");
+        assert!(
+            dev.join("work.txt").exists(),
+            "{link}: the checkout was touched"
+        );
+        assert!(at.is_symlink(), "{link}: the link itself is left");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_start_an_entry_not_of_the_daemons_shape_is_left_alone() {
+    let w = World::new().await;
+    w.mark();
+    for dir in [
+        "builds/notes",
+        "reviews/notes",
+        "repos/o/notes",
+        "transcripts/x/y",
+    ] {
+        std::fs::create_dir_all(w.workspace().join(dir)).unwrap();
+    }
+    std::fs::write(w.workspace().join("builds/12"), "a file").unwrap();
+    std::fs::write(w.workspace().join("repos/readme"), "a file").unwrap();
+    let agent = w.agent("idle", "", BUILT);
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.tools().contains(&"claim_build".to_owned())
+    })
+    .await;
+
+    for path in [
+        "builds/notes",
+        "reviews/notes",
+        "repos/o/notes",
+        "builds/12",
+        "repos/readme",
+    ] {
+        assert!(w.workspace().join(path).exists(), "{path} was removed");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_file_the_daemon_cannot_open_refuses_the_start_and_is_kept() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let w = World::new().await;
+    w.mark();
+    // A live daemon's lock, made read-only while it runs.
+    let lock = w.workspace().join("daemon/lock");
+    std::fs::write(&lock, "").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let inode = std::fs::metadata(&lock).unwrap().ino();
+    let agent = w.agent("idle", "", BUILT);
+
+    let said = w.refused(w.config(1, &agent)).await;
+
+    assert!(said.contains("daemon/lock"), "{said}");
+    assert_eq!(
+        std::fs::metadata(&lock).unwrap().ino(),
+        inode,
+        "the lock was replaced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_group_records_the_daemon_cannot_list_refuse_the_start_and_are_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new().await;
+    w.mark();
+    let groups = w.workspace().join("daemon/groups");
+    std::fs::create_dir_all(&groups).unwrap();
+    std::fs::write(groups.join("77.999999"), "Mon Jan  1 00:00:00 2001").unwrap();
+    std::fs::set_permissions(&groups, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let agent = w.agent("idle", "", BUILT);
+
+    let said = w.refused(w.config(1, &agent)).await;
+
+    std::fs::set_permissions(&groups, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(said.contains("daemon/groups"), "{said}");
+    assert!(
+        groups.join("77.999999").exists(),
+        "a record was dropped unread"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_name_that_cannot_be_read_refuses_the_start_and_is_kept() {
+    let w = World::new().await;
+    w.mark();
+    let id = w.workspace().join("daemon/id");
+    std::fs::write(&id, "").unwrap();
+    let agent = w.agent("idle", "", BUILT);
+
+    let said = w.refused(w.config(1, &agent)).await;
+
+    assert!(said.contains("daemon/id"), "{said}");
+    assert!(id.is_file());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -850,6 +1038,7 @@ async fn what_the_agent_and_verify_leave_running_ends_with_their_run() {
 #[tokio::test(flavor = "multi_thread")]
 async fn on_start_it_stops_the_processes_a_crashed_daemon_left() {
     let w = World::new().await;
+    w.mark();
     // A build's process group, as a daemon killed mid-build left it, noted in its folder.
     let mut left = std::process::Command::new("sh");
     left.args(["-c", "sleep 60 & sleep 60"]);
@@ -1553,12 +1742,14 @@ async fn a_pr_github_would_not_label_yet_is_opened_on_a_later_call() {
 
     let calls = w.fake.args_of("open_build_pr").len();
     assert_eq!(calls, 2);
-    assert!(w.fake.lane(|l| l.released.is_empty()));
+    let released = w.fake.lane(|l| l.released.clone());
+    assert!(released.is_empty(), "{released:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn transcripts_older_than_seven_days_are_removed() {
     let w = World::new().await;
+    w.mark();
     for (build, stamp) in [("1", "202001010000"), ("2", "")] {
         let dir = w.workspace().join("transcripts").join(build);
         std::fs::create_dir_all(&dir).unwrap();

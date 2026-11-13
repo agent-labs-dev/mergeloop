@@ -106,8 +106,8 @@ impl Daemon {
         }
         let (folder, _lock) = Folder::open(&self.config.workspace)?;
         // What a crash left running goes before what it left on disk.
-        folder.groups().stop_all().await;
-        folder.reconcile(&[]).await;
+        folder.groups().stop_all().await?;
+        folder.reconcile(&[]).await?;
         let workspaces = lane::workspaces(&self.client).await?;
         if workspaces.is_empty() {
             bail!(

@@ -499,7 +499,7 @@ The daemon names itself once, in `daemon/id` in its folder, and holds only the b
 
 ```toml
 slots = 1                          # builds at once, at least 1
-workspace = "~/.mergeloop/daemon"  # the daemon's own folder: absolute, or ~/...
+workspace = "~/.mergeloop/daemon"  # the daemon's own folder, new or empty at first: absolute, or ~/...
 access = "workspace"               # or "full": see "What an agent may do on your machine"
 # deny_read = ["~/.ssh", ...]      # what a build may not read in workspace access: replaces the default list
 
@@ -541,7 +541,7 @@ An agent and what it runs never act as you on GitHub or MergeLoop: a reply or a 
 
 ### The workspace folder, and how it is cleaned
 
-The daemon's folder, `~/.mergeloop/daemon` by default, holds:
+The daemon's folder, `~/.mergeloop/daemon` by default, must be its own. The daemon makes it its own when it first starts there, if the folder is missing or empty, by writing its name in `daemon/id`. It refuses to start in a folder that has other things in it and no `daemon/id`, and touches nothing there: give it a new folder instead. It holds:
 
 - `daemon/`: its lock (a second daemon on the same folder refuses to start), its name (`id`), and the process groups its builds run.
 - `repos/<owner>/<name>.git`: its own clone of each repo it builds in. It never touches your checkouts.
@@ -549,7 +549,7 @@ The daemon's folder, `~/.mergeloop/daemon` by default, holds:
 - `reviews/<build>/`: the reviewer's folder, made empty for each review.
 - `transcripts/<build>/`: what the agents printed, kept 7 days after last written.
 
-The agent and each `verify` command run in a process group of their own, and whatever they leave running is stopped when their run ends; a process that leaves its group (`setsid`) is not found. A build's folders and local branch are removed when the build ends, however it ends, once its processes are gone. A PR's need gets a worktree only while its agent works, and loses it once the change is pushed: a PR that waits has nothing on disk but its transcripts. On start, the daemon stops what a daemon killed mid-build left running, removes whatever a crash left of builds, gives back the builds without a PR that it still holds, and lands again those with one, once MergeLoop has finished labeling and assigning their PR. What it finds in its folder that it cannot read or make sense of, such as a clone a crash left before it had its origin, it removes, saying so in one line, and goes on: a clone is made again when a build next needs it.
+The agent and each `verify` command run in a process group of their own, and whatever they leave running is stopped when their run ends; a process that leaves its group (`setsid`) is not found. A build's folders and local branch are removed when the build ends, however it ends, once its processes are gone. A PR's need gets a worktree only while its agent works, and loses it once the change is pushed: a PR that waits has nothing on disk but its transcripts. On start, the daemon stops what a daemon killed mid-build left running, removes whatever a crash left of builds, gives back the builds without a PR that it still holds, and lands again those with one, once MergeLoop has finished labeling and assigning their PR. It removes only what it knows as a leftover of its own, saying so in one line: a build's or a reviewer's folder of a build it does not hold, and a clone under `repos/<owner>/<name>.git` that is broken, such as one a crash left before it had its origin, which is made again when a build next needs it. Anything else of another shape it leaves, saying so. It follows no symlink in its folder: it never makes one there, so a symlink where it keeps a folder of its own stops the start, with a message naming it, and nothing it points at is touched. A lock, a name or a record of process groups that it cannot read stops the start too, naming the path: stopping is safe, deleting is not.
 
 ### How a build is confined
 

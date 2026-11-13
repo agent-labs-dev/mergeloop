@@ -21,8 +21,14 @@
 //! read. A build's room and branch go when the build ends, however it
 //! ends. Every removal is idempotent, and `reconcile` on start removes whatever a crash left of
 //! builds the daemon does not hold.
+//!
+//! The folder is the daemon's only when it holds `daemon/id`, written when the daemon first makes
+//! the folder: a daemon refuses to start in a folder with other things in it. On start it removes
+//! only what it knows as its own leftover, and follows no symlink: it never makes one in the
+//! folder, so one there is not its own, and stops the start. Stopping is safe; deleting is not.
 
 use std::collections::HashMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -51,26 +57,17 @@ pub struct Folder {
 
 impl Folder {
     /// The folder at `root`, made if it is not there, and held for this process: an error when
-    /// another daemon holds it. The lock goes with the returned file.
+    /// another daemon holds it, or when the folder is not the daemon's. The lock goes with the
+    /// returned file.
     pub fn open(root: &Path) -> Result<(Self, std::fs::File)> {
         std::fs::create_dir_all(root).with_context(|| format!("make {}", root.display()))?;
         // The agents' sandboxes see the folder by its real path (`/tmp` is `/private/tmp` on
         // macOS).
         let root = root.canonicalize()?;
+        claimed(&root)?;
         let own = root.join("daemon");
         std::fs::create_dir_all(&own)?;
-        let open = || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(own.join("lock"))
-        };
-        // Something in its place that is no file is no lock anyone holds.
-        let lock = open().or_else(|e| {
-            discard(&own.join("lock"), Some(&e.into()));
-            open()
-        })?;
+        let lock = lock_file(&own.join("lock"))?;
         // A child forked in this process shares the lock until it execs: give it a moment.
         let locked = (0..50).any(|_| {
             lock.try_lock().is_ok() || {
@@ -231,32 +228,56 @@ impl Folder {
     }
 
     /// Removes every build's worktree and branch but those of `keep`, with whatever a crash
-    /// left half made, and the transcripts older than `TRANSCRIPTS_KEPT`. Heals each clone a
-    /// killed git left locked. What it cannot make sense of it removes, saying so: nothing left
-    /// in the folder stops the daemon. Run it before any build starts.
-    pub async fn reconcile(&self, keep: &[u64]) {
-        let rooms = entries(&self.root.join("builds"));
-        for dir in rooms.into_iter().chain(entries(&self.root.join("reviews"))) {
-            let held = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.parse::<u64>().ok())
-                .is_some_and(|b| keep.contains(&b));
-            if !held {
-                discard(&dir, None);
+    /// left half made of a room or a clone, and the transcripts older than `TRANSCRIPTS_KEPT`.
+    /// Heals each clone a killed git left locked. It removes only folders of the shape it makes;
+    /// anything else it leaves, saying so. A symlink, or a folder it cannot list, is an error:
+    /// the daemon does not start. Run it before any build starts.
+    pub async fn reconcile(&self, keep: &[u64]) -> Result<()> {
+        self.reconcile_rooms(keep)?;
+        self.reconcile_clones().await?;
+        self.prune_transcripts(SystemTime::now()).await
+    }
+
+    /// Removes the builds' and reviewers' rooms of builds not in `keep`.
+    fn reconcile_rooms(&self, keep: &[u64]) -> Result<()> {
+        let rooms = listing(&self.root.join("builds"))?;
+        for dir in rooms
+            .into_iter()
+            .chain(listing(&self.root.join("reviews"))?)
+        {
+            let build = |n: &str| n.parse::<u64>().ok();
+            if !own_dir(&dir, |n| build(n).is_some())? {
+                continue;
+            }
+            let name = dir.file_name().and_then(|n| n.to_str());
+            if !name.and_then(build).is_some_and(|b| keep.contains(&b)) {
+                discard(&dir, "the room of a build it does not hold")?;
             }
         }
-        for owner in entries(&self.root.join("repos")) {
-            for clone in entries(&owner) {
-                if let Err(e) = self.reconcile_clone(&clone).await {
-                    // Made again when a build next needs it.
-                    discard(&clone, Some(&e));
-                }
+        Ok(())
+    }
+
+    /// Prunes each clone of what builds it does not hold left, and removes a broken one.
+    async fn reconcile_clones(&self) -> Result<()> {
+        for owner in listing(&self.root.join("repos"))? {
+            if own_dir(&owner, |_| true)? {
+                self.reconcile_owner(&owner).await?;
             }
         }
-        if let Err(e) = self.prune_transcripts(SystemTime::now()).await {
-            discard(&self.root.join("transcripts"), Some(&e));
+        Ok(())
+    }
+
+    async fn reconcile_owner(&self, owner: &Path) -> Result<()> {
+        for clone in listing(owner)? {
+            if !own_dir(&clone, |n| n.ends_with(".git"))? {
+                continue;
+            }
+            if let Err(e) = self.reconcile_clone(&clone).await {
+                // Made again when a build next needs it.
+                discard(&clone, &format!("{e:#}"))?;
+            }
         }
+        Ok(())
     }
 
     /// Makes `clone` a clone of `url`: made, or made whole when a crash left it before it had its
@@ -304,8 +325,11 @@ impl Folder {
     /// Removes the transcripts of builds last written to more than `TRANSCRIPTS_KEPT` before
     /// `now`.
     pub async fn prune_transcripts(&self, now: SystemTime) -> Result<()> {
-        for dir in list(&self.root.join("transcripts"))? {
-            let written = std::fs::metadata(&dir)?.modified()?;
+        for dir in listing(&self.root.join("transcripts"))? {
+            if !own_dir(&dir, |_| true)? {
+                continue;
+            }
+            let written = std::fs::symlink_metadata(&dir)?.modified()?;
             if now.duration_since(written).unwrap_or_default() > TRANSCRIPTS_KEPT {
                 remove_dir(&dir).await?;
             }
@@ -323,16 +347,86 @@ pub struct Checkout {
     pub remote: Option<String>,
 }
 
-/// The name kept in `dir/id`, made the first time, or when what is there cannot be read.
-/// Written whole or not at all.
+/// Refuses `root` unless it is the daemon's: it holds the daemon's name, or nothing but what
+/// a first start left before it wrote the name. Nothing is made or removed before this.
+fn claimed(root: &Path) -> Result<()> {
+    let own = root.join("daemon");
+    if named(&own)? || unnamed(root, &own)? {
+        return Ok(());
+    }
+    bail!(
+        "{} is not a mergeloop daemon's workspace folder: it holds other things, and no daemon/id. \
+         The daemon touches nothing in it: give it an empty or new folder as `workspace` in its config",
+        root.display()
+    )
+}
+
+/// Whether `own`, the daemon's own folder, holds its name.
+fn named(own: &Path) -> Result<bool> {
+    match kind(own)? {
+        Some(Kind::Link) => Err(not_followed(own)),
+        Some(Kind::Dir) => match kind(&own.join("id"))? {
+            Some(Kind::Link) => Err(not_followed(&own.join("id"))),
+            found => Ok(found == Some(Kind::File)),
+        },
+        _ => Ok(false),
+    }
+}
+
+/// Whether `root` holds nothing but `own` with what a first start made in it before the name.
+fn unnamed(root: &Path, own: &Path) -> Result<bool> {
+    let made_first = |p: &PathBuf| -> Result<bool> {
+        let name = p.file_name().and_then(|n| n.to_str());
+        Ok(matches!(name, Some("lock" | "id.tmp")) && kind(p)? == Some(Kind::File))
+    };
+    all(listing(root)?, |p| {
+        Ok(p == own && all(listing(own)?, made_first)?)
+    })
+}
+
+/// The lock at `path`, opened. A folder in its place is no lock anyone holds, and is replaced;
+/// a file is kept, whatever opening it says.
+fn lock_file(path: &Path) -> Result<std::fs::File> {
+    if kind(path)? == Some(Kind::Dir) {
+        discard(path, "a folder where the lock goes")?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "open the lock {}: another daemon may hold it. Give it back write permission, or stop the daemon that uses this folder",
+                path.display()
+            )
+        })
+}
+
+fn all(paths: Vec<PathBuf>, f: impl Fn(&PathBuf) -> Result<bool>) -> Result<bool> {
+    for p in &paths {
+        if !f(p)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The name kept in `dir/id`, made the first time. Written whole or not at all.
 fn identity(dir: &Path) -> Result<String> {
     let path = dir.join("id");
+    let cannot = |why: String| {
+        anyhow::anyhow!(
+            "cannot read the daemon's name {}: {why}. Remove it to give this daemon a new name: the builds the old one held come free once stale",
+            path.display()
+        )
+    };
     match std::fs::read_to_string(&path) {
         Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_owned()),
-        Ok(_) => {}
+        Ok(_) => return Err(cannot("it is empty".into())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // A name it cannot read names no claim it could still act on.
-        Err(e) => discard(&path, Some(&e.into())),
+        Err(e) => return Err(cannot(e.to_string())),
     }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the OS has no random source");
@@ -343,42 +437,94 @@ fn identity(dir: &Path) -> Result<String> {
     Ok(id)
 }
 
-/// Removes `path`, a folder or not, saying why when `why` is given. Saying so is all it does
-/// when that fails.
-fn discard(path: &Path, why: Option<&anyhow::Error>) {
-    if let Some(e) = why {
-        eprintln!("mergeloop: removes {}: {e:#}", path.display());
+/// What is at a path, looked at without following a symlink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Dir,
+    File,
+    Link,
+    Other,
+}
+
+/// What is at `path`, `None` when nothing is.
+fn kind(path: &Path) -> Result<Option<Kind>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_symlink() => Ok(Some(Kind::Link)),
+        Ok(m) if m.is_dir() => Ok(Some(Kind::Dir)),
+        Ok(m) if m.is_file() => Ok(Some(Kind::File)),
+        Ok(_) => Ok(Some(Kind::Other)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("look at {}", path.display())),
     }
-    let removed = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
-    match removed {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            eprintln!("mergeloop: could not remove {}: {e}", path.display());
+}
+
+/// The error for a symlink where the daemon keeps something of its own.
+pub(super) fn not_followed(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is a symlink, which the daemon never makes there, so it follows it nowhere and \
+         touches nothing it points at. Remove the link, or give the daemon another workspace",
+        path.display()
+    )
+}
+
+/// Whether `path` is one of the daemon's own folders: a folder with a name of the `shape` it
+/// gives them. Anything else is left, and said. A symlink is an error.
+fn own_dir(path: &Path, shape: impl Fn(&str) -> bool) -> Result<bool> {
+    let shaped = path.file_name().and_then(|n| n.to_str()).is_some_and(shape);
+    match (kind(path)?, shaped) {
+        (Some(Kind::Link), _) => Err(not_followed(path)),
+        (Some(Kind::Dir), true) => Ok(true),
+        _ => {
+            eprintln!(
+                "mergeloop: leaves {}: not something the daemon makes",
+                path.display()
+            );
+            Ok(false)
         }
-        _ => {}
     }
 }
 
-/// The entries of `dir`, none when it is not there. A `dir` that cannot be read is removed.
-fn entries(dir: &Path) -> Vec<PathBuf> {
-    list(dir).unwrap_or_else(|e| {
-        discard(dir, Some(&e));
-        vec![]
-    })
-}
-
-/// The folder's entries, none when it is not there.
-fn list(dir: &Path) -> Result<Vec<PathBuf>> {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .map(|e| Ok(e?.path()))
-            .collect::<std::io::Result<_>>()
-            .with_context(|| format!("read {}", dir.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-        Err(e) => Err(e).with_context(|| format!("read {}", dir.display())),
+/// Removes `path`, a folder of the daemon's own, saying why.
+fn discard(path: &Path, why: &str) -> Result<()> {
+    eprintln!("mergeloop: removes {}: {why}", path.display());
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("remove {}", path.display()))
+        }
+        _ => Ok(()),
     }
 }
 
+/// The entries of `dir`, a folder of the daemon's own: none when it is not there. A symlink,
+/// anything else in its place, or a folder it cannot list is an error.
+fn listing(dir: &Path) -> Result<Vec<PathBuf>> {
+    match kind(dir)? {
+        None => return Ok(vec![]),
+        Some(Kind::Dir) => {}
+        Some(Kind::Link) => return Err(not_followed(dir)),
+        Some(_) => bail!(
+            "{} is not a folder, where the daemon keeps one: remove it, or give the daemon another workspace",
+            dir.display()
+        ),
+    }
+    std::fs::read_dir(dir)
+        .and_then(|entries| entries.map(|e| Ok(e?.path())).collect())
+        .with_context(|| {
+            format!(
+                "list {}: give it back its permissions (chmod u+rwx), or give the daemon another workspace",
+                dir.display()
+            )
+        })
+}
+
+/// Removes `dir`, a folder of the daemon's own in `builds`, `reviews` or `transcripts`, and
+/// what is in it: nothing there is fine. Neither `remove_dir_all` nor this follows a symlink.
 async fn remove_dir(dir: &Path) -> Result<()> {
+    if let Some(parent) = dir.parent()
+        && kind(parent)? == Some(Kind::Link)
+    {
+        return Err(not_followed(parent));
+    }
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

@@ -136,25 +136,7 @@ impl Config {
         if !workspace.is_absolute() {
             bail!("workspace must be an absolute path, or start with ~/");
         }
-        let deny_read: Vec<PathBuf> = match file.deny_read {
-            Some(paths) => paths.iter().map(|p| expand(p, home)).collect(),
-            None => DENY_READ.iter().map(|p| expand(p, home)).collect(),
-        };
-        for path in &deny_read {
-            if !path.is_absolute() {
-                bail!(
-                    "deny_read paths must be absolute, or start with ~/: {}",
-                    path.display()
-                );
-            }
-            if workspace.starts_with(path) || path.starts_with(&workspace) {
-                bail!(
-                    "the workspace {} and the deny_read path {} overlap: a build could not read its own folder, or could read what it may not",
-                    workspace.display(),
-                    path.display()
-                );
-            }
-        }
+        let deny_read = deny_read(file.deny_read, &workspace, home)?;
         let builder = file.builder.agent("builder", None)?;
         let reviewer = match file.reviewer.enabled {
             true => Some(file.reviewer.agent(&builder, installed)?),
@@ -169,6 +151,31 @@ impl Config {
             reviewer,
         })
     }
+}
+
+/// The `deny_read` paths, `~` expanded: the default list when the file gives none. Each must be
+/// absolute, and none may overlap the workspace.
+fn deny_read(paths: Option<Vec<String>>, workspace: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+    let deny_read: Vec<PathBuf> = match paths {
+        Some(paths) => paths.iter().map(|p| expand(p, home)).collect(),
+        None => DENY_READ.iter().map(|p| expand(p, home)).collect(),
+    };
+    for path in &deny_read {
+        if !path.is_absolute() {
+            bail!(
+                "deny_read paths must be absolute, or start with ~/: {}",
+                path.display()
+            );
+        }
+        if workspace.starts_with(path) || path.starts_with(workspace) {
+            bail!(
+                "the workspace {} and the deny_read path {} overlap: a build could not read its own folder, or could read what it may not",
+                workspace.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(deny_read)
 }
 
 /// Whether a program named `name` is in a folder on `PATH`.

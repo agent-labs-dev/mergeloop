@@ -151,12 +151,32 @@ impl Builder {
             task,
             &format!("building in {}", checkout.room.tree.display()),
         );
+        match self.rounds(lane, task, &checkout, &base, stage).await? {
+            Ok((built, reviewed)) => {
+                self.publish(lane, task, &checkout, &built, reviewed.as_ref())
+                    .await
+            }
+            Err(why) => Ok(Work::Stuck(why)),
+        }
+    }
+
+    /// The change, committed on `base`, that the reviewer asks nothing more of: the builder's
+    /// run, verified, then each round's review, with the findings back to the builder, at most
+    /// `REVIEW_ROUNDS` times. With it, the run that says what the PR is, and how the review
+    /// went. `Err` with why the build is stuck.
+    async fn rounds(
+        &self,
+        lane: &Lane,
+        task: &Task,
+        checkout: &Checkout,
+        base: &str,
+        stage: &watch::Sender<Stage>,
+    ) -> Result<Result<(Resolution, Option<Reviewed>), String>> {
         let env = env::nobody(&checkout.room);
         let mut findings: Vec<BuildFinding> = vec![];
         let mut built: Option<Resolution> = None;
         let mut fixed = 0;
-        let mut round = 1;
-        let reviewed = loop {
+        for round in 1..=REVIEW_ROUNDS {
             let prompt = |failed: Option<&VerifyFailed>| {
                 build_prompt(&BuildRequest {
                     repo: &task.repo,
@@ -172,53 +192,47 @@ impl Builder {
                 1 => "build".to_owned(),
                 n => format!("build-{n}"),
             };
-            let run = match self.change(task, &checkout, prompt, &env, &step).await? {
+            let run = match self.change(task, checkout, prompt, &env, &step).await? {
                 Ok(run) => run,
-                Err(why) => return Ok(Work::Stuck(why)),
+                Err(why) => return Ok(Err(why)),
             };
             // The first run built the issue: its subject and description say what the PR is.
-            let run = match built {
+            let run = match built.take() {
                 Some(first) if commit_subject(&first.text).is_some() => first,
                 _ => run,
             };
-            let Some(head) = commit(task, &checkout, &base, &run).await? else {
-                return Ok(Work::Stuck("The agent changed nothing.".into()));
+            let Some(head) = commit(task, checkout, base, &run).await? else {
+                return Ok(Err("The agent changed nothing.".into()));
             };
-            built = Some(run);
             let Some(reviewer) = &self.reviewer else {
-                break None;
+                return Ok(Ok((run, None)));
             };
             stage.send_replace(Stage::Reviewing);
             lane.heartbeat(task, Stage::Reviewing).await?;
-            let review = self
-                .review(task, reviewer, &checkout, &base, &head, round)
-                .await?;
-            stage.send_replace(Stage::Building);
-            findings = match review {
+            let review = self.review(task, reviewer, checkout, base, &head, round);
+            findings = match review.await? {
                 Ok(findings) => findings,
-                Err(why) => return Ok(Work::Stuck(why)),
+                Err(why) => return Ok(Err(why)),
             };
+            stage.send_replace(Stage::Building);
             if findings.is_empty() {
-                break Some(Reviewed {
-                    by: reviewer.clone(),
+                let by = reviewer.clone();
+                let reviewed = Reviewed {
+                    by,
                     rounds: round,
                     fixed,
-                });
+                };
+                return Ok(Ok((run, Some(reviewed))));
             }
             say(
                 task,
                 &format!("the reviewer asks for {} change(s)", findings.len()),
             );
-            if round == REVIEW_ROUNDS {
-                return Ok(Work::Stuck(unreviewed(&findings)));
-            }
             fixed += findings.len();
+            built = Some(run);
             lane.heartbeat(task, Stage::Building).await?;
-            round += 1;
-        };
-        let built = built.expect("a round ran");
-        self.publish(lane, task, &checkout, &built, reviewed.as_ref())
-            .await
+        }
+        Ok(Err(unreviewed(&findings)))
     }
 
     /// What the reviewer asks of the change at `head`, in a fresh session of its own that can

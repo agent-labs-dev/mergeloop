@@ -19,7 +19,8 @@ use super::build::{Builder, Ended, Stopped, Work, heard, heartbeats, push, say, 
 use super::env;
 use super::folder::Checkout;
 use super::github::Bot;
-use super::lane::{self, Lane, Scope, Stage, Standing, Task};
+use super::lane::{self, Held, Lane, Scope, Stage, Standing, Task};
+use crate::client::Refused;
 use crate::land::{self, Pr};
 
 /// The agent runs one PR's needs may take before its build is released as stuck: a need that
@@ -29,6 +30,16 @@ pub const ROUNDS: u32 = 10;
 /// How many times the daemon posts a need's answer before the build is stuck: GitHub may refuse
 /// for a moment.
 const ANSWER_TRIES: u32 = 3;
+
+/// How a landing starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// Right after this daemon opened the PR.
+    Opened,
+    /// With a PR from before: from before a restart, or from a holder that went quiet or gave
+    /// it back.
+    TakenUp,
+}
 
 /// What a need asks of the daemon.
 #[derive(Debug, PartialEq, Eq)]
@@ -100,10 +111,11 @@ impl Builder {
         &self,
         lane: &Lane,
         task: &Task,
+        entry: Entry,
         stop: watch::Receiver<bool>,
     ) -> Result<Ended> {
         let work = tokio::select! {
-            work = self.landing(lane, task) => work,
+            work = self.landing(lane, task, entry) => work,
             e = heartbeats(lane, task, || task.stage(), self.heartbeat_every) => Err(e),
             () = stopped(stop) => Err(Stopped.into()),
         };
@@ -117,17 +129,17 @@ impl Builder {
         ended
     }
 
-    async fn landing(&self, lane: &Lane, task: &Task) -> Result<Work> {
+    async fn landing(&self, lane: &Lane, task: &Task, entry: Entry) -> Result<Work> {
         let Some(number) = task.pr else {
             bail!("build {} has no PR to land", task.build);
         };
+        if entry == Entry::TakenUp {
+            // The server may have recorded the PR, then failed before it labeled and assigned
+            // it: its open finishes that, and says when the PR merged or was closed.
+            self.open(lane, task, &task.title, "").await?;
+        }
         say(task, &format!("landing PR #{number}"));
-        let pr = Pr {
-            repo: &task.repo,
-            number,
-            workspace: Some(lane.workspace),
-            for_daemon: true,
-        };
+        let mut task = task.clone();
         let mut at = Landing {
             after: None,
             next: None,
@@ -138,16 +150,57 @@ impl Builder {
             posted: Posted::default(),
         };
         loop {
-            let Some(need) = self.ask(lane, task, &pr, &mut at).await? else {
-                continue;
+            let pr = Pr {
+                repo: &task.repo,
+                number,
+                workspace: Some(lane.workspace),
+                for_daemon: true,
             };
-            match self.on_need(lane, task, &pr, &need, &mut at).await? {
-                Next::Ended(work) => return Ok(work),
-                Next::Seen => at.after = need["id"].as_str().map(str::to_owned),
-                Next::Again => at.after = None,
-                Next::Later => tokio::time::sleep(self.pause).await,
+            let next = match self.ask(lane, &task, &pr, &mut at).await {
+                Ok(None) => continue,
+                Ok(Some(need)) => self
+                    .on_need(lane, &task, &pr, &need, &mut at)
+                    .await
+                    .map(|next| (next, need)),
+                Err(e) => Err(e),
+            };
+            match next {
+                Ok((Next::Ended(work), _)) => return Ok(work),
+                Ok((Next::Seen, need)) => at.after = need["id"].as_str().map(str::to_owned),
+                Ok((Next::Again, _)) => at.after = None,
+                Ok((Next::Later, _)) => tokio::time::sleep(self.pause).await,
+                Err(e) => task = self.renamed(lane, &task, e).await?,
             }
         }
+    }
+
+    /// The build's task under its repo's new name, when `e` refused the repo as not found
+    /// because it was renamed: the server moved the build with it. Else `e`.
+    async fn renamed(&self, lane: &Lane, task: &Task, e: anyhow::Error) -> Result<Task> {
+        let not_found = e
+            .downcast_ref::<Refused>()
+            .is_some_and(|r| r.status == Some(404));
+        if !not_found {
+            return Err(e);
+        }
+        let held = Held {
+            id: task.build,
+            claim: task.claim,
+            pr: task.pr,
+        };
+        let said = |e: &anyhow::Error| say(task, &format!("could not read its task: {e:#}"));
+        let now = lane::answered(self.pause, said, || lane.task_of(&held)).await?;
+        if now.repo == task.repo {
+            return Err(e);
+        }
+        say(
+            task,
+            &format!(
+                "{} is now {}: it lands under the new name",
+                task.repo, now.repo
+            ),
+        );
+        Ok(Task { pr: task.pr, ..now })
     }
 
     /// The PR's next need, or `None` to ask again: after the server failed to answer, or, while

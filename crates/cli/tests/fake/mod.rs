@@ -60,6 +60,10 @@ pub struct Lane {
     pub graphql_lost: Vec<(String, u32)>,
     /// The replies in each review thread, oldest first: all the bot's, as only it replies here.
     pub comments: HashMap<String, Vec<String>>,
+    /// The PRs `open_build_pr` labeled and assigned to the developer.
+    pub assigned: HashSet<u64>,
+    /// Repo names the server no longer knows, as after a rename: a call on one is not found.
+    pub gone: HashSet<String>,
 }
 
 impl Lane {
@@ -77,6 +81,12 @@ impl Lane {
 /// A need as `next_need` gives it.
 pub fn need(needs: &str, id: &str, brief: &str) -> Value {
     json!({ "needs": needs, "id": id, "brief": brief, "exit_code": 0 })
+}
+
+/// In a PR's script, in place of a need: its repo is renamed `to`, at `clone_url`, as the server's
+/// rename pass moves every build of it. The old name is then not found.
+pub fn rename(to: &str, clone_url: &str) -> Value {
+    json!({ "rename": to, "clone_url": clone_url })
 }
 
 #[derive(Default)]
@@ -262,6 +272,10 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
     if !signed_in && bearer != GITHUB_TOKEN {
         return (StatusCode::UNAUTHORIZED, "Sign in, or pass a GitHub token").into_response();
     }
+    let repo = args["repo"].as_str().unwrap_or_default();
+    if seen.lane.gone.contains(repo) {
+        return not_found(&message, repo);
+    }
     if let Some(i) = seen.lane.refusals.iter().position(|r| r.0 == tool) {
         let (_, kind, status, text) = seen.lane.refusals.remove(i);
         let result = json!({
@@ -299,6 +313,7 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
             let build = args["build"].as_u64().unwrap_or_default();
             let said = |k: &str| args[k].as_str().unwrap_or_default().to_owned();
             seen.lane.opened.push((build, said("title"), said("body")));
+            seen.lane.assigned.insert(100 + build);
             json!({ "id": build, "status": "landing", "pr": 100 + build })
         }
         // The next scripted need, else the PR's need as it is now, unless the daemon saw it:
@@ -307,7 +322,17 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
         "next_need" if args["for_daemon"] == true => {
             let number = args["number"].as_u64().unwrap_or_default();
             let lane = &mut seen.lane;
-            if let Some(next) = lane.needs.get_mut(&number).and_then(VecDeque::pop_front) {
+            let next = lane.needs.get_mut(&number).and_then(VecDeque::pop_front);
+            if let Some(to) = next.as_ref().and_then(|n| n["rename"].as_str()) {
+                let old = args["repo"].as_str().unwrap_or_default().to_owned();
+                for task in lane.held_tasks.values_mut().filter(|t| t["repo"] == old) {
+                    task["repo"] = to.into();
+                    task["clone_url"] = next.as_ref().unwrap()["clone_url"].clone();
+                }
+                lane.gone.insert(old.clone());
+                return not_found(&message, &old);
+            }
+            if let Some(next) = next {
                 lane.current.insert(number, next);
             }
             {
@@ -355,6 +380,16 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
     };
     let result =
         json!({ "content": [{ "type": "text", "text": text.to_string() }], "isError": false });
+    Json(json!({ "jsonrpc": "2.0", "id": message["id"], "result": result })).into_response()
+}
+
+/// A repo-scoped tool's refusal of a repo the caller cannot read, as `Caller::repo`'s.
+fn not_found(message: &Value, repo: &str) -> Response {
+    let text = format!("No repo {repo}.");
+    let result = json!({
+        "content": [{ "type": "text", "text": text }], "isError": true,
+        "_meta": { "status": 404 },
+    });
     Json(json!({ "jsonrpc": "2.0", "id": message["id"], "result": result })).into_response()
 }
 

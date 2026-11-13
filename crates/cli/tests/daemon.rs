@@ -1399,8 +1399,10 @@ async fn ejected_once_it_is_queued_again_and_ejected_twice_it_is_stuck() {
     );
     let agent = w.lander();
 
-    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
-        .await;
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| !l.released.is_empty())
+    })
+    .await;
 
     let released = w.fake.lane(|l| l.released.clone());
     assert_eq!(released.len(), 1);
@@ -1419,8 +1421,9 @@ async fn a_pr_that_waits_holds_no_slot() {
     w.fake.add_task(w.task(1, 7, &[]));
     let agent = w.lander();
 
+    // Build 1's PR opened.
     w.run(w.config(1, &agent), |w| {
-        w.fake.lane(|l| l.opened.len() == 1)
+        w.fake.lane(|l| l.opened.iter().any(|o| o.0 == 1))
     })
     .await;
 
@@ -1449,7 +1452,86 @@ async fn a_task_claimed_with_its_pr_is_landed_not_given_back() {
         .await;
 
     assert!(w.fake.lane(|l| l.released.is_empty()));
+    assert!(
+        w.fake.lane(|l| l.assigned.contains(&105)),
+        "its setup finished"
+    );
     assert_eq!(w.runs(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_taken_up_with_its_pr_has_the_pr_labeled_and_assigned_before_it_lands() {
+    let w = World::new().await;
+    // The server recorded PR #105, then failed before it assigned it.
+    w.held(5, 12, 105);
+    w.fake
+        .script(105, vec![fake::need("merged", "m1", "#105 merged.")]);
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert!(w.fake.lane(|l| l.assigned.contains(&105)));
+    let tools = w.fake.lane_tools();
+    assert!(
+        in_order(&tools, &["get_build_task", "open_build_pr", "next_need"]),
+        "{tools:?}"
+    );
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_taken_up_whose_pr_was_closed_is_stuck_without_landing() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.refuse("open_build_pr", "closed", 409, CLOSED);
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert!(released[0].1.as_deref().unwrap().contains("closed PR #105"));
+    assert!(w.fake.args_of("next_need").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repo_renamed_while_its_pr_lands_is_landed_under_its_new_name() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    // The same remote by another path: the renamed repo's URL.
+    let moved = w.root().join("moved.git");
+    std::os::unix::fs::symlink(w.remote(), &moved).unwrap();
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    w.fake.script(
+        105,
+        vec![
+            fake::rename("o/new", moved.to_str().unwrap()),
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#105 merged."),
+        ],
+    );
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| l.merged(5) || !l.released.is_empty())
+    })
+    .await;
+
+    assert_eq!(w.fake.lane(|l| l.released.clone()), [], "not stuck");
+    let asked: Vec<Value> = w.fake.args_of("next_need");
+    assert_eq!(asked.first().unwrap()["repo"], "o/r");
+    assert_eq!(asked.last().unwrap()["repo"], "o/new");
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-12:feature.txt"]),
+        "checked\n"
+    );
+    let clone = w.workspace().join("repos/o/new.git");
+    assert_eq!(
+        git(&clone, &["remote", "get-url", "origin"]).trim(),
+        moved.to_str().unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1853,7 +1935,8 @@ async fn an_issue_whose_pr_was_closed_is_built_anew_over_the_old_branch_once_lab
             task["claim"] = 2.into();
             w.fake.add_task(task);
         }
-        w.fake.lane(|l| l.opened.len() == 1)
+        // Opened once more after its take-up's call: built anew.
+        w.fake.lane(|l| l.opened.len() == 2)
     })
     .await;
 

@@ -37,6 +37,7 @@ use crate::client::{Client, Refusal, needs_sign_in, refusal};
 use build::{Builder, Ended};
 use config::Config;
 use folder::Folder;
+use landing::Entry;
 use lane::{Lane, Task};
 
 /// The daemon, with how often it does what.
@@ -252,7 +253,7 @@ impl Slots {
             failed: None,
         };
         for (lane, task) in resumed {
-            self.land(&mut state, &stop_rx, lane, task);
+            self.land(&mut state, &stop_rx, lane, task, Entry::TakenUp);
         }
         tokio::pin!(stop);
         loop {
@@ -276,7 +277,7 @@ impl Slots {
                             match (ended, ran) {
                                 (Ok(Ended::Opened(pr)), Some((lane, mut task))) => {
                                     task.pr = Some(pr);
-                                    self.land(&mut state, &stop_rx, lane, task);
+                                    self.land(&mut state, &stop_rx, lane, task, Entry::Opened);
                                     Ok(())
                                 }
                                 (ended, _) => ended.map(drop),
@@ -308,12 +309,19 @@ impl Slots {
     }
 
     /// Lands the PR of `task` from `lane`, holding no slot while it waits.
-    fn land(&self, state: &mut State, stop: &watch::Receiver<bool>, lane: Lane, task: Task) {
+    fn land(
+        &self,
+        state: &mut State,
+        stop: &watch::Receiver<bool>,
+        lane: Lane,
+        task: Task,
+        entry: Entry,
+    ) {
         let (builder, stop) = (self.builder.clone(), stop.clone());
         let (l, t) = (lane.clone(), task.clone());
         let spawned = state
             .builds
-            .spawn(async move { builder.land(&l, &t, stop).await });
+            .spawn(async move { builder.land(&l, &t, entry, stop).await });
         state.running.insert(spawned.id(), (lane, task));
     }
 
@@ -331,7 +339,9 @@ impl Slots {
             state.next = (state.next + 1) % self.lanes.len();
             match self.claim(lane).await {
                 // Claimed with its PR, from a holder that went quiet or gave it back.
-                Ok(Some(task)) if task.pr.is_some() => self.land(state, stop, lane.clone(), task),
+                Ok(Some(task)) if task.pr.is_some() => {
+                    self.land(state, stop, lane.clone(), task, Entry::TakenUp)
+                }
                 Ok(Some(task)) => {
                     let (builder, stop) = (self.builder.clone(), stop.clone());
                     let (l, t) = (lane.clone(), task.clone());

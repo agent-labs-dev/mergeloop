@@ -478,20 +478,32 @@ impl Builder {
         )
         .trim()
         .to_owned();
+        let pr = self.open(lane, task, &subject, &description).await?;
+        say(task, &format!("opened PR #{pr}"));
+        Ok(Work::Opened(pr))
+    }
+
+    /// Has the server open the build's PR, or finish labeling and assigning the one it has:
+    /// called again while the server says to.
+    pub(super) async fn open(
+        &self,
+        lane: &Lane,
+        task: &Task,
+        title: &str,
+        body: &str,
+    ) -> Result<u64> {
         let mut tries = 0;
-        let pr = loop {
-            match heard(lane, task, || lane.open_pr(task, &subject, &description)).await {
+        loop {
+            match heard(lane, task, || lane.open_pr(task, title, body)).await {
                 Err(e) if tries < OPEN_RETRIES && call_again(&e) => {
                     tries += 1;
                     say(task, &format!("{e:#}: calling again"));
                     tokio::time::sleep(self.pause).await;
-                    self.beat(lane, task, Stage::Building).await?;
+                    self.beat(lane, task, task.stage()).await?;
                 }
-                opened => break opened?,
+                opened => return opened,
             }
-        };
-        say(task, &format!("opened PR #{pr}"));
-        Ok(Work::Opened(pr))
+        }
     }
 }
 

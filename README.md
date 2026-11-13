@@ -579,7 +579,7 @@ The App's bot is the author of every built PR, so the developer whose daemon bui
 | **Rules by path.** No approval is needed in general; sensitive paths need their code owner. | **Dark.** It merges once MergeLoop's review lets it on. | **A human.** The code owner approves; that can be the developer, if they are one. |
 | **Every PR needs one approval.** The common default. | **One click.** The developer approves their daemon's PR. Never dark. | **A human.** The code owner approves. |
 
-A PR a person opens can merge dark under "every PR needs one approval", since MergeLoop approves it once its review passes; a built PR cannot. Letting MergeLoop bypass that rule for built PRs, with the sensitive paths in a second ruleset with no bypass, is not built.
+A PR a person opens can merge dark under "every PR needs one approval", since MergeLoop approves it once its review passes; a built PR cannot. Letting MergeLoop bypass that rule for built PRs, with the sensitive paths in a second ruleset with no bypass, is not built: GitHub's documentation does not say whether that second ruleset still holds against the bypass, or how MergeLoop could tell before it merges. [`docs/build-bypass.md`](docs/build-bypass.md) says what it does say, and the check on a scratch repo that would settle it. Making the App a bypass actor changes nothing today: MergeLoop never asks GitHub to use a bypass.
 
 ## How jobs are isolated
 

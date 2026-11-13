@@ -85,7 +85,7 @@ pub async fn run(
         let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
         let waited = tokio::time::timeout(TIMEOUT, child.wait()).await;
         // Ends what it left running, which may hold its output open.
-        groups.stop(build).await?;
+        groups.stop(build).await;
         let status = match waited {
             Ok(status) => status.with_context(|| format!("run `{command}`"))?,
             Err(_) => {

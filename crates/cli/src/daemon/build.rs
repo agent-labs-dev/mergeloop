@@ -127,9 +127,7 @@ impl Builder {
 
     /// Stops what the build left running, then removes its room and branch.
     pub async fn clean_up(&self, task: &Task) {
-        if let Err(e) = self.folder.groups().stop(task.build).await {
-            say(task, &format!("could not stop what it left running: {e:#}"));
-        }
+        self.folder.groups().stop(task.build).await;
         if let Err(e) = self.folder.remove(task).await {
             say(task, &format!("could not clean up: {e:#}"));
         }
@@ -357,7 +355,7 @@ impl Builder {
             .run(room, prompt, &self.access, env, &transcript, spawned)
             .await;
         // What the agent left running ends with its run.
-        groups.stop(task.build).await?;
+        groups.stop(task.build).await;
         let run = run?;
         say(task, &format!("the {step} run ended: {:?}", run.outcome));
         Ok(run)

@@ -59,11 +59,18 @@ impl Folder {
         let root = root.canonicalize()?;
         let own = root.join("daemon");
         std::fs::create_dir_all(&own)?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(own.join("lock"))?;
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(own.join("lock"))
+        };
+        // Something in its place that is no file is no lock anyone holds.
+        let lock = open().or_else(|e| {
+            discard(&own.join("lock"), Some(&e.into()));
+            open()
+        })?;
         // A child forked in this process shares the lock until it execs: give it a moment.
         let locked = (0..50).any(|_| {
             lock.try_lock().is_ok() || {
@@ -145,9 +152,7 @@ impl Folder {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
-        if !clone.join("HEAD").exists() {
-            Git.ensure_cache(&clone, &task.clone_url).await?;
-        }
+        self.clone_at(&clone, &task.clone_url).await?;
         let base = format!("refs/remotes/origin/{}", task.default_branch);
         let refspec = format!("+refs/heads/{}:{base}", task.default_branch);
         Git.fetch(&clone, token, &[&refspec]).await?;
@@ -174,9 +179,7 @@ impl Folder {
         let clone = self.clone_of(&task.repo);
         let lock = self.clone_lock(&clone);
         let _held = lock.lock().await;
-        if !clone.join("HEAD").exists() {
-            Git.ensure_cache(&clone, &task.clone_url).await?;
-        }
+        self.clone_at(&clone, &task.clone_url).await?;
         let pushed = format!("refs/remotes/origin/{}", task.branch);
         Git.fetch(
             &clone,
@@ -229,32 +232,48 @@ impl Folder {
 
     /// Removes every build's worktree and branch but those of `keep`, with whatever a crash
     /// left half made, and the transcripts older than `TRANSCRIPTS_KEPT`. Heals each clone a
-    /// killed git left locked. Run it before any build starts.
-    pub async fn reconcile(&self, keep: &[u64]) -> Result<()> {
-        let rooms = list(&self.root.join("builds"))?;
-        for dir in rooms.into_iter().chain(list(&self.root.join("reviews"))?) {
+    /// killed git left locked. What it cannot make sense of it removes, saying so: nothing left
+    /// in the folder stops the daemon. Run it before any build starts.
+    pub async fn reconcile(&self, keep: &[u64]) {
+        let rooms = entries(&self.root.join("builds"));
+        for dir in rooms.into_iter().chain(entries(&self.root.join("reviews"))) {
             let held = dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.parse::<u64>().ok())
                 .is_some_and(|b| keep.contains(&b));
             if !held {
-                remove_dir(&dir).await?;
+                discard(&dir, None);
             }
         }
-        for owner in list(&self.root.join("repos"))? {
-            for clone in list(&owner)? {
-                self.reconcile_clone(&clone).await?;
+        for owner in entries(&self.root.join("repos")) {
+            for clone in entries(&owner) {
+                if let Err(e) = self.reconcile_clone(&clone).await {
+                    // Made again when a build next needs it.
+                    discard(&clone, Some(&e));
+                }
             }
         }
-        self.prune_transcripts(SystemTime::now()).await
+        if let Err(e) = self.prune_transcripts(SystemTime::now()).await {
+            discard(&self.root.join("transcripts"), Some(&e));
+        }
+    }
+
+    /// Makes `clone` a clone of `url`: made, or made whole when a crash left it before it had its
+    /// origin, or pointed at `url` when the repo was renamed. Run it under the clone's lock.
+    async fn clone_at(&self, clone: &Path, url: &str) -> Result<()> {
+        match Git.run(clone, &["remote", "get-url", "origin"]).await {
+            Ok(current) if current.trim() == url => Ok(()),
+            Ok(_) => Git
+                .run(clone, &["remote", "set-url", "origin", url])
+                .await
+                .map(drop),
+            Err(_) => Git.ensure_cache(clone, url).await,
+        }
     }
 
     async fn reconcile_clone(&self, clone: &Path) -> Result<()> {
-        if !clone.join("HEAD").exists() {
-            // A clone a crash left before `git init`: nothing in it to keep.
-            return remove_dir(clone).await;
-        }
+        // Whole only with its origin: a clone a crash left before then is made again.
         let url = Git.run(clone, &["remote", "get-url", "origin"]).await?;
         Git.ensure_cache(clone, url.trim()).await?;
         Git.run(clone, &["worktree", "prune"]).await?;
@@ -304,14 +323,16 @@ pub struct Checkout {
     pub remote: Option<String>,
 }
 
-/// The name kept in `dir/id`, made the first time. Written whole or not at all.
+/// The name kept in `dir/id`, made the first time, or when what is there cannot be read.
+/// Written whole or not at all.
 fn identity(dir: &Path) -> Result<String> {
     let path = dir.join("id");
     match std::fs::read_to_string(&path) {
         Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_owned()),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        // A name it cannot read names no claim it could still act on.
+        Err(e) => discard(&path, Some(&e.into())),
     }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the OS has no random source");
@@ -320,6 +341,29 @@ fn identity(dir: &Path) -> Result<String> {
     std::fs::write(&tmp, format!("{id}\n"))?;
     std::fs::rename(&tmp, &path)?;
     Ok(id)
+}
+
+/// Removes `path`, a folder or not, saying why when `why` is given. Saying so is all it does
+/// when that fails.
+fn discard(path: &Path, why: Option<&anyhow::Error>) {
+    if let Some(e) = why {
+        eprintln!("mergeloop: removes {}: {e:#}", path.display());
+    }
+    let removed = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
+    match removed {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("mergeloop: could not remove {}: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// The entries of `dir`, none when it is not there. A `dir` that cannot be read is removed.
+fn entries(dir: &Path) -> Vec<PathBuf> {
+    list(dir).unwrap_or_else(|e| {
+        discard(dir, Some(&e));
+        vec![]
+    })
 }
 
 /// The folder's entries, none when it is not there.

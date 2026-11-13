@@ -8,8 +8,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-
 /// The longest a stopped group is waited for.
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
@@ -33,24 +31,24 @@ impl Groups {
         }
     }
 
-    /// Stops every process of the build's groups, waits for them to go, and forgets them.
-    pub async fn stop(&self, build: u64) -> Result<()> {
-        self.stop_where(|b| b == build).await
+    /// Stops every process of the build's groups, waits for them to go, and forgets them. A note
+    /// it cannot read or remove is said and left: it never stops the daemon.
+    pub async fn stop(&self, build: u64) {
+        self.stop_where(|b| b == build).await;
     }
 
     /// Stops the groups of every build: what a daemon that died mid-build left running.
-    pub async fn stop_all(&self) -> Result<()> {
-        self.stop_where(|_| true).await
+    pub async fn stop_all(&self) {
+        self.stop_where(|_| true).await;
     }
 
-    async fn stop_where(&self, which: impl Fn(u64) -> bool) -> Result<()> {
+    async fn stop_where(&self, which: impl Fn(u64) -> bool) {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).with_context(|| format!("read {}", self.dir.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => return forget(&self.dir, &e),
         };
-        for entry in entries {
-            let path = entry?.path();
+        for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
             let Some((build, pgid)) = parse(&path) else {
                 continue;
             };
@@ -60,11 +58,25 @@ impl Groups {
             let noted = std::fs::read_to_string(&path).unwrap_or_default();
             stop(pgid, noted.trim()).await;
             match std::fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => forget(&path, &e),
                 _ => {}
             }
         }
-        Ok(())
+    }
+}
+
+/// Removes what is in the place of a note of process groups, file or not, saying so.
+fn forget(path: &Path, e: &std::io::Error) {
+    eprintln!(
+        "mergeloop: removes {}, no note of process groups: {e}",
+        path.display()
+    );
+    let removed = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
+    if let Err(e) = removed.or_else(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(e),
+    }) {
+        eprintln!("mergeloop: could not remove {}: {e}", path.display());
     }
 }
 
@@ -143,7 +155,7 @@ mod tests {
         let groups = Groups::new(dir.path().join("groups"));
         let pgid = group();
         groups.track(3, pgid);
-        groups.stop(3).await.unwrap();
+        groups.stop(3).await;
         assert!(!exists(-(pgid as i32)), "the group outlived stop");
         assert_eq!(
             std::fs::read_dir(dir.path().join("groups"))
@@ -161,7 +173,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("groups")).unwrap();
         let noted = dir.path().join(format!("groups/4.{pgid}"));
         std::fs::write(&noted, "Mon Jan  1 00:00:00 2001").unwrap();
-        groups.stop_all().await.unwrap();
+        groups.stop_all().await;
         assert!(exists(pgid as i32), "a stranger was stopped");
         assert!(!noted.exists(), "it is forgotten all the same");
         // SAFETY: the test's own group.

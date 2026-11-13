@@ -663,6 +663,33 @@ async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn on_start_nothing_a_crash_left_half_made_stops_the_daemon_and_the_next_build_runs() {
+    let w = World::new().await;
+    // A clone a crash left after `git init`, before it had its origin.
+    let clone = w.workspace().join("repos/o/r.git");
+    std::fs::create_dir_all(&clone).unwrap();
+    git(&clone, &["init", "-q", "--bare"]);
+    assert!(clone.join("HEAD").exists());
+    // And a process-group record that is no file the daemon can read or remove as one.
+    let groups = w.workspace().join("daemon/groups");
+    std::fs::create_dir_all(groups.join("77.999999/x")).unwrap();
+    // And a lock and a name that are folders.
+    std::fs::create_dir_all(w.workspace().join("daemon/lock/x")).unwrap();
+    std::fs::create_dir_all(w.workspace().join("daemon/id/x")).unwrap();
+    w.fake.add_task(w.task(1, 7, &[]));
+    let agent = w.agent("my-agent", "echo built > feature.txt", BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1, "{:?}", w.fake.tools());
+    assert!(w.pushed("mergeloop/build-7").is_some());
+    assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0);
+    assert!(w.workspace().join("daemon/id").is_file());
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn on_start_it_gives_back_only_the_builds_without_a_pr_that_this_daemon_holds() {
     let w = World::new().await;
     std::fs::create_dir_all(w.workspace().join("daemon")).unwrap();

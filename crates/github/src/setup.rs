@@ -148,6 +148,10 @@ pub async fn convert_manifest(code: &str) -> Result<AppCredentials> {
 }
 
 /// A random URL-safe string with `bytes` bytes of entropy.
+///
+/// # Panics
+///
+/// If the OS has no random source. No token can be made safely without one.
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("the OS has no random source");

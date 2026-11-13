@@ -579,43 +579,51 @@ impl Installation {
         );
         // The labeled PRs come a page at a time. The rest of the repo is the same on every page:
         // the first page's.
-        let mut repository: Option<Value> = None;
-        let mut prs: Vec<Value> = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let mut data: Value = self
-                .graphql(
-                    "snapshot",
-                    &query,
-                    json!({
-                        "owner": repo.owner,
-                        "name": repo.name,
-                        "label": labels.trigger,
-                        "priority": labels.priority,
-                        "failed": labels.failed,
-                        "page": SNAPSHOT_PAGE,
-                        "after": after,
-                    }),
-                )
-                .await?;
-            let mut r = data["repository"].take();
-            let page = r
-                .as_object_mut()
-                .and_then(|r| r.remove("pullRequests"))
-                .context("repository.pullRequests")?;
-            prs.extend(page["nodes"].as_array().cloned().unwrap_or_default());
-            let next = &page["pageInfo"];
-            let more = next["hasNextPage"] == true;
-            after = next["endCursor"].clone();
-            repository.get_or_insert(r);
-            if !more || after.is_null() {
-                break;
-            }
+        let (repository, mut prs, mut after) = self
+            .snapshot_page(repo, labels, &query, Value::Null)
+            .await?;
+        while let Some(cursor) = after {
+            let (_, page, next) = self.snapshot_page(repo, labels, &query, cursor).await?;
+            prs.extend(page);
+            after = next;
         }
-        Ok(SnapshotParts {
-            repository: repository.expect("one page at least"),
-            prs,
-        })
+        Ok(SnapshotParts { repository, prs })
+    }
+
+    /// The page of `query` after `after`: the repository without its PRs, the PR nodes, and the
+    /// cursor of the next page, if there is one.
+    async fn snapshot_page(
+        &self,
+        repo: &RepoName,
+        labels: &Labels,
+        query: &str,
+        after: Value,
+    ) -> Result<(Value, Vec<Value>, Option<Value>)> {
+        let mut data: Value = self
+            .graphql(
+                "snapshot",
+                query,
+                json!({
+                    "owner": repo.owner,
+                    "name": repo.name,
+                    "label": labels.trigger,
+                    "priority": labels.priority,
+                    "failed": labels.failed,
+                    "page": SNAPSHOT_PAGE,
+                    "after": after,
+                }),
+            )
+            .await?;
+        let mut repository = data["repository"].take();
+        let page = repository
+            .as_object_mut()
+            .and_then(|r| r.remove("pullRequests"))
+            .context("repository.pullRequests")?;
+        let prs = page["nodes"].as_array().cloned().unwrap_or_default();
+        let next = &page["pageInfo"];
+        let more = next["hasNextPage"] == true && !next["endCursor"].is_null();
+        let after = more.then(|| next["endCursor"].clone());
+        Ok((repository, prs, after))
     }
 
     /// A PR, as the snapshot reads it, whatever its state and labels.

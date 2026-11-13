@@ -484,15 +484,10 @@ fn own_dir(path: &Path, shape: impl Fn(&str) -> bool) -> Result<bool> {
     }
 }
 
-/// Removes `path`, a folder of the daemon's own, saying why.
+/// Removes `path`, a folder of the daemon's own just seen there, saying why.
 fn discard(path: &Path, why: &str) -> Result<()> {
     eprintln!("mergeloop: removes {}: {why}", path.display());
-    match std::fs::remove_dir_all(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            Err(e).with_context(|| format!("remove {}", path.display()))
-        }
-        _ => Ok(()),
-    }
+    std::fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
 }
 
 /// The entries of `dir`, a folder of the daemon's own: none when it is not there. A symlink,

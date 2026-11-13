@@ -845,17 +845,7 @@ pub(crate) const FINDINGS_MAX: usize = 25;
 
 /// The review in the agent's answer, once it reviewed: its JSON, alone or in a code block.
 fn parse_review(outcome: &Outcome, text: &str) -> Result<ReviewOutput> {
-    match outcome {
-        Outcome::Failed(why) => bail!("the agent failed: {why}"),
-        Outcome::GaveUp(why) => bail!("the agent gave up: {why}"),
-        Outcome::Resolved => {}
-    }
-    let json = match (text.find('{'), text.rfind('}')) {
-        (Some(start), Some(end)) if start < end => &text[start..=end],
-        _ => bail!("the agent's review is not JSON"),
-    };
-    let mut output: ReviewOutput =
-        serde_json::from_str(json).context("the agent's review does not parse")?;
+    let mut output: ReviewOutput = mergepatrol_resolver::reply_json(outcome, text)?;
     output.findings.retain(|f| !f.title.trim().is_empty());
     output.findings = most_first(std::mem::take(&mut output.findings), FINDINGS_MAX);
     for (i, f) in output.findings.iter_mut().enumerate() {

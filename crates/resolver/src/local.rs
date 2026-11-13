@@ -10,7 +10,8 @@
 //!   `/tmp/claude-<uid>`, which its shell needs: denying it breaks every command. Its
 //!   `filesystem.denyRead` denies the shell the listed paths, and `Read` deny rules deny them to
 //!   its file tools, through a symlink too. `permissions.blockWritesOutsideWorkingDirectories`
-//!   confines its file tools' writes. Nothing prompts: anything that would is denied. Only the
+//!   confines its file tools' writes; an allow rule lets them read outside the working
+//!   directories, as its shell can. Nothing prompts: anything that would is denied. Only the
 //!   developer's own settings load (`--setting-sources user`): a tree's `.claude/` settings are
 //!   the repo's, or a build's own, and must not loosen any of this.
 //! - Codex: a permission profile, given in `-c`, lets commands read everything but the listed
@@ -218,6 +219,8 @@ impl LocalAgent {
                     "permissions": {
                         "blockWritesOutsideWorkingDirectories": true,
                         "denyInsteadOfPrompting": true,
+                        // Its file tools read what its shell may: all but `deny`, which wins.
+                        "allow": ["Read"],
                         "deny": rules,
                     },
                 });
@@ -234,8 +237,15 @@ impl LocalAgent {
 
     fn codex(&self, cmd: &mut tokio::process::Command, room: &Room, prompt: &str, access: &Access) {
         let toml = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
-        cmd.args(["exec", "--json", "--ephemeral", "--cd"])
-            .arg(&room.tree);
+        // A reviewer's room is no git repo: its tree is elsewhere, and not its to write.
+        cmd.args([
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--cd",
+        ])
+        .arg(&room.tree);
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
         }
@@ -381,6 +391,10 @@ mod tests {
         let codex = agent(Vendor::Codex, "codex");
         let a = argv(&codex.command(&room(), "do it", &workspace(), &Env::default()));
         assert_eq!(a[..3], ["codex", "exec", "--json"]);
+        assert!(
+            has(&a, &["--skip-git-repo-check"]),
+            "a reviewer's room is no repo: {a:?}"
+        );
         assert!(has(&a, &["--cd", "/ws/builds/1/tree"]), "{a:?}");
         assert_eq!(a.last().unwrap(), "do it");
         assert!(!a.iter().any(|x| x.contains("model_provider")), "{a:?}");
@@ -441,6 +455,8 @@ mod tests {
             settings["permissions"]["blockWritesOutsideWorkingDirectories"],
             true
         );
+        // Its file tools read what its shell reads: a reviewer reads a tree outside its room.
+        assert_eq!(settings["permissions"]["allow"], json!(["Read"]));
     }
 
     #[test]

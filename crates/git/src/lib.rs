@@ -362,6 +362,13 @@ impl Git {
         Ok(true)
     }
 
+    /// Whether `tree` holds just its commit, as `squash` sees it: no file changed or added.
+    pub async fn tree_clean(&self, tree: &Tree) -> Result<bool> {
+        output(self.on_tree(tree, &["add", "-A"])?, "git add").await?;
+        let diff = self.on_tree(tree, &["diff", "--cached", "--quiet", "HEAD"])?;
+        Ok(output(diff, "git diff").await.is_ok())
+    }
+
     /// The commit `tree` is at.
     pub async fn tree_head(&self, tree: &Tree) -> Result<String> {
         let out = output(
@@ -1167,5 +1174,10 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(Git.tree_clean(&tree).await.unwrap());
+        std::fs::write(dir.join("new.txt"), "new").unwrap();
+        assert!(!Git.tree_clean(&tree).await.unwrap(), "a new file");
+        let ran = std::fs::read_dir(&fired).map_or(0, |d| d.count());
+        assert_eq!(ran, 0, "the check runs nothing of the tree's");
     }
 }

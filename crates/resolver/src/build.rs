@@ -2,7 +2,7 @@
 //! the daemon runs the verify commands, commits as the App's bot with the developer as
 //! co-author, and pushes.
 
-use crate::{COMMIT, GIVE_UP};
+use crate::{BuildFinding, COMMIT, GIVE_UP, findings_note};
 
 /// An issue to build, in a checkout of the repo's default branch.
 pub struct BuildRequest<'a> {
@@ -15,6 +15,8 @@ pub struct BuildRequest<'a> {
     pub verify: &'a [String],
     /// What failed when the daemon ran them after the agent's last run, if anything did.
     pub failed: Option<&'a VerifyFailed>,
+    /// What the reviewer asked of the agent's last change: none on the first run.
+    pub findings: &'a [BuildFinding],
 }
 
 /// A verify command that failed, and the end of what it printed.
@@ -42,10 +44,13 @@ what you could not check."
 nothing until they do:\n{listed}"
         )
     };
-    let failed = req
-        .failed
-        .map(|f| format!("\n{}\n", failed_note(f)))
-        .unwrap_or_default();
+    let mut failed = String::new();
+    if !req.findings.is_empty() {
+        failed.push_str(&format!("\n{}\n", findings_note(req.findings)));
+    }
+    if let Some(f) = req.failed {
+        failed.push_str(&format!("\n{}\n", failed_note(f)));
+    }
     format!(
         "You are building a GitHub issue of {repo} in this checkout, a git worktree of its \
 default branch. MergeLoop opens a pull request with your change once it passes its checks.
@@ -106,6 +111,7 @@ mod tests {
             body: "Add `--dry-run`.",
             verify,
             failed,
+            findings: &[],
         }
     }
 
@@ -146,6 +152,24 @@ mod tests {
         assert!(p.contains("`pnpm test` failed on it"), "{p}");
         assert!(p.contains("```\n1 failed\n```"), "{p}");
         assert!(p.contains("sets no verify commands"), "{p}");
+    }
+
+    #[test]
+    fn a_run_after_a_review_is_told_its_findings() {
+        let findings = [BuildFinding {
+            file: "src/flag.rs".into(),
+            line: 4,
+            finding: "The flag is never read.".into(),
+        }];
+        let p = build_prompt(&BuildRequest {
+            findings: &findings,
+            ..req(&[], None)
+        });
+        assert!(
+            p.contains("- `src/flag.rs:4`: The flag is never read."),
+            "{p}"
+        );
+        assert!(!build_prompt(&req(&[], None)).contains("reviewer"));
     }
 
     #[test]

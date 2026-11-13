@@ -12,6 +12,7 @@ mod cli;
 mod codex;
 mod keys;
 mod local;
+mod review;
 mod vote;
 
 pub use answers::{REPLY, RESOLVE, ThreadAnswers, thread_answers};
@@ -23,6 +24,10 @@ pub use claude::ClaudeResolver;
 pub use codex::CodexResolver;
 pub use keys::{KeyCheck, check_api_key};
 pub use local::{Access, Env, LocalAgent, Room, Vendor};
+pub use review::{
+    BuildFinding, BuildReview, findings_note, reply_json, review_build_findings,
+    review_build_prompt,
+};
 pub use vote::{DOES_NOT_HOLD, HOLDS, claim, vote};
 
 use std::path::Path;

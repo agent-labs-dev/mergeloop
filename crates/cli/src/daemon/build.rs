@@ -151,6 +151,7 @@ impl Builder {
                 body: &task.body,
                 verify: &task.verify,
                 failed,
+                findings: &[],
             })
         };
         let env = env::nobody(&checkout.room);

@@ -19,7 +19,7 @@ use super::build::{Builder, Ended, Stopped, Work, heard, heartbeats, push, say, 
 use super::env;
 use super::folder::Checkout;
 use super::github::Bot;
-use super::lane::{self, Lane, Scope, Standing, Task};
+use super::lane::{self, Lane, Scope, Stage, Standing, Task};
 use crate::land::{self, Pr};
 
 /// The agent runs one PR's needs may take before its build is released as stuck: a need that
@@ -264,11 +264,18 @@ impl Builder {
             };
         }
         let run = (at.rounds, unchanged);
-        if let Err(why) = self
+        let moved = match self
             .work_need(lane, task, number, need, run, &mut at.posted)
             .await?
         {
-            return stuck(why);
+            Ok(moved) => moved,
+            Err(why) => return stuck(why),
+        };
+        if moved {
+            // A new head gives the PR a newer need once the server hears of it, which it may
+            // not have yet: asked now, it could still show this one.
+            at.unchanged = None;
+            return Ok(Next::Seen);
         }
         match self.settled(lane, task, pr, id).await? {
             Some(next) => {
@@ -287,8 +294,9 @@ impl Builder {
         }
     }
 
-    /// Whether the run settled need `id`, as the server says next: whatever the run pushed or
-    /// posted, `None` when the PR's need is still `id`; else that need, for the loop to go on from.
+    /// Whether a run that left the PR's head as it was settled need `id`, as the server says
+    /// next: whatever the run posted, `None` when the PR's need is still `id`; else that need,
+    /// for the loop to go on from.
     async fn settled(
         &self,
         lane: &Lane,
@@ -318,7 +326,7 @@ impl Builder {
     }
 
     /// A token of `scope` for the build's repo, asked for again while the server fails to answer.
-    async fn mint(&self, lane: &Lane, task: &Task, scope: Scope) -> Result<String> {
+    pub(super) async fn mint(&self, lane: &Lane, task: &Task, scope: Scope) -> Result<String> {
         let said = |e: &anyhow::Error| say(task, &format!("could not mint a token: {e:#}"));
         lane::answered(self.pause, said, || {
             heard(lane, task, || lane.mint(task, scope))
@@ -328,13 +336,18 @@ impl Builder {
 
     /// A heartbeat, sent again while the server fails to answer.
     async fn heartbeat(&self, lane: &Lane, task: &Task) -> Result<()> {
+        self.beat(lane, task, task.stage()).await
+    }
+
+    /// A heartbeat saying `stage`, sent again while the server fails to answer.
+    pub(super) async fn beat(&self, lane: &Lane, task: &Task, stage: Stage) -> Result<()> {
         let said = |e: &anyhow::Error| say(task, &format!("could not heartbeat: {e:#}"));
-        lane::answered(self.pause, said, || lane.heartbeat(task, task.stage())).await
+        lane::answered(self.pause, said, || lane.heartbeat(task, stage)).await
     }
 
     /// Works one need in a slot, in a room made for it and removed after. `run` is which run
     /// on the PR this is, and whether the last did not settle this need. `Err` with why the
-    /// build is stuck.
+    /// build is stuck, else whether the PR's head moved: this run pushed, or someone did.
     async fn work_need(
         &self,
         lane: &Lane,
@@ -343,7 +356,7 @@ impl Builder {
         need: &Value,
         run: (u32, bool),
         posted: &mut Posted,
-    ) -> Result<Result<(), String>> {
+    ) -> Result<Result<bool, String>> {
         let _slot = self.slots.clone().acquire_owned().await?;
         let worked = self.worked(lane, task, number, need, run, posted).await;
         self.clean_up(task).await;
@@ -358,7 +371,7 @@ impl Builder {
         need: &Value,
         (round, unchanged): (u32, bool),
         posted: &mut Posted,
-    ) -> Result<Result<(), String>> {
+    ) -> Result<Result<bool, String>> {
         self.heartbeat(lane, task).await?;
         let token = self.mint(lane, task, Scope::Push).await?;
         let checkout = self.folder.checkout_pr(task, &token, &self.access).await?;
@@ -401,10 +414,12 @@ impl Builder {
                     task.branch
                 ),
             );
-            return Ok(Ok(()));
+            return Ok(Ok(true));
         };
-        self.answer(lane, task, number, &run.text, pushed.as_deref(), posted)
-            .await
+        let answered = self
+            .answer(lane, task, number, &run.text, pushed.as_deref(), posted)
+            .await?;
+        Ok(answered.map(|()| pushed.is_some()))
     }
 
     /// The ids of the PR's open review threads, or none when GitHub would not say.

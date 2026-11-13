@@ -302,14 +302,15 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
             json!({ "id": build, "status": "landing", "pr": 100 + build })
         }
         // The next scripted need, else the PR's need as it is now, unless the daemon saw it:
-        // then a wait that names it, as the server's "nothing new since" does.
+        // then a wait that names it, as the server's "nothing new since" does. A need scripted
+        // twice in a row is the PR's need staying as it is over one more ask.
         "next_need" if args["for_daemon"] == true => {
             let number = args["number"].as_u64().unwrap_or_default();
             let lane = &mut seen.lane;
             if let Some(next) = lane.needs.get_mut(&number).and_then(VecDeque::pop_front) {
-                lane.current.insert(number, next.clone());
-                next
-            } else {
+                lane.current.insert(number, next);
+            }
+            {
                 match lane.current.get(&number) {
                     Some(now) if now["needs"] != "wait" && args["after"] != now["id"] => {
                         now.clone()

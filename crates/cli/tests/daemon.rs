@@ -1609,6 +1609,53 @@ async fn a_thread_past_the_first_page_is_answered() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_cannot_answer_for_now_never_ends_a_build() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    for tool in ["heartbeat_build", "mint_build_token"] {
+        w.fake
+            .refuse(tool, "", 502, "GitHub did not answer in time");
+    }
+    let agent = w.agent("builder", "echo built > feature.txt", BUILT);
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.ended() == 1))
+        .await;
+
+    assert!(
+        w.fake
+            .lane(|l| l.released.is_empty() && l.opened.len() == 1),
+        "built and opened, not released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_need_the_server_still_shows_after_a_push_is_not_worked_again_before_it_hears_the_push() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(1, 7, &[]));
+    // Asked again after the push, the server has not heard of it yet: the need is as it was.
+    w.fake.script(
+        101,
+        vec![
+            fake::need("threads", "t1", THREADS),
+            fake::need("threads", "t1", THREADS),
+            fake::need("threads", "t1", THREADS),
+            fake::need("merged", "m1", "#101 merged."),
+        ],
+    );
+    w.fake.seen.lock().unwrap().lane.threads = vec![("T1".into(), false)];
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(1)))
+        .await;
+
+    assert_eq!(w.runs(), 2, "the build, then the need once");
+    assert_eq!(
+        git(&w.remote(), &["show", "mergeloop/build-7:feature.txt"]),
+        "built\nchecked\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reply_that_leaves_a_thread_open_does_not_settle_the_need_nor_is_posted_again() {
     let w = World::new().await;
     w.held(5, 12, 105);

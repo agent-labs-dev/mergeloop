@@ -19,7 +19,7 @@ use super::env;
 use super::folder::{Checkout, Folder};
 use super::lane::{Lane, Scope, Stage, Task};
 use super::verify;
-use crate::client::{Refusal, Refused, needs_sign_in, refusal};
+use crate::client::{Refusal, Refused, needs_sign_in, refusal, unanswered};
 
 /// How many times `open_build_pr` is called again when it says to.
 const OPEN_RETRIES: u32 = 3;
@@ -140,8 +140,8 @@ impl Builder {
     }
 
     async fn work(&self, lane: &Lane, task: &Task, stage: &watch::Sender<Stage>) -> Result<Work> {
-        lane.heartbeat(task, Stage::Building).await?;
-        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
+        self.beat(lane, task, Stage::Building).await?;
+        let token = self.mint(lane, task, Scope::Push).await?;
         let checkout = self.folder.checkout(task, &token, &self.access).await?;
         if let Some(in_room) = &self.in_room {
             in_room(task);
@@ -208,7 +208,7 @@ impl Builder {
                 return Ok(Ok((run, None)));
             };
             stage.send_replace(Stage::Reviewing);
-            lane.heartbeat(task, Stage::Reviewing).await?;
+            self.beat(lane, task, Stage::Reviewing).await?;
             let review = self.review(task, reviewer, checkout, base, &head, round);
             findings = match review.await? {
                 Ok(findings) => findings,
@@ -230,7 +230,7 @@ impl Builder {
             );
             fixed += findings.len();
             built = Some(run);
-            lane.heartbeat(task, Stage::Building).await?;
+            self.beat(lane, task, Stage::Building).await?;
         }
         Ok(Err(unreviewed(&findings)))
     }
@@ -456,7 +456,7 @@ impl Builder {
         reviewed: Option<&Reviewed>,
     ) -> Result<Work> {
         let head = Git.tree_head(&checkout.tree).await?;
-        let token = heard(lane, task, || lane.mint(task, Scope::Push)).await?;
+        let token = self.mint(lane, task, Scope::Push).await?;
         if !push(task, checkout, &token, &head).await? {
             return Ok(Work::Stuck(format!(
                 "The branch {} changed on GitHub while the build ran, so the build did not push \
@@ -479,7 +479,7 @@ impl Builder {
                     tries += 1;
                     say(task, &format!("{e:#}: calling again"));
                     tokio::time::sleep(self.pause).await;
-                    lane.heartbeat(task, Stage::Building).await?;
+                    self.beat(lane, task, Stage::Building).await?;
                 }
                 opened => break opened?,
             }
@@ -608,8 +608,8 @@ pub(super) async fn heard<T, F: std::future::Future<Output = Result<T>>>(
     }
 }
 
-/// Heartbeats the build every `every`, saying the stage `stage` gives, until a heartbeat fails:
-/// that error.
+/// Heartbeats the build every `every`, saying the stage `stage` gives, until the server refuses
+/// one: that refusal. One the server failed to answer for now is no refusal: the next tries again.
 pub(super) async fn heartbeats(
     lane: &Lane,
     task: &Task,
@@ -618,8 +618,10 @@ pub(super) async fn heartbeats(
 ) -> anyhow::Error {
     loop {
         tokio::time::sleep(every).await;
-        if let Err(e) = lane.heartbeat(task, stage()).await {
-            return e;
+        match lane.heartbeat(task, stage()).await {
+            Ok(()) => {}
+            Err(e) if unanswered(&e) => say(task, &format!("could not heartbeat: {e:#}")),
+            Err(e) => return e,
         }
     }
 }

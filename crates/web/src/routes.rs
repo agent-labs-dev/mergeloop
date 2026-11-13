@@ -283,7 +283,7 @@ pub(crate) static ROUTES: &[Route] = &[
         arg("title", Ty::Str, "The PR's title."),
         arg("body", Ty::Str, "What the PR does."))),
     route!(POST "/api/w/{id}/builds/{build}/report", builds::report_build, tool!("report_build", Writes,
-        "Says how the PR of a build you hold stands: `landing` while you act on what the queue needs of its author, `waiting` while it waits on a human, `merged` once GitHub says it merged, which ends the build. Keep heartbeating a landing or waiting build, or anyone may claim it again with its PR. Refused before the build has a PR, and once you no longer hold it. Needs a MergeLoop sign-in.",
+        "Says how the PR of a build you hold stands: `landing` while you act on what the queue needs of its author, `waiting` while it waits on a human, `merged` once GitHub says it merged, which ends the build. `landing` and `waiting` are refused while the PR is not open: refusal `merged` when it merged, so report that; `closed` when it was closed without merging, so release the build as stuck. Keep heartbeating a landing or waiting build, or anyone may claim it again with its PR. Refused before the build has a PR, and once you no longer hold it. Needs a MergeLoop sign-in.",
         arg("claim", Ty::Int, "The `claim` that `claim_build` gave."),
         opt("daemon", Ty::Str, "The `daemon` you claimed it with, if you gave one."),
         arg("standing", Ty::OneOf(&["landing", "waiting", "merged"]), "How the PR stands."))),

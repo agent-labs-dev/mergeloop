@@ -142,7 +142,21 @@ impl Builder {
             unchanged: None,
         };
         loop {
-            let need = match land::next(&lane.client, &pr, &mut at.after).await {
+            let waiting = at.standing == Some(Standing::Waiting);
+            let asked = land::next(&lane.client, &pr, &mut at.after);
+            let asked = match waiting {
+                // A wait on a human can go on for good: how the PR stands is asked again as
+                // often as the build heartbeats, which a PR closed or merged meanwhile ends.
+                true => match tokio::time::timeout(self.heartbeat_every, asked).await {
+                    Ok(asked) => asked,
+                    Err(_) => {
+                        self.waits(lane, task, number).await?;
+                        continue;
+                    }
+                },
+                false => asked.await,
+            };
+            let need = match asked {
                 Ok(need) => need,
                 Err(e) if needs_sign_in(&e) || refusal(&e).is_some() => return Err(e),
                 Err(e) => {
@@ -191,7 +205,8 @@ impl Builder {
                 );
             }
             Act::Wait => {
-                self.stand(lane, task, at, Standing::Waiting).await?;
+                self.waits(lane, task, number).await?;
+                at.standing = Some(Standing::Waiting);
                 say(task, &format!("PR #{number} waits on a human: {brief}"));
             }
             Act::Work => {
@@ -243,6 +258,23 @@ impl Builder {
             at.standing = Some(standing);
         }
         Ok(())
+    }
+
+    /// Reports the PR waiting, which the server refuses with how it ended when it is no longer
+    /// open: closed by a person, or merged. Those end the build; a read that failed is said, and
+    /// asked again later.
+    async fn waits(&self, lane: &Lane, task: &Task, number: u64) -> Result<()> {
+        match lane.report(task, Standing::Waiting).await {
+            Err(e) if needs_sign_in(&e) || refusal(&e).is_some() => Err(e),
+            Err(e) => {
+                say(
+                    task,
+                    &format!("could not ask how PR #{number} stands: {e:#}"),
+                );
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 
     /// Works one need in a slot, in a room made for it and removed after. `run` is which run

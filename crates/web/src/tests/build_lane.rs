@@ -2023,8 +2023,10 @@ async fn a_recorded_pr_closed_or_merged_is_not_labeled_and_says_which(pool: PgPo
             .contains("#40 was closed without merging"),
         "{body}"
     );
-    hub.lock().unwrap().prs[0].merged = true;
     let args = json!({ "workspace": 1, "build": ana["build"], "claim": ana["claim"], "title": "T", "body": "B" });
+    let closed = mcp_tool(&router, "ana", "open_build_pr", args.clone()).await;
+    assert_eq!(refusal(&closed), (json!(409), json!("closed")));
+    hub.lock().unwrap().prs[0].merged = true;
     let merged = mcp_tool(&router, "ana", "open_build_pr", args).await;
     assert_eq!(refusal(&merged), (json!(409), json!("merged")));
     let hub = hub.lock().unwrap();
@@ -2036,6 +2038,35 @@ async fn a_recorded_pr_closed_or_merged_is_not_labeled_and_says_which(pool: PgPo
         "{:?}",
         hub.writes
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pr_reported_landing_or_waiting_is_read_from_github_and_closed_or_merged_says_which(
+    pool: PgPool,
+) {
+    let hub = shared(vec![issue(7, &[])]);
+    let (router, _) = lane(pool, &hub).await;
+    turn_on(&router).await;
+    let ana = claim(&router, "ana").await;
+    assert_eq!(open_pr(&router, "ana", &ana).await.0, StatusCode::OK);
+    let reported = |standing: &str| json!({ "workspace": 1, "build": ana["build"], "claim": ana["claim"], "standing": standing });
+    for standing in ["landing", "waiting"] {
+        let open = mcp_tool(&router, "ana", "report_build", reported(standing)).await;
+        assert_eq!(open["isError"], false, "{standing}: {open}");
+    }
+
+    hub.lock().unwrap().prs[0].open = false;
+    for standing in ["landing", "waiting"] {
+        let closed = mcp_tool(&router, "ana", "report_build", reported(standing)).await;
+        assert_eq!(
+            refusal(&closed),
+            (json!(409), json!("closed")),
+            "{standing}"
+        );
+    }
+    hub.lock().unwrap().prs[0].merged = true;
+    let merged = mcp_tool(&router, "ana", "report_build", reported("waiting")).await;
+    assert_eq!(refusal(&merged), (json!(409), json!("merged")));
 }
 
 #[sqlx::test(migrations = false)]

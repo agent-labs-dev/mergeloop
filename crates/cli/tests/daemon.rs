@@ -1595,3 +1595,89 @@ async fn a_thread_past_the_first_page_is_answered() {
     let threads = w.fake.lane(|l| l.threads.clone());
     assert!(threads.iter().any(|t| *t == ("T140".into(), true)));
 }
+
+const CLOSED: &str = "PR #105 was closed without merging. Release the build as stuck, saying so.";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pr_taken_out_and_closed_without_merging_ends_its_build_as_stuck() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![fake::need(
+            "removed",
+            "r1",
+            "#105 was taken out of the queue.",
+        )],
+    );
+    w.fake.refuse("report_build", "closed", 409, CLOSED);
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| {
+        w.fake.lane(|l| !l.released.is_empty())
+    })
+    .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("A person closed PR #105"), "{why}");
+    assert_eq!(w.runs(), 0);
+    assert_eq!(w.left(), (vec![], vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pr_merged_outside_the_queue_ends_its_build_as_merged() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![fake::need(
+            "removed",
+            "r1",
+            "#105 was taken out of the queue.",
+        )],
+    );
+    w.fake.refuse(
+        "report_build",
+        "merged",
+        409,
+        "PR #105 merged. Report it with `report_build` `merged`.",
+    );
+    let agent = w.lander();
+
+    w.run(w.config(1, &agent), |w| w.fake.lane(|l| l.merged(5)))
+        .await;
+
+    assert!(w.fake.lane(|l| l.released.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pr_closed_while_it_waits_on_a_human_ends_its_build_as_stuck() {
+    let w = World::new().await;
+    w.held(5, 12, 105);
+    w.fake.script(
+        105,
+        vec![fake::need(
+            "human",
+            "h1",
+            "It waits on a human: one approval.",
+        )],
+    );
+    let agent = w.lander();
+    let closed = std::sync::atomic::AtomicBool::new(false);
+
+    w.run(w.config(1, &agent), |w| {
+        // Closed once the daemon reported it waiting: only asking again finds out.
+        let waiting = w.fake.lane(|l| l.reports.len() == 1);
+        if waiting && !closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            w.fake.refuse("report_build", "closed", 409, CLOSED);
+        }
+        w.fake.lane(|l| !l.released.is_empty())
+    })
+    .await;
+
+    let released = w.fake.lane(|l| l.released.clone());
+    let why = released[0].1.as_deref().expect("released as stuck");
+    assert!(why.contains("A person closed PR #105"), "{why}");
+    assert_eq!(w.fake.lane(|l| l.reports.clone()), [(5, "waiting".into())]);
+}

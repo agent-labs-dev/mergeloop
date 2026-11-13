@@ -361,7 +361,9 @@ enum Settle {
     Fatal(anyhow::Error),
 }
 
-fn settlement(work: Result<Work>) -> Settle {
+/// How the work ends a build whose PR is `pr`, when it has one: the one place that decides,
+/// for a build and a landing alike.
+fn settlement(work: Result<Work>, pr: Option<u64>) -> Settle {
     let e = match work {
         Ok(Work::Opened(pr)) => return Settle::Nothing(Ended::Opened(pr)),
         Ok(Work::Stuck(why)) => return Settle::Release(Some(shorten(&why)), Ended::Stuck(why)),
@@ -381,13 +383,23 @@ fn settlement(work: Result<Work>) -> Settle {
             Settle::Release(None, Ended::GivenBack(said))
         }
         Some(Refusal::Merged) => Settle::Merged,
+        Some(Refusal::Closed) => {
+            let why = closed(pr);
+            Settle::Release(Some(why.clone()), Ended::Stuck(why))
+        }
         _ => Settle::Release(Some(shorten(&said)), Ended::Stuck(said)),
     }
 }
 
+/// Why a build whose PR a person closed without merging is stuck: closing it said "not this".
+fn closed(pr: Option<u64>) -> String {
+    let pr = pr.map_or("the build's PR".to_owned(), |n| format!("PR #{n}"));
+    format!("A person closed {pr} without merging it, so this build ends here.")
+}
+
 /// Tells the server how the work ended, and says how the build ended.
 pub(super) async fn settle(lane: &Lane, task: &Task, work: Result<Work>) -> Result<Ended> {
-    let (stuck, ended) = match settlement(work) {
+    let (stuck, ended) = match settlement(work, task.pr) {
         Settle::Nothing(ended) => return Ok(ended),
         Settle::Fatal(e) => {
             say(task, &format!("{e:#}"));
@@ -476,7 +488,7 @@ mod tests {
     }
 
     fn release(work: Result<Work>) -> Option<Option<String>> {
-        match settlement(work) {
+        match settlement(work, Some(9)) {
             Settle::Release(stuck, _) => Some(stuck),
             _ => None,
         }
@@ -485,7 +497,7 @@ mod tests {
     #[test]
     fn each_ending_tells_the_server_what_it_must_hear() {
         assert!(matches!(
-            settlement(Ok(Work::Opened(5))),
+            settlement(Ok(Work::Opened(5)), None),
             Settle::Nothing(Ended::Opened(5))
         ));
         assert_eq!(
@@ -502,16 +514,22 @@ mod tests {
         }
         for kind in [Refusal::Lost, Refusal::LaneOff] {
             assert!(matches!(
-                settlement(Err(refused(409, Some(kind)))),
+                settlement(Err(refused(409, Some(kind))), None),
                 Settle::Nothing(Ended::Dropped(_))
             ));
         }
         assert!(matches!(
-            settlement(Err(refused(409, Some(Refusal::Merged)))),
+            settlement(Err(refused(409, Some(Refusal::Merged))), None),
             Settle::Merged
         ));
+        assert_eq!(
+            release(Err(refused(409, Some(Refusal::Closed)))),
+            Some(Some(
+                "A person closed PR #9 without merging it, so this build ends here.".into()
+            ))
+        );
         assert!(matches!(
-            settlement(Err(refused(401, None))),
+            settlement(Err(refused(401, None)), None),
             Settle::Fatal(_)
         ));
         let stuck = release(Err(anyhow::anyhow!("git push: denied")))

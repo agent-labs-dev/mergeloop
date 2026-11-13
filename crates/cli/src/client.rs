@@ -285,6 +285,8 @@ pub enum Refusal {
     MayNotPush,
     /// The build's PR merged: report it merged.
     Merged,
+    /// A person closed the build's PR without merging it: release it as stuck.
+    Closed,
 }
 
 impl Refusal {
@@ -296,6 +298,7 @@ impl Refusal {
             "unheard" => Refusal::Unheard,
             "may_not_push" => Refusal::MayNotPush,
             "merged" => Refusal::Merged,
+            "closed" => Refusal::Closed,
             _ => return None,
         })
     }

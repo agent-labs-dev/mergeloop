@@ -962,8 +962,8 @@ async fn still_open(gh: &Installation, repo: &RepoName, pr: u64) -> Result<u64, 
             Refusal::Merged,
             format!("PR #{pr} merged. Report it with `report_build` `merged`."),
         )),
-        (false, false) => Err(ApiError::Status(
-            StatusCode::CONFLICT,
+        (false, false) => Err(ApiError::Refused(
+            Refusal::Closed,
             format!("PR #{pr} was closed without merging. Release the build as stuck, saying so."),
         )),
     }
@@ -1092,7 +1092,9 @@ pub struct ReportBuild {
     pub standing: StandingView,
 }
 
-/// The holder says how the build's PR stands. Merged only once GitHub says so.
+/// The holder says how the build's PR stands, as GitHub has it: merged only once GitHub says
+/// so, landing or waiting only while the PR is open. A PR closed or merged meanwhile is refused
+/// with which, so a holder that asks learns how its build ends.
 pub(crate) async fn report_build(
     State(app): State<AppState>,
     caller: Caller,
@@ -1110,17 +1112,18 @@ pub(crate) async fn report_build(
         ));
     }
     let standing = Standing::from(body.standing);
-    if let (Standing::Merged, Some(pr)) = (standing, build.pr)
-        && !installation(&app, id)
-            .await?
-            .lane_pull(&build.repo, pr)
-            .await?
-            .merged
-    {
-        return Err(ApiError::Status(
-            StatusCode::CONFLICT,
-            format!("GitHub says PR #{pr} is not merged. Report `landing` or `waiting`."),
-        ));
+    let gh = installation(&app, id).await?;
+    match (standing, build.pr) {
+        (Standing::Merged, Some(pr)) if !gh.lane_pull(&build.repo, pr).await?.merged => {
+            return Err(ApiError::Status(
+                StatusCode::CONFLICT,
+                format!("GitHub says PR #{pr} is not merged. Report `landing` or `waiting`."),
+            ));
+        }
+        (Standing::Landing | Standing::Waiting, Some(pr)) => {
+            still_open(&gh, &build.repo, pr).await?;
+        }
+        _ => {}
     }
     let login = caller.user()?.login();
     let held = holder(id, build.id, login, body.daemon.as_deref(), body.claim);

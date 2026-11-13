@@ -617,6 +617,7 @@ async fn review(
                 pr_title: &spec.pr_title,
                 pr_body: &spec.pr_body,
                 trunk: &spec.trunk,
+                below: spec.base_ref.as_deref(),
                 answered,
                 sent_back,
                 scope,

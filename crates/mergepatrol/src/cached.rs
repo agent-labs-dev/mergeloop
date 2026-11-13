@@ -316,6 +316,10 @@ impl GitHub for Cached<'_> {
             .value(repo, key, None, Duration::ZERO, read)
             .await
     }
+    async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        // Read once per head, when its review starts: nothing to keep.
+        GitHub::diff_id(self.gh, repo, base, head).await
+    }
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool> {
         let read = GitHub::awaiting_approval(self.gh, repo, sha);
         let key = format!("approval:{sha}");
@@ -439,6 +443,9 @@ impl GitHub for Cached<'_> {
     async fn pr_body(&self, repo: &RepoName, number: PrNumber) -> Result<String> {
         GitHub::pr_body(self.gh, repo, number).await
     }
+    async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32> {
+        GitHub::unresolved_threads(self.gh, repo, number).await
+    }
     async fn dismiss_reviews_marked(
         &self,
         repo: &RepoName,
@@ -447,6 +454,16 @@ impl GitHub for Cached<'_> {
         message: &str,
     ) -> Result<usize> {
         GitHub::dismiss_reviews_marked(self.gh, repo, number, marks, message).await
+    }
+    async fn approve(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        head: &str,
+        body: &str,
+    ) -> Result<()> {
+        let approved = GitHub::approve(self.gh, repo, number, head, body).await;
+        self.marking(repo, vec![Change::Pr(number)], approved).await
     }
     async fn set_body(&self, repo: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         GitHub::set_body(self.gh, repo, number, body).await

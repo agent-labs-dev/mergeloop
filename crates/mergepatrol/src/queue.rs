@@ -77,8 +77,6 @@ const PIN_WAIT: Duration = Duration::from_secs(5 * 60);
 const GITHUB_READS_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often each subscription's seats are brought in line with Stripe.
 const SYNC_SEATS_EVERY: Duration = Duration::from_secs(60);
-/// How long the inbox keeps a PR once it merged or closed. The You tab lists a week of them.
-const INBOX_CLOSED_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub struct Ctx {
     pub config: Config,
@@ -228,8 +226,6 @@ pub async fn lead(ctx: Arc<Ctx>, store: Arc<PgStore>, mut stop: watch::Receiver<
                     Spawned::spawn(prune(ctx.clone()), &alive),
                     Spawned::spawn(sync_seats(ctx.clone()), &alive),
                     Spawned::spawn(crate::redeliver::redeliver(ctx.clone()), &alive),
-                    Spawned::spawn(crate::inbox::read_changed(ctx.clone()), &alive),
-                    Spawned::spawn(crate::inbox::index(ctx.clone()), &alive),
                     Spawned::spawn(crate::review::run(ctx.clone(), alive.clone()), &alive),
                 );
                 let stopping = loop {
@@ -285,10 +281,6 @@ async fn prune(ctx: Arc<Ctx>) {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "could not delete old GitHub reads")
             }
-        }
-        match ctx.store.prune_inbox(INBOX_CLOSED_FOR).await {
-            Ok(n) => tracing::info!(prs = n, "deleted PRs closed long ago from the inbox"),
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), "could not prune the inbox"),
         }
         let jobs = ctx.config.data_dir.join("jobs");
         match prune_job_outputs(&jobs, JOB_OUTPUTS_FOR).await {
@@ -794,9 +786,11 @@ impl Caches {
 
 /// Why a unit waits for the agent's review, the queue's first gate: each PR's review of its
 /// head, which a tick starts, then its review threads. `heads` are each layer's, bottom to top,
-/// as (PR, head, unresolved review threads).
+/// as (PR, head, unresolved review threads). A head that changes what an approved one did, as a
+/// layer that a restack moved onto new layers below, keeps that approval.
 async fn review_hold(
     ctx: &Ctx,
+    gh: &dyn GitHub,
     key: &LaneKey,
     review: &ReviewSettings,
     stacked: bool,
@@ -806,7 +800,7 @@ async fn review_hold(
     if !review.enabled {
         return Ok(None);
     }
-    for &(number, head, unresolved) in heads {
+    for (i, &(number, head, unresolved)) in heads.iter().enumerate() {
         let latest = ctx
             .store
             .latest_review(key.installation_id, &key.repo, number)
@@ -816,7 +810,10 @@ async fn review_hold(
             // caught up. It runs again.
             Some(r) if r.head_sha == head && r.status != ReviewStatus::Stale => {
                 // The author resolved every thread of what it sent back to them: it goes on.
-                if resolved(&r, unresolved) && ctx.store.approve_resolved(r.id).await? {
+                if resolved(&r, unresolved)
+                    && none_open_now(gh, &key.repo, number).await
+                    && ctx.store.approve_resolved(r.id).await?
+                {
                     record(
                         ctx,
                         key,
@@ -831,13 +828,45 @@ async fn review_hold(
                 }
             }
             _ => {
-                let r = ctx
-                    .store
-                    .start_review(key.installation_id, &key.repo, number, head)
-                    .await?;
-                // Woken by the caller once the lane is saved: a PR just queued is in it then.
-                *started = true;
-                r.status
+                // A layer's own changes start at the layer below.
+                let base = match i {
+                    0 => key.trunk.as_str(),
+                    _ => heads[i - 1].1,
+                };
+                let diff_id = match gh.diff_id(&key.repo, base, head).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(repo = %key.repo, pr = number, error = %format!("{e:#}"), "could not read the PR's diff");
+                        None
+                    }
+                };
+                let carried = match &diff_id {
+                    Some(id) => {
+                        ctx.store
+                            .carry_unchanged(key.installation_id, &key.repo, number, head, id)
+                            .await?
+                    }
+                    None => false,
+                };
+                if carried {
+                    let why = "its changes are those of the head it approved";
+                    record(ctx, key, number, "review-carried", why).await?;
+                    ReviewStatus::Approved
+                } else {
+                    let r = ctx
+                        .store
+                        .start_review(
+                            key.installation_id,
+                            &key.repo,
+                            number,
+                            head,
+                            diff_id.as_deref(),
+                        )
+                        .await?;
+                    // Woken by the caller once the lane is saved: a PR just queued is in it then.
+                    *started = true;
+                    r.status
+                }
             }
         };
         if let Some(hold) = Hold::of_reviews(stacked, [(number, status)]) {
@@ -857,15 +886,52 @@ async fn review_hold(
     Ok(None)
 }
 
-/// Dismisses the changes MergeLoop's review asked for on PRs its review gate lets go on, as
-/// GitHub would not merge them otherwise. One that fails stays: GitHub turns the merge down,
-/// and says why.
-async fn withdraw_change_requests(gh: &dyn GitHub, repo: &RepoName, layers: &[PullRequest]) {
+/// Shows on GitHub that the review gate lets the PRs go on: MergeLoop dismisses the changes its
+/// review asked for, and, when its review ran, approves each layer at the head it reviewed, of
+/// `heads`, as (PR, head, unresolved threads), unless its approval still stands. Never a PR the
+/// App opened, which GitHub won't let it approve. One that fails stays: GitHub turns the merge
+/// down, and says why.
+async fn pass_review(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    reviewed: bool,
+    layers: &[PullRequest],
+    heads: &[(PrNumber, &str, u32)],
+) {
     for pr in layers.iter().filter(|pr| pr.changes_requested_by_viewer()) {
         let why = "MergeLoop's review no longer holds this PR.";
         let dismissed = gh.dismiss_reviews_marked(repo, pr.number, &REVIEW_MARKS, why);
         if let Err(e) = dismissed.await {
             tracing::warn!(%repo, pr = pr.number, error = %format!("{e:#}"), "could not dismiss the review's request for changes");
+        }
+    }
+    if !reviewed {
+        return;
+    }
+    let unapproved = layers
+        .iter()
+        .filter(|pr| !pr.viewer_did_author && !pr.approved_by_viewer());
+    for pr in unapproved {
+        let Some(&(_, head, _)) = heads.iter().find(|(n, ..)| *n == pr.number) else {
+            continue;
+        };
+        let short = &head[..7.min(head.len())];
+        let body =
+            format!("MergeLoop's review approves `{short}`: nothing it found holds this PR.");
+        if let Err(e) = gh.approve(repo, pr.number, head, &body).await {
+            tracing::warn!(%repo, pr = pr.number, error = %format!("{e:#}"), "could not approve the PR");
+        }
+    }
+}
+
+/// Whether GitHub has no unresolved thread on the PR now. The lane's read can predate the threads
+/// a review just posted, and would let it on before its author saw them.
+async fn none_open_now(gh: &dyn GitHub, repo: &RepoName, number: PrNumber) -> bool {
+    match gh.unresolved_threads(repo, number).await {
+        Ok(n) => n == 0,
+        Err(e) => {
+            tracing::warn!(%repo, pr = number, error = %format!("{e:#}"), "could not read the PR's unresolved threads");
+            false
         }
     }
 }
@@ -1157,10 +1223,18 @@ async fn sync_lane(
                     false => (pr.number, pr.head_ref_oid.as_str(), pr.unresolved_threads),
                 })
                 .collect();
-            let hold =
-                review_hold(ctx, key, &read.review, unit.stacked, &heads, &mut started).await?;
+            let hold = review_hold(
+                ctx,
+                gh,
+                key,
+                &read.review,
+                unit.stacked,
+                &heads,
+                &mut started,
+            )
+            .await?;
             if hold.is_none() {
-                withdraw_change_requests(gh, repo, &unit.layers).await;
+                pass_review(gh, repo, read.review.enabled, &unit.layers, &heads).await;
             }
             hold
         } {
@@ -1190,6 +1264,14 @@ async fn sync_lane(
                 fix_budget: match unit.fork() {
                     true => 0,
                     false => settings.fix_ci.allowed(),
+                },
+                stack: match unit.stacked {
+                    true => unit
+                        .layers
+                        .iter()
+                        .map(|pr| (pr.number, pr.summary()).into())
+                        .collect(),
+                    false => Vec::new(),
                 },
                 ..unit.layers[0].summary()
             },
@@ -2969,12 +3051,13 @@ async fn run_job(
                 } else if let Some(reason) = {
                     let mut started = false;
                     let hold =
-                        review_hold(ctx, key, review, now.stacked, &reviewed, &mut started).await?;
+                        review_hold(ctx, gh, key, review, now.stacked, &reviewed, &mut started)
+                            .await?;
                     if started {
                         ctx.reviews.notify_one();
                     }
                     if hold.is_none() {
-                        withdraw_change_requests(gh, repo, &now.layers).await;
+                        pass_review(gh, repo, review.enabled, &now.layers, &reviewed).await;
                     }
                     hold
                 } {

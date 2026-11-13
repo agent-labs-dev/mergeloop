@@ -18,7 +18,7 @@ pub use hold::Hold;
 pub use job::{CHECKS_MISSING_FOR, CHECKS_TIMEOUT, EjectReason, Event, Job, Phase, Transition};
 pub use lane::{
     BatchStep, Bisect, BuiltBatch, Candidate, Entry, EntryState, Lane, LaneChange, LayerHead,
-    PendingMerge, Person, PrSummary, Review, Stage,
+    LayerSummary, PendingMerge, Person, PrSummary, Review, Stage,
 };
 pub use price::{Price, Usage};
 pub use repo_config::{
@@ -26,10 +26,11 @@ pub use repo_config::{
     Labels, ModelOverrides, REPO_CONFIG_PATH, RepoSettings, TaskModel, WorkspaceDefaults,
 };
 pub use review::{
-    Answer, Answered, Bar, CodeLine, Depth, Evidence, Finding, Judged, Kind, Lean, LineKind,
-    Outcome, Panel, Place, Question, Related, ReviewOverrides, ReviewSettings, ReviewStatus, Route,
-    SentBack, Settled, Verdict, Verification, Vote, carry_back, dismiss_sent_back, merge_reviews,
-    most_first, newly_settled, review_status, review_url, settle_answers, settled_by,
+    Answer, Answered, Bar, CodeLine, Depth, Evidence, FINDING_MARKS, Finding, Judged, Kind, Lean,
+    LineKind, Outcome, Panel, Place, Question, REPLY_MARKS, Related, ReviewOverrides,
+    ReviewSettings, ReviewStatus, Route, SentBack, Settled, TITLE_CHARS, Verdict, Verification,
+    Vote, carry_back, clip, dismiss_sent_back, finding_title, merge_reviews, most_first,
+    newly_settled, review_status, settle_answers, settled_by, thread_title,
 };
 pub use spend::{Spend, SpendTask};
 pub use steps::{Step, StepTimes, current_step, step_times};

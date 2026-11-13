@@ -5,17 +5,15 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use mergepatrol_core::{
     Answer, Bar, CodeLine, Depth, Judged, Kind, Lean, LineKind, Outcome, PrNumber, Question,
     Related, RepoName, ReviewOverrides, ReviewSettings, ReviewStatus,
 };
-use mergepatrol_github::setup::{self, LineComment, Verdict};
-use mergepatrol_store::{ReviewAnswers, ReviewRecord};
+use mergepatrol_store::ReviewRecord;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::api::{approval, installation, repo_name};
+use crate::api::repo_name;
 use crate::auth::Caller;
 use crate::{ApiError, AppState};
 
@@ -626,337 +624,12 @@ pub(crate) async fn agent_review(
     Ok(Json(review.map(AgentReviewView::from)))
 }
 
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct AnswerAgentReview {
-    /// The head the answers are about, as the review names it.
-    pub head_sha: String,
-    /// One per finding the review asks about.
-    pub answers: Vec<AnswerView>,
-    /// For the author, on top of the answers. Optional.
-    #[serde(default)]
-    pub note: String,
-    /// Ask for changes to a PR the agent could not review, and so asks nothing about: the
-    /// `note` says what. Ignored when the review asks about findings.
-    #[serde(default)]
-    pub request_changes: bool,
-}
-
 /// Hidden in answers so deliveries are not read as new replies. Each after the first is how
 /// MergeLoop marked them as Mergepatrol, which a revision from then still writes while the new
 /// one rolls out.
 pub(crate) const ANSWERED_MARKS: [&str; 2] =
     ["mergeloop:answered", "Answered Mergepatrol's review."];
 pub(crate) const LINE_MARKS: [&str; 2] = ["mergeloop:line-answer", "<sub>On Mergepatrol's review:"];
-const ANSWERED_MARK: &str = ANSWERED_MARKS[0];
-const LINE_MARK: &str = LINE_MARKS[0];
-
-/// Answers what the review asks: posts a review of the PR as the caller, with each change asked
-/// for on its line, and lets the PR on in the queue, or holds it for a push.
-pub(crate) async fn answer_agent_review(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<AnswerAgentReview>,
-) -> Result<Json<AgentReviewView>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let token = caller.github_token(&app)?;
-    let review = current(&app, id, &repo, number, &body.head_sha).await?;
-    if review.status != ReviewStatus::Asks {
-        return Err(ApiError::Status(
-            StatusCode::CONFLICT,
-            "The review asks nothing now.".into(),
-        ));
-    }
-    let answers = answers_of(&review, &body)?;
-    let changes = match review.asks().count() {
-        0 => body.request_changes,
-        _ => answers.values().any(|a| matches!(a, Answer::Change { .. })),
-    };
-    if changes && answers.is_empty() && body.note.trim().is_empty() {
-        return Err(ApiError::bad_request("Say what to change."));
-    }
-    // What the agent sent back to the author still holds the PR for their push: answering the
-    // asks approves it only when nothing is left.
-    let owed = review.findings.iter().any(|f| f.sent_back);
-    let by = reviewer(&caller, &app, &repo).await?;
-
-    let mut text = String::new();
-    if !body.note.trim().is_empty() {
-        text.push_str(body.note.trim());
-        text.push_str("\n\n");
-    }
-    let fine: Vec<&Judged> = review
-        .asks()
-        .filter(|f| matches!(answers.get(&f.finding.id), Some(Answer::Fine)))
-        .collect();
-    if !fine.is_empty() {
-        text.push_str("Fine as they are, of what MergeLoop's review asked about:\n");
-        for f in fine {
-            text.push_str(&format!("- {}\n", f.finding.title));
-        }
-    }
-    let mut comments = Vec::new();
-    let mut unplaced = String::new();
-    for f in review.asks() {
-        let Some(Answer::Change { note }) = answers.get(&f.finding.id) else {
-            continue;
-        };
-        let body = format!(
-            "{note}\n\n<sub>On MergeLoop's review: {}</sub><!-- {LINE_MARK} -->",
-            f.finding.title
-        );
-        match (&f.finding.file, f.finding.line) {
-            (Some(path), Some(line)) => comments.push(LineComment { path, line, body }),
-            _ => unplaced.push_str(&format!("\n\n**{}**\n{note}", f.finding.title)),
-        }
-    }
-    text.push_str(&unplaced);
-    text.push_str(&format!(
-        "\n\n<sub>Answered MergeLoop's review.</sub><!-- {ANSWERED_MARK} -->"
-    ));
-    // GitHub takes neither an approval nor a request for changes from the PR's author, so
-    // theirs goes as a comment. The gate holds a PR sent back by its `Changes` status, not by
-    // GitHub's review, so the author's request holds it for their next push all the same.
-    let gh = installation(&app, id).await?;
-    let verdict = match changes {
-        true if gh.pull_request(&repo, number).await?.authored_by(&by) => Verdict::Comment,
-        true => Verdict::RequestChanges,
-        false if owed => Verdict::Comment,
-        false => approval(&gh, &repo, number, &by)
-            .await?
-            .unwrap_or(Verdict::Comment),
-    };
-    setup::review_lines_as(
-        &token,
-        &repo.to_string(),
-        number,
-        &review.head_sha,
-        verdict,
-        text.trim(),
-        &comments,
-    )
-    .await
-    .map_err(|e| {
-        if let Some(setup::Rejected(why)) = e.downcast_ref() {
-            ApiError::Status(StatusCode::UNPROCESSABLE_ENTITY, why.clone())
-        } else if e.is::<setup::Refused>() {
-            ApiError::Status(
-                StatusCode::FORBIDDEN,
-                format!("GitHub won't let you review PRs in {repo}."),
-            )
-        } else if e.is::<setup::Revoked>() {
-            ApiError::Status(StatusCode::UNAUTHORIZED, "Sign in again first.".into())
-        } else {
-            e.into()
-        }
-    })?;
-    let answered = ReviewAnswers {
-        answers,
-        by: by.clone(),
-        note: body.note.trim().to_owned(),
-        status: match changes || owed {
-            true => ReviewStatus::Changes,
-            false => ReviewStatus::Approved,
-        },
-    };
-    if !app.store.answer_review(review.id, &answered).await? {
-        return Err(ApiError::Status(
-            StatusCode::CONFLICT,
-            "Someone answered the review first.".into(),
-        ));
-    }
-    tracing::info!(installation = id, %repo, number, changes, "answered the agent's review");
-    app.store.inbox_reviewed(id, &repo, number, &by).await?;
-    app.wake.wake(id, repo.clone());
-    let review = app.store.review(review.id).await?.ok_or_else(no_review)?;
-    Ok(Json(review.into()))
-}
-
-/// The agent's questions are for the people who may change the repo: GitHub takes a review
-/// from anyone who can read it, but the gate takes answers, and spends the workspace's model
-/// on questions, only from those who can write.
-async fn reviewer(caller: &Caller, app: &AppState, repo: &RepoName) -> Result<String, ApiError> {
-    let token = caller.github_token(app)?;
-    let writes = setup::can_write(&token, &repo.to_string())
-        .await
-        .map_err(|e| match e.is::<setup::Revoked>() {
-            true => ApiError::Status(StatusCode::UNAUTHORIZED, "Sign in again first.".into()),
-            false => e.into(),
-        })?;
-    if !writes {
-        return Err(ApiError::Status(
-            StatusCode::FORBIDDEN,
-            format!("You need write access to {repo} to answer its review."),
-        ));
-    }
-    Ok(match caller {
-        Caller::User(user) => user.login().to_owned(),
-        Caller::Token(t) => setup::user(t).await?.login,
-    })
-}
-
-fn no_review() -> ApiError {
-    ApiError::Status(
-        StatusCode::NOT_FOUND,
-        "The agent has not reviewed this PR.".into(),
-    )
-}
-
-/// The PR's newest review, which must be of `head`.
-async fn current(
-    app: &AppState,
-    id: u64,
-    repo: &RepoName,
-    number: PrNumber,
-    head: &str,
-) -> Result<ReviewRecord, ApiError> {
-    let review = app
-        .store
-        .latest_review(id, repo, number)
-        .await?
-        .ok_or_else(no_review)?;
-    if review.head_sha != head {
-        return Err(ApiError::Status(
-            StatusCode::CONFLICT,
-            "The PR moved on: its new head has a review of its own.".into(),
-        ));
-    }
-    Ok(review)
-}
-
-/// The answers by finding: one for each finding the review asks about, and no other.
-fn answers_of(
-    review: &ReviewRecord,
-    body: &AnswerAgentReview,
-) -> Result<BTreeMap<String, Answer>, ApiError> {
-    let mut answers = BTreeMap::new();
-    for a in &body.answers {
-        if !review.asks().any(|f| f.finding.id == a.finding) {
-            return Err(ApiError::bad_request(&format!(
-                "The review does not ask about {}.",
-                a.finding
-            )));
-        }
-        let answer = match a.call {
-            CallView::Fine => Answer::Fine,
-            CallView::Change if a.note.trim().is_empty() => {
-                return Err(ApiError::bad_request("Say what to change."));
-            }
-            CallView::Change => Answer::Change {
-                note: a.note.trim().to_owned(),
-            },
-        };
-        answers.insert(a.finding.clone(), answer);
-    }
-    if let Some(missing) = review.asks().find(|f| !answers.contains_key(&f.finding.id)) {
-        return Err(ApiError::bad_request(&format!(
-            "Answer every finding: {} has no answer.",
-            missing.finding.id
-        )));
-    }
-    Ok(answers)
-}
-
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct AskAgent {
-    pub head_sha: String,
-    /// The finding's id.
-    pub finding: String,
-    pub question: String,
-}
-
-/// Puts a question to the agent about a finding. The agent reads the code again to answer: the
-/// answer shows on the review in a minute or two.
-pub(crate) async fn ask_agent(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<AskAgent>,
-) -> Result<Json<QuestionView>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let question = body.question.trim();
-    if question.is_empty() {
-        return Err(ApiError::bad_request("Ask something."));
-    }
-    let review = current(&app, id, &repo, number, &body.head_sha).await?;
-    let Some(finding) = review
-        .findings
-        .iter()
-        .find(|f| f.finding.id == body.finding)
-    else {
-        return Err(ApiError::bad_request("No such finding."));
-    };
-    // A human's question while it asks, or the author's reply to a finding sent back to them.
-    if review.status != ReviewStatus::Asks && !finding.sent_back {
-        return Err(ApiError::Status(
-            StatusCode::CONFLICT,
-            "The review asks nothing now, and holds nothing for the author.".into(),
-        ));
-    }
-    let by = reviewer(&caller, &app, &repo).await?;
-    let q = app
-        .store
-        .add_question(review.id, &body.finding, question, &by)
-        .await?;
-    Ok(Json(q.into()))
-}
-
-#[derive(Deserialize, TS)]
-#[ts(export)]
-pub struct AskReviewers {
-    /// GitHub logins.
-    pub reviewers: Vec<String>,
-}
-
-/// Asks others to answer the review in place of those it asked: requests their reviews on
-/// GitHub, as the caller.
-pub(crate) async fn ask_reviewers(
-    State(app): State<AppState>,
-    caller: Caller,
-    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
-    Json(body): Json<AskReviewers>,
-) -> Result<Json<AgentReviewView>, ApiError> {
-    let repo = repo_name(owner, name)?;
-    let id = caller.repo(&app, id, &repo).await?;
-    let token = caller.github_token(&app)?;
-    let logins: Vec<String> = body
-        .reviewers
-        .iter()
-        .map(|l| l.trim().trim_start_matches('@').to_owned())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if logins.is_empty() {
-        return Err(ApiError::bad_request("Name someone to ask."));
-    }
-    let review = app
-        .store
-        .latest_review(id, &repo, number)
-        .await?
-        .ok_or_else(no_review)?;
-    setup::request_reviewers_as(&token, &repo.to_string(), number, &logins)
-        .await
-        .map_err(|e| {
-            if let Some(setup::Rejected(why)) = e.downcast_ref() {
-                ApiError::Status(StatusCode::UNPROCESSABLE_ENTITY, why.clone())
-            } else if e.is::<setup::Refused>() {
-                ApiError::Status(
-                    StatusCode::FORBIDDEN,
-                    format!("GitHub won't let you ask for reviews in {repo}."),
-                )
-            } else {
-                e.into()
-            }
-        })?;
-    app.store.set_asked(review.id, &logins).await?;
-    app.store.inbox_changed(id, &repo, number).await?;
-    let review = app.store.review(review.id).await?.ok_or_else(no_review)?;
-    Ok(Json(review.into()))
-}
-
 /// What a lane shows of a queued PR's review.
 #[derive(Clone, Serialize, TS)]
 #[ts(export)]
@@ -1063,6 +736,7 @@ mod tests {
     fn record(findings: Vec<Judged>, answers: BTreeMap<String, Answer>) -> ReviewRecord {
         ReviewRecord {
             since_head: None,
+            diff_id: None,
             claim: 0,
             id: 1,
             installation_id: 1,
@@ -1163,48 +837,6 @@ mod tests {
             h[1..]
                 .iter()
                 .all(|k| k.bands.iter().all(|b| b.findings == 0))
-        );
-    }
-
-    #[test]
-    fn answers_cover_exactly_what_the_review_asks() {
-        let r = record(
-            vec![
-                judged("a", 52, Lean::Fine, true),
-                judged("c", 97, Lean::Fine, false),
-            ],
-            BTreeMap::new(),
-        );
-        let body = |answers: Vec<AnswerView>| AnswerAgentReview {
-            head_sha: "h".into(),
-            answers,
-            note: String::new(),
-            request_changes: false,
-        };
-        let a = |id: &str, call, note: &str| AnswerView {
-            finding: id.into(),
-            call,
-            note: note.into(),
-        };
-        assert!(answers_of(&r, &body(vec![])).is_err(), "a missing answer");
-        assert!(
-            answers_of(
-                &r,
-                &body(vec![a("a", CallView::Fine, ""), a("c", CallView::Fine, "")])
-            )
-            .is_err(),
-            "not asked"
-        );
-        assert!(
-            answers_of(&r, &body(vec![a("a", CallView::Change, " ")])).is_err(),
-            "a change says what"
-        );
-        let Ok(got) = answers_of(&r, &body(vec![a("a", CallView::Change, "fix")])) else {
-            panic!("a change that says what is an answer");
-        };
-        assert_eq!(
-            got,
-            BTreeMap::from([("a".into(), Answer::Change { note: "fix".into() })])
         );
     }
 

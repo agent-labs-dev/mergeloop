@@ -104,6 +104,9 @@ pub struct ReviewRequest<'a> {
     pub pr_title: &'a str,
     pub pr_body: &'a str,
     pub trunk: &'a str,
+    /// The branch of the stack layer below the PR, where `base` is. `None` for a PR, or a
+    /// stack's bottom.
+    pub below: Option<&'a str>,
     /// What humans said about findings on an earlier head.
     pub answered: &'a [Answered],
     /// What the agent sent back to the author on the last head, to check the fix of, with the
@@ -545,6 +548,19 @@ the PR unless one of these breaks it.\n{}\n",
     }
 }
 
+/// What a stack layer's review reads: its own changes, as the layers below have reviews of
+/// their own.
+fn below_section(below: Option<&str>) -> String {
+    match below {
+        None => String::new(),
+        Some(branch) => format!(
+            " The pull request is one layer of a stack: it sits on `{branch}`, the layer below, \
+which is reviewed on its own. Code the layers below bring is not this PR's: report it only where \
+this PR's changes break it or newly reach a bug in it, else as `pre_existing`."
+        ),
+    }
+}
+
 pub(crate) fn review_prompt(req: &ReviewRequest<'_>) -> String {
     format!(
         "You are reviewing a pull request before a merge queue merges it into `{trunk}`.
@@ -553,7 +569,7 @@ Pull request: {title}
 
 {body}
 {answered}{sent_back}{scope}
-Its changes are `git diff {base}..HEAD`. Read them, and read the code around them that you need \
+Its changes are `git diff {base}..HEAD`.{below} Read them, and read the code around them that you need \
 to judge them: callers, tests, config, deploy files, earlier migrations, docs. Use `git log`, \
 `git show` and `git diff`, and read files. You may run the repo's tests and tools, and write \
 tests: MergeLoop throws your changes away after the review, all but the files a finding's \
@@ -627,6 +643,7 @@ Reply with the JSON alone, in this shape, and nothing else:
         sent_back = sent_back_section(req.sent_back),
         scope = scope_section(req.scope),
         base = req.base,
+        below = below_section(req.below),
         verify = checks_section(req.verify),
         report = report_section(req.depth),
         evidence = evidence_section(),
@@ -751,6 +768,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope: Scope::Whole,
@@ -778,6 +796,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope: Scope::Whole,
@@ -795,6 +814,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope: Scope::Whole,
@@ -809,6 +829,19 @@ mod prompt_tests {
         assert!(review.contains("only when 2 of them agree it holds"));
     }
 
+    #[test]
+    fn a_stack_layers_review_reads_its_own_changes() {
+        let alone = review_prompt(&request(&[]));
+        assert!(!alone.contains("one layer of a stack"));
+        let layer = review_prompt(&ReviewRequest {
+            below: Some("feat/below"),
+            ..request(&[])
+        });
+        assert!(layer.contains("`git diff abc..HEAD`. The pull request is one layer of a stack"));
+        assert!(layer.contains("it sits on `feat/below`, the layer below"));
+        assert!(layer.contains("else as `pre_existing`"));
+    }
+
     fn request<'a>(sent_back: &'a [SentBack]) -> ReviewRequest<'a> {
         ReviewRequest {
             workdir: Path::new("."),
@@ -816,6 +849,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back,
             scope: Scope::Whole,
@@ -863,6 +897,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope: Scope::Whole,
@@ -931,6 +966,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &answered,
             sent_back: &sent_back,
             scope: Scope::QueueCommits(&commits),
@@ -959,6 +995,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope: Scope::Whole,
@@ -978,6 +1015,7 @@ mod prompt_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope: Scope::Whole,
@@ -1012,6 +1050,7 @@ mod scope_tests {
             pr_title: "t",
             pr_body: "b",
             trunk: "main",
+            below: None,
             answered: &[],
             sent_back: &[],
             scope,

@@ -1,6 +1,9 @@
 ---
 title: Deep review requires replayed evidence
 kind: fixed
+pr: 306
 ---
 
 Deep review sends a non-security change back to you only after MergeLoop runs its evidence command on the reviewed commit and sees it fail. Agreement between reviewers cannot replace that proof. Security findings and decisions that need a human keep their existing exceptions.
+
+You or your agent still decide how to fix review findings. Automatic fixes remain limited to failed CI checks.

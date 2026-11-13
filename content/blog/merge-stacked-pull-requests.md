@@ -60,7 +60,7 @@ held: the queue cannot tell it is part of a stack.
    A coding agent connected to MergeLoop's [MCP server](/docs/mcp-and-api) can call `queue_pull`
    on any layer instead, which queues the stack.
 
-To take the stack out, use the dashboard's Queue page, or call `dequeue_pull` on any layer: it takes the
+To take the stack out, call `dequeue_pull` on any layer: it takes the
 whole stack out.
 
 ## FAQ

@@ -22,6 +22,9 @@ pub trait GitHub: Send + Sync {
     async fn pull_head(&self, repo: &RepoName, number: PrNumber) -> Result<String>;
     /// Whether `head` needs a rebase onto `base`.
     async fn behind(&self, repo: &RepoName, base: &str, head: &str) -> Result<bool>;
+    /// What `head` changes since it left `base`, as an id a restack keeps. `None` when
+    /// GitHub does not show the whole diff.
+    async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>>;
     /// Whether workflow runs on `sha` wait for a maintainer's approval.
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool>;
     /// Whether PR `number` changes a file under `dir`.
@@ -82,6 +85,9 @@ pub trait GitHub: Send + Sync {
     async fn commit_messages(&self, repo: &RepoName, number: PrNumber) -> Result<Vec<String>>;
     /// The PR's description as GitHub has it now, never from a cache.
     async fn pr_body(&self, repo: &RepoName, number: PrNumber) -> Result<String>;
+    /// How many of the PR's review threads are unresolved as GitHub has them now, never from a
+    /// cache.
+    async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32>;
     async fn set_body(&self, repo: &RepoName, number: PrNumber, body: &str) -> Result<()>;
     /// Dismisses each request for changes on the PR whose body holds one of `marks`.
     async fn dismiss_reviews_marked(
@@ -91,6 +97,14 @@ pub trait GitHub: Send + Sync {
         marks: &[&str],
         message: &str,
     ) -> Result<usize>;
+    /// Approves the PR at `head` as the App, with `body`.
+    async fn approve(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        head: &str,
+        body: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -122,6 +136,9 @@ impl GitHub for Installation {
     }
     async fn behind(&self, repo: &RepoName, base: &str, head: &str) -> Result<bool> {
         Installation::behind(self, repo, base, head).await
+    }
+    async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        Installation::diff_id(self, repo, base, head).await
     }
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool> {
         Installation::awaiting_approval(self, repo, sha).await
@@ -218,6 +235,9 @@ impl GitHub for Installation {
     async fn pr_body(&self, repo: &RepoName, number: PrNumber) -> Result<String> {
         Installation::pr_body(self, repo, number).await
     }
+    async fn unresolved_threads(&self, repo: &RepoName, number: PrNumber) -> Result<u32> {
+        Installation::unresolved_threads(self, repo, number).await
+    }
     async fn dismiss_reviews_marked(
         &self,
         repo: &RepoName,
@@ -226,6 +246,15 @@ impl GitHub for Installation {
         message: &str,
     ) -> Result<usize> {
         Installation::dismiss_reviews_marked(self, repo, number, marks, message).await
+    }
+    async fn approve(
+        &self,
+        repo: &RepoName,
+        number: PrNumber,
+        head: &str,
+        body: &str,
+    ) -> Result<()> {
+        Installation::approve(self, repo, number, head, body).await
     }
     async fn set_body(&self, repo: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         Installation::set_body(self, repo, number, body).await

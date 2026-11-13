@@ -15,9 +15,9 @@ use mergepatrol_executor::proxy::Upstreams;
 use mergepatrol_github::{BranchMerge, BranchRules, Checks, HeadRepository, RepoOwner, StackRef};
 use mergepatrol_store::{
     AgentTask, BillingStore, Change, DeveloperStats, EventRecord, ExitQuery, ExitRecord, ExitStats,
-    FairUse, InboxStale, InboxStore, InboxWrite, LoginCode, PrWrite, ReadCache, RepoReads,
-    RepoState, ReviewAnswers, ReviewDone, ReviewRecord, ReviewStore, SecretRecord, Session, Slice,
-    StepStats, Subscription, Unsynced, UserInbox, ValueRead, Workspace,
+    FairUse, LoginCode, PrWrite, ReadCache, RepoReads, RepoState, ReviewAnswers, ReviewDone,
+    ReviewRecord, ReviewStore, SecretRecord, Session, Slice, StepStats, Subscription, Unsynced,
+    ValueRead, Workspace,
 };
 
 use super::*;
@@ -71,6 +71,8 @@ struct State {
     comments: Vec<(PrNumber, String)>,
     /// The PRs whose request for changes MergeLoop dismissed, in order.
     dismissed: Vec<PrNumber>,
+    /// The PRs MergeLoop approved, and the head it approved, in order.
+    approved: Vec<(PrNumber, String)>,
     /// The reviews posted on each PR: their body, and how many threads they start.
     reviews: Vec<(PrNumber, String, usize)>,
     /// Each of those reviews' state: `COMMENTED`, `CHANGES_REQUESTED` until it is dismissed,
@@ -79,6 +81,8 @@ struct State {
     /// The review threads those started, in order: their first comment, the replies in them, and
     /// whether they are resolved.
     threads: Vec<(String, Vec<String>, bool)>,
+    /// The unresolved threads GitHub has on a PR now, where the PR's read lags behind them.
+    live_threads: HashMap<PrNumber, u32>,
     merges: u32,
     /// Merged PRs stay, closed, as on GitHub.
     merged: Vec<PrNumber>,
@@ -121,6 +125,8 @@ struct State {
     forbids_force: bool,
     /// Heads that need a rebase onto the trunk. Every other head is on it.
     behind: Vec<String>,
+    /// Each head's diff id, by its base and head: a restack keeps one. Unknown heads have none.
+    diff_ids: HashMap<(String, String), String>,
     /// Heads whose workflow runs wait for a maintainer's approval.
     awaiting_approval: Vec<String>,
     /// PRs that change workflow files.
@@ -171,6 +177,7 @@ impl State {
                 maintainer_can_modify: false,
                 head_repository: None,
                 unresolved_threads: 0,
+                viewer_did_author: false,
                 details: Default::default(),
             },
         );
@@ -497,6 +504,11 @@ impl GitHub for Fake {
         Ok(self.state.lock().unwrap().behind.iter().any(|h| h == head))
     }
 
+    async fn diff_id(&self, _: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.diff_ids.get(&(base.to_owned(), head.to_owned())).cloned())
+    }
+
     async fn awaiting_approval(&self, _: &RepoName, sha: &str) -> Result<bool> {
         let s = self.state.lock().unwrap();
         Ok(s.awaiting_approval.iter().any(|h| h == sha))
@@ -554,6 +566,11 @@ impl GitHub for Fake {
             .get(&number)
             .map(|pr| pr.body.clone())
             .unwrap_or_default())
+    }
+    async fn unresolved_threads(&self, _: &RepoName, number: PrNumber) -> Result<u32> {
+        let s = self.state.lock().unwrap();
+        let read = s.prs.get(&number).map_or(0, |pr| pr.unresolved_threads);
+        Ok(s.live_threads.get(&number).copied().unwrap_or(read))
     }
     async fn set_body(&self, _: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -716,6 +733,22 @@ impl GitHub for Fake {
             pr.details = Default::default();
         });
         Ok(1)
+    }
+    async fn approve(&self, _: &RepoName, number: PrNumber, head: &str, _: &str) -> Result<()> {
+        self.with_mut(|s| {
+            s.approved.push((number, head.to_owned()));
+            let pr = s.prs.get_mut(&number).unwrap();
+            pr.review_decision = Some("APPROVED".into());
+            pr.details = serde_json::from_value(serde_json::json!({
+                "url": "", "createdAt": "", "additions": 0, "deletions": 0, "changedFiles": 0,
+                "author": null, "reviewRequests": { "nodes": [] }, "commits": null,
+                "latestOpinionatedReviews": { "nodes": [
+                    { "state": "APPROVED", "viewerDidAuthor": true, "author": null },
+                ] },
+            }))
+            .unwrap();
+        });
+        Ok(())
     }
     async fn sticky_comment(&self, _: &RepoName, number: PrNumber, body: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -1042,6 +1075,7 @@ impl ReviewStore for Mem {
         repo: &RepoName,
         pr: PrNumber,
         head: &str,
+        diff_id: Option<&str>,
     ) -> Result<ReviewRecord> {
         let mut reviews = self.reviews.lock().unwrap();
         if let Some(r) = reviews
@@ -1050,6 +1084,9 @@ impl ReviewStore for Mem {
         {
             if r.status == ReviewStatus::Stale {
                 r.status = ReviewStatus::Pending;
+                if diff_id.is_some() {
+                    r.diff_id = diff_id.map(str::to_owned);
+                }
             }
             return Ok(r.clone());
         }
@@ -1060,6 +1097,7 @@ impl ReviewStore for Mem {
             number: pr,
             head_sha: head.to_owned(),
             since_head: None,
+            diff_id: diff_id.map(str::to_owned),
             claim: 0,
             status: ReviewStatus::Pending,
             error: None,
@@ -1077,6 +1115,33 @@ impl ReviewStore for Mem {
         };
         reviews.push(r.clone());
         Ok(r)
+    }
+    async fn carry_unchanged(
+        &self,
+        _: u64,
+        _: &RepoName,
+        pr: PrNumber,
+        head: &str,
+        diff_id: &str,
+    ) -> Result<bool> {
+        let mut reviews = self.reviews.lock().unwrap();
+        if reviews.iter().any(|r| r.number == pr && r.head_sha == head) {
+            return Ok(false);
+        }
+        let newest = reviews.iter().rev().find(|r| r.number == pr).cloned();
+        let Some(r) = newest.filter(|r| {
+            r.status == ReviewStatus::Approved && r.diff_id.as_deref() == Some(diff_id)
+        }) else {
+            return Ok(false);
+        };
+        let id = reviews.len() as i64 + 1;
+        reviews.push(ReviewRecord {
+            id,
+            head_sha: head.to_owned(),
+            since_head: None,
+            ..r
+        });
+        Ok(true)
     }
     async fn claim_review(&self, _: Duration) -> Result<Option<ReviewRecord>> {
         unreachable!()
@@ -1150,9 +1215,6 @@ impl ReviewStore for Mem {
             });
         }
         Ok(())
-    }
-    async fn set_asked(&self, _: i64, _: &[String]) -> Result<()> {
-        unreachable!()
     }
     async fn answer_review(&self, _: i64, _: &ReviewAnswers) -> Result<bool> {
         unreachable!()
@@ -1287,72 +1349,6 @@ impl ReadCache for Mem {
         _: i64,
         _: &serde_json::Value,
     ) -> Result<()> {
-        unreachable!()
-    }
-}
-
-/// The queue keeps no inbox.
-#[async_trait]
-impl InboxStore for Mem {
-    async fn inbox_changed(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        Ok(())
-    }
-    async fn inbox_reviewed(&self, _: u64, _: &RepoName, _: PrNumber, _: &str) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_closed(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_ready(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_stale(&self, _: Duration, _: u32) -> Result<Vec<InboxStale>> {
-        unreachable!()
-    }
-    async fn inbox_changes(&self, _: u64, _: &RepoName) -> Result<HashMap<PrNumber, i64>> {
-        unreachable!()
-    }
-    async fn save_inbox_reads(&self, _: u64, _: &RepoName, _: &[InboxWrite]) -> Result<()> {
-        unreachable!()
-    }
-    async fn save_inbox_index(&self, _: u64, _: &RepoName, _: &[InboxWrite]) -> Result<()> {
-        unreachable!()
-    }
-    async fn set_inbox_repos(&self, _: u64, _: &[RepoName]) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_open(&self, _: u64, _: &RepoName) -> Result<Option<Vec<serde_json::Value>>> {
-        unreachable!()
-    }
-    async fn inbox_repos_due(&self, _: Duration) -> Result<Vec<(u64, RepoName)>> {
-        unreachable!()
-    }
-    async fn set_inbox_teams(&self, _: u64, _: &[(String, Vec<String>)]) -> Result<()> {
-        unreachable!()
-    }
-    async fn set_inbox_member(&self, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
-        unreachable!()
-    }
-    async fn delete_inbox_team(&self, _: u64, _: &str) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox(&self, _: &str, _: &[u64], _: Duration) -> Result<UserInbox> {
-        unreachable!()
-    }
-    async fn inbox_seen(&self, _: &str, _: u64, _: &RepoName, _: PrNumber) -> Result<()> {
-        unreachable!()
-    }
-    async fn inbox_snooze(
-        &self,
-        _: &str,
-        _: u64,
-        _: &RepoName,
-        _: PrNumber,
-        _: Option<Duration>,
-    ) -> Result<()> {
-        unreachable!()
-    }
-    async fn prune_inbox(&self, _: Duration) -> Result<u64> {
         unreachable!()
     }
 }
@@ -2486,7 +2482,7 @@ async fn a_conflict_the_agent_resolved_needs_a_review_and_a_clean_rebase_keeps_i
         let (run, key, settings) = (&run, &key, &settings);
         async move {
             let heads = [(number, head, 0)];
-            review_hold(&run.ctx, key, settings, false, &heads, &mut false)
+            review_hold(&run.ctx, &*run.gh, key, settings, false, &heads, &mut false)
                 .await
                 .unwrap()
         }
@@ -2503,6 +2499,64 @@ async fn a_conflict_the_agent_resolved_needs_a_review_and_a_clean_rebase_keeps_i
         Some(&heads[1]),
         "it reads only the resolution"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_layer_restacked_onto_a_fix_below_keeps_its_approval() {
+    let run = Run::new(Fake::new(|s| {
+        s.add_stack(10, &[1, 2], &[2]);
+        for (base, head, id) in [
+            ("main", "pr-1-v0", "one"),
+            ("pr-1-v0", "pr-2-v0", "two"),
+            ("main", "pr-1-v1", "one, fixed"),
+            ("pr-1-v1", "pr-2-v1", "two"),
+            ("pr-1-v1", "pr-2-v2", "two, changed"),
+        ] {
+            s.diff_ids.insert((base.into(), head.into()), id.into());
+        }
+    }));
+    let settings = ReviewSettings {
+        enabled: true,
+        ..ReviewSettings::default()
+    };
+    let key = LaneKey {
+        installation_id: 1,
+        repo: repo(),
+        trunk: "main".into(),
+    };
+    let hold = |one: &'static str, two: &'static str| {
+        let (run, key, settings) = (&run, &key, &settings);
+        async move {
+            let heads = [(1, one, 0), (2, two, 0)];
+            review_hold(&run.ctx, &*run.gh, key, settings, true, &heads, &mut false)
+                .await
+                .unwrap()
+        }
+    };
+    let reviewing = |number| {
+        Some(Hold::Layer {
+            number,
+            hold: Box::new(Hold::Reviewing),
+        })
+    };
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, reviewing(1));
+    run.store.finish_review(1, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, reviewing(2));
+    run.store.finish_review(2, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v0", "pr-2-v0").await, None);
+
+    // A fix on the layer below, and the restack it brings: only the fix is reviewed.
+    assert_eq!(hold("pr-1-v1", "pr-2-v1").await, reviewing(1));
+    run.store.finish_review(1, ReviewStatus::Approved);
+    assert_eq!(hold("pr-1-v1", "pr-2-v1").await, None);
+    assert_eq!(
+        run.store.newest_review(2).0,
+        "pr-2-v1",
+        "the approval holds for it"
+    );
+
+    // A push that changes the layer's own changes is reviewed again.
+    assert_eq!(hold("pr-1-v1", "pr-2-v2").await, reviewing(2));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2624,7 +2678,99 @@ async fn a_pr_goes_on_once_its_author_resolves_every_comment_with_no_human() {
     threads(0);
     run.drain().await;
     assert_eq!(run.gh.with(|s| s.dismissed.clone()), [1]);
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
     assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_from_before_the_reviews_threads_never_lets_the_pr_on() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    run.tick().await;
+    // The review posted its thread, but the lane's read of the PR is from before it.
+    run.store.finish_review(1, ReviewStatus::Changes);
+    run.store.with_finding(1, |f| {
+        f.sent_back = true;
+        f.threaded = true;
+    });
+    run.gh.with_mut(|s| s.live_threads.insert(1, 1));
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(ReviewChanges)".into())]);
+    assert!(run.gh.with(|s| s.approved.is_empty()));
+    let status = run.store.reviews.lock().unwrap().last().unwrap().status;
+    assert_eq!(status, ReviewStatus::Changes);
+    // The author resolves it: it goes on.
+    run.gh.with_mut(|s| s.live_threads.insert(1, 0));
+    run.drain().await;
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
+    assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mergeloop_approves_the_head_its_review_approved_once() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    // Branch rules wait for an approval, which MergeLoop's own gives.
+    run.gh
+        .with_mut(|s| s.prs.get_mut(&1).unwrap().review_decision = Some("REVIEW_REQUIRED".into()));
+    run.tick().await;
+    assert!(run.gh.with(|s| s.approved.is_empty()), "not reviewed yet");
+    run.store.finish_review(1, ReviewStatus::Approved);
+    // The tick that approves read the PR before: the next sees the approval.
+    run.tick().await;
+    run.drain().await;
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
+    assert_eq!(run.merged(), [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mergeloop_approves_again_once_github_dismisses_its_approval_on_a_push() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    let require_review =
+        |s: &mut State| s.prs.get_mut(&1).unwrap().review_decision = Some("REVIEW_REQUIRED".into());
+    run.gh.with_mut(require_review);
+    run.tick().await;
+    run.store.finish_review(1, ReviewStatus::Approved);
+    run.tick().await;
+    assert_eq!(run.gh.with(|s| s.approved.clone()), [(1, "pr-1-v0".into())]);
+    // The author pushes, and the branch's rules dismiss stale approvals.
+    run.gh.with_mut(|s| {
+        s.push(1, "pushed");
+        s.prs.get_mut(&1).unwrap().details = Default::default();
+        require_review(s);
+    });
+    run.tick().await;
+    run.tick().await;
+    assert_eq!(run.gh.with(|s| s.approved.len()), 1, "not reviewed yet");
+    run.store.finish_review(1, ReviewStatus::Approved);
+    run.tick().await;
+    let approved = run.gh.with(|s| s.approved.clone());
+    assert_eq!(approved, [(1, "pr-1-v0".into()), (1, "pushed".into())]);
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert_eq!(run.gh.with(|s| s.approved.len()), 2, "approved once a head");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mergeloop_never_approves_a_pr_it_opened_or_did_not_review() {
+    // A PR the App opened: GitHub won't let it approve its own.
+    let run = Run::new(Fake::new(|s| {
+        s.add_pr(1);
+        s.prs.get_mut(&1).unwrap().viewer_did_author = true;
+    }));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    run.tick().await;
+    run.store.finish_review(1, ReviewStatus::Approved);
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert!(run.gh.with(|s| s.approved.is_empty()));
+
+    // A workspace with the review off.
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    run.drain().await;
+    assert_eq!(run.merged(), [1]);
+    assert!(run.gh.with(|s| s.approved.is_empty()));
 }
 
 #[tokio::test(start_paused = true)]

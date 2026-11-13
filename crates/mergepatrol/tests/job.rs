@@ -1,5 +1,7 @@
 //! Runs the real `mergepatrol job` binary through `LocalExecutor`, against local git repos.
 
+#![cfg(test)]
+
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;

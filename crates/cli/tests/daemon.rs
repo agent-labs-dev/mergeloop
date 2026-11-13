@@ -1,6 +1,8 @@
 //! `mergeloop daemon` against a fake server, a fake agent CLI, and a bare repo on disk as the
 //! GitHub remote. The fake agent is a shell script, run as the config names it.
 
+#![cfg(test)]
+
 mod fake;
 
 use std::path::{Path, PathBuf};

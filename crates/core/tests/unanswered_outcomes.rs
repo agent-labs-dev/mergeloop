@@ -1,5 +1,7 @@
 //! A push can fix a change referred to a human before that person answers.
 
+#![cfg(test)]
+
 use std::collections::BTreeMap;
 
 use mergepatrol_core::{Finding, Judged, Outcome, carry_back, settled_by};

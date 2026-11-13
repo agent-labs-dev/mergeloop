@@ -30,6 +30,7 @@ use mergepatrol_github::{
     PullRequest, RateLimited, RepoSnapshot,
 };
 use mergepatrol_store::{AgentTask, Change, GITHUB_APP, LaneKey, PgStore, Scope, Store, Vault};
+use parking_lot::Mutex;
 use secrecy::ExposeSecret;
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -107,24 +108,24 @@ pub struct Ctx {
 
 /// Fork PRs waiting for their pin: the `labeled` webhook, or for their pull ref to show it.
 #[derive(Default)]
-pub struct Unpinned(std::sync::Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
+pub struct Unpinned(Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
 
 impl Unpinned {
     /// How long ago the queue first saw the PR without its pin.
     fn waited(&self, key: &LaneKey, number: PrNumber) -> Duration {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         let k = (key.installation_id, key.repo.clone(), number);
         map.entry(k).or_insert_with(Instant::now).elapsed()
     }
 
     fn forget(&self, key: &LaneKey, number: PrNumber) {
         let k = (key.installation_id, key.repo.clone(), number);
-        self.0.lock().unwrap().remove(&k);
+        self.0.lock().remove(&k);
     }
 
     /// Forgets the repo's PRs that lost the label: a new labeling waits afresh.
     fn keep_labeled(&self, installation: u64, repo: &RepoName, labeled: &[PullRequest]) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.retain(|(i, r, number), _| {
             *i != installation || r != repo || labeled.iter().any(|pr| pr.number == *number)
         });
@@ -133,18 +134,18 @@ impl Unpinned {
 
 /// Since when each PR's job has failed on every try, on errors outside the job.
 #[derive(Default)]
-pub struct JobErrors(std::sync::Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
+pub struct JobErrors(Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
 
 impl JobErrors {
     /// How long the PR's job has failed, this time included.
     fn failed(&self, key: &LaneKey, number: PrNumber) -> Duration {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         let key = (key.installation_id, key.repo.clone(), number);
         map.entry(key).or_insert_with(Instant::now).elapsed()
     }
 
     fn clear(&self, key: &LaneKey, number: PrNumber) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.remove(&(key.installation_id, key.repo.clone(), number));
     }
 }
@@ -152,7 +153,7 @@ impl JobErrors {
 /// Each PR in a repo's queue as of its last tick: whose queue events they are, and what the
 /// history keeps of it once it leaves.
 #[derive(Default)]
-pub struct Prs(std::sync::Mutex<HashMap<(u64, RepoName), HashMap<PrNumber, PrSummary>>>);
+pub struct Prs(Mutex<HashMap<(u64, RepoName), HashMap<PrNumber, PrSummary>>>);
 
 impl Prs {
     /// The PRs of the repo's lanes before they sync, so a PR that just left is still here, and
@@ -169,12 +170,12 @@ impl Prs {
         let left = left.map(|e| (e.number, builders.saved(e.number, e.summary.clone())));
         let labeled = labeled.iter().map(|pr| (pr.number, builders.summary(pr)));
         let prs = left.chain(labeled).collect();
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.insert((installation, repo.clone()), prs);
     }
 
     fn get(&self, key: &LaneKey, number: PrNumber) -> Option<PrSummary> {
-        let map = self.0.lock().unwrap();
+        let map = self.0.lock();
         map.get(&(key.installation_id, key.repo.clone()))?
             .get(&number)
             .cloned()
@@ -225,11 +226,11 @@ impl Builders {
 
 /// Webhooks wake a repo's queue before its poll is due. Polling still runs, in case one is lost.
 #[derive(Default)]
-pub struct Wakers(std::sync::Mutex<HashMap<(u64, RepoName), Arc<Notify>>>);
+pub struct Wakers(Mutex<HashMap<(u64, RepoName), Arc<Notify>>>);
 
 impl Wakers {
     fn get(&self, installation: u64, repo: &RepoName) -> Arc<Notify> {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.entry((installation, repo.clone())).or_default().clone()
     }
 
@@ -828,12 +829,12 @@ fn no_queue(base: &str, default_branch: &str, settings: &RepoSettings) -> Hold {
 
 /// One lock per repo's git cache.
 #[derive(Default)]
-pub struct Caches(std::sync::Mutex<HashMap<RepoName, Arc<tokio::sync::Mutex<()>>>>);
+pub struct Caches(Mutex<HashMap<RepoName, Arc<tokio::sync::Mutex<()>>>>);
 
 impl Caches {
     async fn lock(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
-            let mut locks = self.0.lock().unwrap();
+            let mut locks = self.0.lock();
             locks.entry(repo.clone()).or_default().clone()
         };
         lock.lock_owned().await
@@ -4263,7 +4264,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/a-renamed HTTP/1.1",
                 "GET /repos/o/gone HTTP/1.1",

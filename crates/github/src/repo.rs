@@ -579,43 +579,51 @@ impl Installation {
         );
         // The labeled PRs come a page at a time. The rest of the repo is the same on every page:
         // the first page's.
-        let mut repository: Option<Value> = None;
-        let mut prs: Vec<Value> = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let mut data: Value = self
-                .graphql(
-                    "snapshot",
-                    &query,
-                    json!({
-                        "owner": repo.owner,
-                        "name": repo.name,
-                        "label": labels.trigger,
-                        "priority": labels.priority,
-                        "failed": labels.failed,
-                        "page": SNAPSHOT_PAGE,
-                        "after": after,
-                    }),
-                )
-                .await?;
-            let mut r = data["repository"].take();
-            let page = r
-                .as_object_mut()
-                .and_then(|r| r.remove("pullRequests"))
-                .context("repository.pullRequests")?;
-            prs.extend(page["nodes"].as_array().cloned().unwrap_or_default());
-            let next = &page["pageInfo"];
-            let more = next["hasNextPage"] == true;
-            after = next["endCursor"].clone();
-            repository.get_or_insert(r);
-            if !more || after.is_null() {
-                break;
-            }
+        let (repository, mut prs, mut after) = self
+            .snapshot_page(repo, labels, &query, Value::Null)
+            .await?;
+        while let Some(cursor) = after {
+            let (_, page, next) = self.snapshot_page(repo, labels, &query, cursor).await?;
+            prs.extend(page);
+            after = next;
         }
-        Ok(SnapshotParts {
-            repository: repository.expect("one page at least"),
-            prs,
-        })
+        Ok(SnapshotParts { repository, prs })
+    }
+
+    /// The page of `query` after `after`: the repository without its PRs, the PR nodes, and the
+    /// cursor of the next page, if there is one.
+    async fn snapshot_page(
+        &self,
+        repo: &RepoName,
+        labels: &Labels,
+        query: &str,
+        after: Value,
+    ) -> Result<(Value, Vec<Value>, Option<Value>)> {
+        let mut data: Value = self
+            .graphql(
+                "snapshot",
+                query,
+                json!({
+                    "owner": repo.owner,
+                    "name": repo.name,
+                    "label": labels.trigger,
+                    "priority": labels.priority,
+                    "failed": labels.failed,
+                    "page": SNAPSHOT_PAGE,
+                    "after": after,
+                }),
+            )
+            .await?;
+        let mut repository = data["repository"].take();
+        let page = repository
+            .as_object_mut()
+            .and_then(|r| r.remove("pullRequests"))
+            .context("repository.pullRequests")?;
+        let prs = page["nodes"].as_array().cloned().unwrap_or_default();
+        let next = &page["pageInfo"];
+        let more = next["hasNextPage"] == true && !next["endCursor"].is_null();
+        let after = more.then(|| next["endCursor"].clone());
+        Ok((repository, prs, after))
     }
 
     /// A PR, as the snapshot reads it, whatever its state and labels.
@@ -1797,7 +1805,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![]).await;
         let labeled = of(layer(2, &["mp"]));
         assert!(gh.labeled_for_queue(&repo, &labeled, "mp").await.unwrap());
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
 
         // On a layer below: the whole stack is queued.
         let bare = of(layer(2, &[]));
@@ -1815,14 +1823,14 @@ mod tests {
         ])
         .await;
         assert!(!gh.labeled_for_queue(&repo, &bare, "mp").await.unwrap());
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
 
         // Outside a stack, a PR's own labels are the answer.
         let (gh, requests) = fake::serve(vec![]).await;
         let mut alone = bare.clone();
         alone.stack = None;
         assert!(!gh.labeled_for_queue(&repo, &alone, "mp").await.unwrap());
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
     }
 
     fn snapshot_page(numbers: std::ops::Range<u64>, next: Option<&str>) -> &'static str {
@@ -1854,7 +1862,7 @@ mod tests {
         let numbers: Vec<u64> = snap.labeled.iter().map(|p| p.number).collect();
         assert_eq!(numbers, (1..103).collect::<Vec<_>>());
         assert_eq!(snap.missing_labels, ["mp:priority"]);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1874,7 +1882,7 @@ mod tests {
         let repo = RepoName::parse("o/r").unwrap();
         gh.sticky_comment(&repo, 7, "new").await.unwrap();
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/r/issues/7/comments?per_page=100&page=1 HTTP/1.1",
                 "GET /repos/o/r/issues/7/comments?per_page=100&page=2 HTTP/1.1",
@@ -1888,10 +1896,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![(200, "", "{}")]).await;
         let repo = RepoName::parse("o/r").unwrap();
         gh.set_title(&repo, 7, "fix: it").await.unwrap();
-        assert_eq!(
-            *requests.lock().unwrap(),
-            ["PATCH /repos/o/r/pulls/7 HTTP/1.1"]
-        );
+        assert_eq!(*requests.lock(), ["PATCH /repos/o/r/pulls/7 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -1902,7 +1907,7 @@ mod tests {
         let repo = RepoName::parse("o/r").unwrap();
         let tree = gh.create_tree(&repo, "base", &[]).await.unwrap();
         assert_eq!(tree, "base");
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
     }
 
     async fn merge_answered(pr: &'static str) -> (MergeOutcome, Vec<String>) {
@@ -1913,7 +1918,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![reply, (200, "", pr)]).await;
         let repo = RepoName::parse("o/r").unwrap();
         let outcome = gh.merge(&repo, 7, "abc", "squash").await.unwrap();
-        let requests = requests.lock().unwrap().clone();
+        let requests = requests.lock().clone();
         (outcome, requests)
     }
 
@@ -1946,7 +1951,7 @@ mod tests {
         .await;
         let repo = RepoName::parse("o/r").unwrap();
         gh.merge(&repo, 7, "abc", "squash").await.unwrap();
-        let request = requests.lock().unwrap()[0].clone();
+        let request = requests.lock()[0].clone();
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
             body,
@@ -2099,7 +2104,7 @@ mod tests {
         let dismissed = gh.dismiss_reviews_marked(&repo, 7, &["<!-- mark -->"], "cleared");
         assert_eq!(dismissed.await.unwrap(), 1);
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/r/pulls/7/reviews?per_page=100&page=1 HTTP/1.1",
                 "PUT /repos/o/r/pulls/7/reviews/1/dismissals HTTP/1.1",
@@ -2119,7 +2124,7 @@ mod tests {
         let lines = [line];
         let posted = gh.review_lines(&repo, 7, "abc", Verdict::RequestChanges, "body", &lines);
         posted.await.unwrap();
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         let last = &requests[1];
         assert!(last.contains(r#""event":"REQUEST_CHANGES""#), "{last}");
@@ -2136,7 +2141,7 @@ mod tests {
         gh.review_lines(&repo, 7, "abc", Verdict::RequestChanges, "body", &[])
             .await
             .unwrap();
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(
             requests[0].contains(r#""event":"REQUEST_CHANGES""#),
             "{}",

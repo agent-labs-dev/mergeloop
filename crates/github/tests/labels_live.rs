@@ -3,6 +3,8 @@
 //! labels only. `LIVE_TOKEN=$(gh auth token) LIVE_REPO=owner/name LIVE_PR=1 \
 //! cargo test -p mergepatrol-github --test labels_live -- --ignored`
 
+#![cfg(test)]
+
 use mergepatrol_github::AsUser;
 
 fn env(name: &str) -> String {

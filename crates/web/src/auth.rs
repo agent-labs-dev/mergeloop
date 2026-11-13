@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -30,6 +30,7 @@ pub(crate) use mergepatrol_github::percent_encode;
 use mergepatrol_github::setup::{self, Pkce, random_token};
 use mergepatrol_github::setup::{Revoked, UserInstallation, UserToken};
 use mergepatrol_store::{GITHUB_APP, LoginCode, Scope, Sealed, Session, SessionKind, Workspace};
+use parking_lot::Mutex;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -590,14 +591,14 @@ impl<K, V> Default for Recent<K, V> {
 
 impl<K: Eq + Hash, V: Clone> Recent<K, V> {
     pub(crate) fn get(&self, key: &K) -> Option<V> {
-        let map = self.0.lock().unwrap();
+        let map = self.0.lock();
         map.get(key)
             .filter(|(at, _)| at.elapsed() < SEEN_FOR)
             .map(|(_, v)| v.clone())
     }
 
     pub(crate) fn put(&self, key: K, value: V) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.retain(|_, (at, _)| at.elapsed() < SEEN_FOR);
         map.insert(key, (Instant::now(), value));
     }
@@ -673,7 +674,7 @@ pub(crate) async fn unlock(
     State(state): State<AppState>,
     Json(body): Json<Unlock>,
 ) -> Result<Response, ApiError> {
-    let expected = state.setup_token.lock().unwrap().clone();
+    let expected = state.setup_token.lock().clone();
     let Some(expected) = expected else {
         return Err(ApiError::Status(
             StatusCode::CONFLICT,
@@ -781,7 +782,7 @@ pub(crate) async fn manifest_callback(
             .vault
             .set(Scope::Instance, GITHUB_APP, &serde_json::to_string(&creds)?)
             .await?;
-        *state.setup_token.lock().unwrap() = None;
+        *state.setup_token.lock() = None;
         tracing::info!(app = %creds.slug, "GitHub App created");
         Ok(creds.install_url())
     }

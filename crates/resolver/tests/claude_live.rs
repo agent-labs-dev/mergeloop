@@ -1,6 +1,8 @@
 //! Runs the real Claude CLI on a small conflict. Needs `claude` on PATH and ANTHROPIC_API_KEY.
 //! `cargo test -p mergepatrol-resolver --test claude_live -- --ignored --nocapture`
 
+#![cfg(test)]
+
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;

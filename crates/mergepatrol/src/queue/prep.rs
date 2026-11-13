@@ -6,14 +6,15 @@
 //! joins a batch, the lane rebases it and runs its checks again whatever they said here.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use mergepatrol_core::{CHECKS_TIMEOUT, Event, Hold, PrNumber, RepoName, RepoSettings};
 use mergepatrol_github::{CheckState, Installation, RepoSnapshot};
 use mergepatrol_store::LaneKey;
+use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -33,7 +34,7 @@ pub struct Claim {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        let mut running = self.running.lock().unwrap();
+        let mut running = self.running.lock();
         if running.get(&self.id).is_some_and(|(t, _)| *t == self.token) {
             running.remove(&self.id);
         }
@@ -94,12 +95,12 @@ pub struct Prep {
 
 impl Prep {
     fn holding(&self, id: &PrId) -> Option<Hold> {
-        let running = self.running.lock().unwrap();
+        let running = self.running.lock();
         running.get(id).map(|(_, hold)| hold.clone())
     }
 
     fn left_to_lane(&self, id: &PrId, head: &str) -> bool {
-        self.left.lock().unwrap().get(id).is_some_and(|h| h == head)
+        self.left.lock().get(id).is_some_and(|h| h == head)
     }
 
     /// Whether what `unit` needs of an agent is for here to do, and not its job in the lane.
@@ -112,38 +113,38 @@ impl Prep {
     /// checks' failure stands.
     pub(super) fn note_refused_rerun(&self, key: &LaneKey, number: PrNumber, sha: &str) {
         let id = (key.installation_id, key.repo.clone(), number);
-        let mut refused = self.refused_reruns.lock().unwrap();
+        let mut refused = self.refused_reruns.lock();
         refused.entry(id).or_default().insert(sha.to_owned());
     }
 
     /// Whether GitHub would not run the failed jobs of `sha` again.
     pub(super) fn rerun_refused(&self, key: &LaneKey, number: PrNumber, sha: &str) -> bool {
         let id = (key.installation_id, key.repo.clone(), number);
-        let refused = self.refused_reruns.lock().unwrap();
+        let refused = self.refused_reruns.lock();
         refused.get(&id).is_some_and(|shas| shas.contains(sha))
     }
 
     /// The lane found a conflict on the PR's `head`.
     pub(super) fn conflicted(&self, key: &LaneKey, number: PrNumber, head: &str) {
         let id = (key.installation_id, key.repo.clone(), number);
-        self.conflicts.lock().unwrap().insert(id, head.to_owned());
+        self.conflicts.lock().insert(id, head.to_owned());
     }
 
     /// Whether the lane found a conflict on `head`, which it asks only once.
     fn take_conflict(&self, id: &PrId, head: &str) -> bool {
-        let mut conflicts = self.conflicts.lock().unwrap();
+        let mut conflicts = self.conflicts.lock();
         conflicts.remove_entry(id).is_some_and(|(_, h)| h == head)
     }
 
     /// Asks for `wanted`, or, if a job has the PR since the tick looked, holds it for that one.
     fn want(&self, id: PrId, hold: Hold, mut wanted: Wanted) -> Hold {
-        let mut running = self.running.lock().unwrap();
+        let mut running = self.running.lock();
         if let Some((_, theirs)) = running.get(&id) {
             return theirs.clone();
         }
         wanted.token = self.next_claim.fetch_add(1, Ordering::Relaxed);
         running.insert(id, (wanted.token, hold.clone()));
-        self.wanted.lock().unwrap().push(wanted);
+        self.wanted.lock().push(wanted);
         hold
     }
 
@@ -160,7 +161,7 @@ impl Prep {
     #[cfg(test)]
     pub(crate) fn claim(&self, key: &LaneKey, number: PrNumber) -> Option<Claim> {
         let id = (key.installation_id, key.repo.clone(), number);
-        let mut running = self.running.lock().unwrap();
+        let mut running = self.running.lock();
         if running.contains_key(&id) {
             return None;
         }
@@ -176,8 +177,8 @@ impl Prep {
     /// A queue starts on `repo`: the jobs its last run asked for and never started are gone. One
     /// that started ended with that queue, and took its claim along.
     fn reset(&self, repo: &RepoName) {
-        let mut running = self.running.lock().unwrap();
-        let mut wanted = self.wanted.lock().unwrap();
+        let mut running = self.running.lock();
+        let mut wanted = self.wanted.lock();
         wanted.retain(|w| {
             if w.key.repo != *repo {
                 return true;
@@ -189,7 +190,7 @@ impl Prep {
 
     /// The jobs asked for on `repo`.
     pub(super) fn take(&self, repo: &RepoName) -> Vec<Wanted> {
-        let mut wanted = self.wanted.lock().unwrap();
+        let mut wanted = self.wanted.lock();
         let (mine, rest) = std::mem::take(&mut *wanted)
             .into_iter()
             .partition(|w| w.key.repo == *repo);
@@ -198,7 +199,7 @@ impl Prep {
     }
 
     fn waited(&self, id: &PrId, head: &str) -> Duration {
-        let mut since = self.since.lock().unwrap();
+        let mut since = self.since.lock();
         let entry = since
             .entry(id.clone())
             .or_insert_with(|| (head.to_owned(), Instant::now()));
@@ -211,14 +212,14 @@ impl Prep {
     /// The PR's job ended, for its claim to stop holding it. `left`: the head it could not settle.
     pub(super) fn finish(&self, id: &PrId, left: Option<String>) {
         if let Some(head) = left {
-            self.left.lock().unwrap().insert(id.clone(), head);
+            self.left.lock().insert(id.clone(), head);
         }
     }
 
     /// As the claim of a job does as it ends.
     #[cfg(test)]
     pub(super) fn end_job(&self, id: &PrId) {
-        self.running.lock().unwrap().remove(id);
+        self.running.lock().remove(id);
     }
 
     /// Takes the jobs asked for on `repo`, as `drain` does, and aborts each before it runs.
@@ -241,7 +242,7 @@ impl Prep {
     /// What was asked for, for tests of the tick.
     #[cfg(test)]
     pub(super) fn asked(&self) -> Vec<(PrNumber, Work)> {
-        let wanted = self.wanted.lock().unwrap();
+        let wanted = self.wanted.lock();
         wanted
             .iter()
             .map(|w| (w.unit.number, w.work.clone()))
@@ -250,7 +251,7 @@ impl Prep {
 
     #[cfg(test)]
     pub(super) fn leave_to_lane(&self, id: PrId, head: &str) {
-        self.left.lock().unwrap().insert(id, head.to_owned());
+        self.left.lock().insert(id, head.to_owned());
     }
 }
 

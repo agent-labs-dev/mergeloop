@@ -1,5 +1,7 @@
 //! Settling a recurring finding must settle each request counted by review stats.
 
+#![cfg(test)]
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 

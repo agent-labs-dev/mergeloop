@@ -32,10 +32,11 @@ The tests marked `#[ignore]` need Docker images, or a real Anthropic API key. Ea
 
 We follow [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html) where it fits. The lints in `[workspace.lints]` in the root `Cargo.toml` enforce what we adopted, and CI fails on any of them.
 
-Two rules have no lint yet, so we keep them by convention:
+Outside tests, `unwrap()` fails the lint. Where a panic is right because the types cannot say what holds, write `expect("why it holds")`; where the input can fail, return the error. A public function that can panic says when in a `# Panics` section. Locks are `parking_lot`'s, which have no poisoning to unwrap; `tokio::sync::Mutex` stays where a lock is held across an `.await`.
 
-- One module per `use` statement: `use a::b::{X, Y}`, not `use a::{X, b::Y}`.
-- `expect("why")` over `unwrap()` outside tests.
+Clippy counts `#[test]` functions and `#[cfg(test)]` modules as tests, but not the helpers of an integration test. So each file under `crates/*/tests/` starts with `#![cfg(test)]`, which makes the whole crate a test.
+
+One rule has no lint yet, so we keep it by convention: one module per `use` statement, `use a::b::{X, Y}`, not `use a::{X, b::Y}`.
 
 We leave these parts of the guide out on purpose. Don't raise them in review:
 

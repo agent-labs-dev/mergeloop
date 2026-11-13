@@ -21,7 +21,7 @@ use mergepatrol_executor::sandbox::{Kube, START_PORT, SandboxLaunch};
 use mergepatrol_executor::{DockerExecutor, Executor, LocalExecutor};
 use mergepatrol_github::App;
 use mergepatrol_github::setup::random_token;
-use mergepatrol_store::{GITHUB_APP, PgStore, Scope, Store, Vault};
+use mergepatrol_store::{BuildStore, GITHUB_APP, PgStore, Scope, Store, Vault};
 use mergepatrol_web::WebConfig;
 use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
@@ -72,6 +72,7 @@ async fn orchestrator() -> Result<()> {
 
     let pg = Arc::new(PgStore::connect(&config.database_url).await?);
     let store: Arc<dyn Store> = pg.clone();
+    let builds: Arc<dyn BuildStore> = pg.clone();
     let vault = Arc::new(Vault::new(store.clone(), &config.secret_key)?);
     let rotated = vault.rotate().await?;
     if rotated > 0 {
@@ -211,7 +212,7 @@ async fn orchestrator() -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "dashboard");
-    let app = mergepatrol_web::router(store, vault, web)
+    let app = mergepatrol_web::router(store, builds, vault, web)
         .merge(mailbox.router())
         .merge(proxy.router());
     axum::serve(listener, app)

@@ -1,11 +1,16 @@
 //! Persistence, in Postgres. Migrations are in `migrations/`, embedded, and run at startup.
 
 mod billing;
+mod build;
 mod github;
 mod review;
 mod vault;
 
 pub use billing::{BillingStore, FairUse, Subscription, Unsynced};
+pub use build::{
+    Build, BuildSettings, BuildStatus, BuildStore, Claimed, Holder, IssueTask, Stage, Standing,
+    SyncStart,
+};
 pub use github::{BRANCH_RULES, Change, PrRead, PrWrite, Read, ReadCache, RepoReads, ValueRead};
 pub use review::{ReviewAnswers, ReviewDone, ReviewRecord, ReviewStore};
 pub use vault::{
@@ -353,7 +358,7 @@ impl Scope {
 
 /// What moves a repo from its old name, $2, to its new one, $3. A table that can hold a row under
 /// each name keeps the new name's: it is the newer.
-const RENAME_REPO: [&str; 11] = [
+const RENAME_REPO: [&str; 14] = [
     // A repo turned on or off under its old name stays so.
     "UPDATE repos new SET enabled = COALESCE(new.enabled, old.enabled) FROM repos old
      WHERE new.installation_id = $1 AND new.repo = $3
@@ -372,6 +377,11 @@ const RENAME_REPO: [&str; 11] = [
     "UPDATE agent_reviews SET repo = $3 WHERE installation_id = $1 AND repo = $2",
     "UPDATE events SET repo = $3 WHERE installation_id = $1 AND repo = $2",
     "UPDATE exits SET repo = $3 WHERE installation_id = $1 AND repo = $2",
+    // A build claimed under the old name stays claimed, so its holder keeps building it.
+    "DELETE FROM builds old WHERE old.installation_id = $1 AND old.repo = $2 AND EXISTS
+     (SELECT 1 FROM builds new WHERE new.installation_id = $1 AND new.repo = $3 AND new.issue = old.issue)",
+    "UPDATE builds SET repo = $3 WHERE installation_id = $1 AND repo = $2",
+    "DELETE FROM build_syncs WHERE installation_id = $1 AND repo = $2",
 ];
 
 /// One installation of the GitHub App, on an organization or a user account.

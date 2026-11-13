@@ -60,6 +60,12 @@ pub(crate) async fn receive(
         .and_then(RepoName::parse);
     if let (Some(installation), Some(repo)) = (installation, repo) {
         tracing::debug!(event, installation, %repo, "webhook");
+        // Issues are the build lane's, and nothing the queue reads.
+        if event == Some("issues") {
+            return crate::builds::heard(&state, installation, &repo, &payload)
+                .await
+                .map(|()| StatusCode::NO_CONTENT);
+        }
         let mut stored = Ok(());
         if event == Some("push")
             && let Some(has) = config_after_push(&payload)

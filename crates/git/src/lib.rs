@@ -1,6 +1,8 @@
-//! Local git, through the `git` CLI. MergeLoop never pushes: `fetch` is the only network call,
-//! and the `github` crate publishes the commits.
+//! Local git, through the `git` CLI. The server never pushes through it: it fetches, and the
+//! `github` crate publishes its commits. The build lane's daemon pushes its builds with
+//! `push_leased`.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -17,6 +19,76 @@ const COMMITTER: (&str, &str) = ("MergeLoop", "mergeloop@users.noreply.github.co
 
 #[derive(Clone, Copy, Default)]
 pub struct Git;
+
+/// A worktree whose files someone else may have written, such as a build's agent. Git runs on
+/// it by its git dir, named here, never found through the tree's `.git`, which could point at a
+/// repo with hooks or config of its writer's; and only while the tree's root is the folder
+/// `Git::add_tree` made, so that its writer cannot point git at another folder to read. Make
+/// one with `Git::add_tree`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tree {
+    /// The worktree's own git dir, in its clone's `worktrees/`.
+    pub git_dir: PathBuf,
+    pub work_tree: PathBuf,
+    /// The device and inode of the root as made. `None` only through `Tree::unpinned`.
+    root: Option<(u64, u64)>,
+    /// What git runs under, as `sandbox-exec -p <profile>`: none, git runs as it is.
+    under: Vec<OsString>,
+}
+
+/// The tree's root is no longer the folder `Git::add_tree` made: a link, or another folder.
+#[derive(Debug)]
+pub struct TreeReplaced(pub PathBuf);
+
+impl std::fmt::Display for TreeReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the worktree at {} was replaced since it was made, so git did not read it",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for TreeReplaced {}
+
+impl Tree {
+    /// The tree, with git run on it under `program`: its first item and the rest its
+    /// arguments, before `git`.
+    pub fn under(self, program: Vec<OsString>) -> Self {
+        Tree {
+            under: program,
+            ..self
+        }
+    }
+
+    /// The tree, without the check that its root is the folder made. For tests of what holds
+    /// without it.
+    #[doc(hidden)]
+    pub fn unpinned(self) -> Self {
+        Tree { root: None, ..self }
+    }
+
+    /// An error when the root is not the folder made.
+    fn check(&self) -> Result<()> {
+        let Some(made) = self.root else {
+            return Ok(());
+        };
+        let now = std::fs::symlink_metadata(&self.work_tree)
+            .ok()
+            .filter(|m| m.is_dir())
+            .map(|m| root_id(&m));
+        if now != Some(made) {
+            return Err(TreeReplaced(self.work_tree.clone()).into());
+        }
+        Ok(())
+    }
+}
+
+fn root_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RebaseStep {
@@ -122,7 +194,26 @@ impl Git {
         Ok(())
     }
 
-    /// Pushes `sha` to `branch` at `url`, only while the branch is at `expected`. The token goes
+    /// The commit `branch` is at on `origin`, or `None` when it has no such branch. The token goes
+    /// in as `fetch`'s does.
+    pub async fn remote_head(
+        &self,
+        repo: &Path,
+        token: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let refname = format!("refs/heads/{branch}");
+        let mut cmd = self.git(repo, &["ls-remote", "origin", &refname]);
+        authorize(&mut cmd, token);
+        let out = String::from_utf8(output(cmd, "git ls-remote").await?)?;
+        Ok(out
+            .lines()
+            .find_map(|l| l.strip_suffix(refname.as_str()))
+            .map(|sha| sha.trim().to_owned()))
+    }
+
+    /// Pushes `sha` to `branch` at `url`, only while the branch is at `expected`: absent, when
+    /// `expected` is empty. The token goes
     /// in as `fetch`'s does.
     pub async fn push_leased(
         &self,
@@ -199,6 +290,105 @@ impl Git {
         )
         .await?;
         Ok(())
+    }
+
+    /// A worktree of `clone` at `dir`, on local branch `branch` at `rev`. Its git dir is read
+    /// now, while nobody else has written to `dir`.
+    pub async fn add_tree(
+        &self,
+        clone: &Path,
+        dir: &Path,
+        branch: &str,
+        rev: &str,
+    ) -> Result<Tree> {
+        self.run(
+            clone,
+            &["worktree", "add", "-q", "-B", branch, path_str(dir)?, rev],
+        )
+        .await?;
+        let link = tokio::fs::read_to_string(dir.join(".git")).await?;
+        let git_dir = PathBuf::from(
+            link.trim()
+                .strip_prefix("gitdir: ")
+                .context("a worktree whose .git names no git dir")?,
+        );
+        if !git_dir.starts_with(clone.join("worktrees")) {
+            bail!(
+                "the worktree at {} has its git dir outside its clone",
+                dir.display()
+            );
+        }
+        let root = std::fs::symlink_metadata(dir)?;
+        Ok(Tree {
+            git_dir,
+            work_tree: dir.to_owned(),
+            root: Some(root_id(&root)),
+            under: vec![],
+        })
+    }
+
+    /// Commits everything in `tree` since `base` as one commit, by `author` as author and
+    /// committer, on the tree's branch: what was committed on top of `base` folds into it.
+    /// `false` when there is nothing to commit.
+    pub async fn squash(
+        &self,
+        tree: &Tree,
+        base: &str,
+        message: &str,
+        author: (&str, &str),
+    ) -> Result<bool> {
+        let run = async |args: &[&str]| output(self.on_tree(tree, args)?, "git").await;
+        run(&["reset", "-q", "--soft", base]).await?;
+        run(&["add", "-A"]).await?;
+        if run(&["diff", "--cached", "--quiet"]).await.is_ok() {
+            return Ok(false);
+        }
+        let mut cmd = self.on_tree(
+            tree,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "-F",
+                "-",
+            ],
+        )?;
+        cmd.env("GIT_AUTHOR_NAME", author.0)
+            .env("GIT_AUTHOR_EMAIL", author.1)
+            .env("GIT_COMMITTER_NAME", author.0)
+            .env("GIT_COMMITTER_EMAIL", author.1);
+        input(cmd.stdin(Stdio::piped()), message.as_bytes(), "git commit").await?;
+        Ok(true)
+    }
+
+    /// Whether `tree` holds just its commit, as `squash` sees it: no file changed or added.
+    pub async fn tree_clean(&self, tree: &Tree) -> Result<bool> {
+        output(self.on_tree(tree, &["add", "-A"])?, "git add").await?;
+        let diff = self.on_tree(tree, &["diff", "--cached", "--quiet", "HEAD"])?;
+        Ok(output(diff, "git diff").await.is_ok())
+    }
+
+    /// The commit `tree` is at.
+    pub async fn tree_head(&self, tree: &Tree) -> Result<String> {
+        let out = output(
+            self.on_tree(tree, &["rev-parse", "--verify", "HEAD"])?,
+            "git rev-parse",
+        )
+        .await?;
+        Ok(String::from_utf8(out)?.trim().to_owned())
+    }
+
+    /// `git args` on `tree`, by its git dir, under what the tree names; an error when the tree
+    /// was replaced. It starts in the git dir, so that not even its start follows the tree.
+    fn on_tree(&self, tree: &Tree, args: &[&str]) -> Result<tokio::process::Command> {
+        tree.check()?;
+        let git_dir = format!("--git-dir={}", tree.git_dir.display());
+        let work_tree = format!("--work-tree={}", tree.work_tree.display());
+        let mut all = vec![git_dir.as_str(), work_tree.as_str()];
+        all.extend(args);
+        Ok(self.command(&tree.under, &tree.git_dir, &all))
     }
 
     pub async fn remove_worktree(&self, cache: &Path, dir: &Path) -> Result<()> {
@@ -601,10 +791,27 @@ impl Git {
         )
     }
 
+    /// Every git MergeLoop runs: with no hooks, whatever the repo or its config says, so that
+    /// nothing a repo's writer left there runs as MergeLoop. Git still reads the system's, the
+    /// user's and the repo's configuration, which repos need (git-lfs's filter): keeping a
+    /// tree's writer from writing any of it is the caller's.
     fn git(&self, cwd: &Path, args: &[&str]) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new("git");
+        self.command(&[], cwd, args)
+    }
+
+    /// `git`, run under `under` when it names a program.
+    fn command(&self, under: &[OsString], cwd: &Path, args: &[&str]) -> tokio::process::Command {
+        let mut cmd = match under {
+            [program, rest @ ..] => {
+                let mut cmd = tokio::process::Command::new(program);
+                cmd.args(rest).arg("git");
+                cmd
+            }
+            [] => tokio::process::Command::new("git"),
+        };
         cmd.current_dir(cwd)
             .kill_on_drop(true)
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .env("GIT_COMMITTER_NAME", COMMITTER.0)
             .env("GIT_COMMITTER_EMAIL", COMMITTER.1)
@@ -617,7 +824,8 @@ impl Git {
         output(self.git(cwd, args), &format!("git {}", args.join(" "))).await
     }
 
-    async fn run(&self, cwd: &Path, args: &[&str]) -> Result<String> {
+    /// `git args` in `cwd`, its output: an error with git's when it fails.
+    pub async fn run(&self, cwd: &Path, args: &[&str]) -> Result<String> {
         Ok(String::from_utf8(self.output(cwd, args).await?)?)
     }
 
@@ -881,5 +1089,96 @@ mod tests {
         std::fs::write(dir.join("test.txt"), "weakened\n").unwrap();
         assert!(!Git.holds(dir, &patch).await.unwrap());
         assert!(Git.patch_of(dir, &head, &[]).await.unwrap().is_empty());
+    }
+
+    /// Writes an executable script at `path` that touches `marker`.
+    fn tripwire(path: &Path, marker: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_on_a_tree_runs_nothing_that_the_tree_or_its_clone_could_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        let base = commit(&src, "a.txt", "1");
+        let clone = root.join("c.git");
+        sh(&root, &["clone", "-q", "--bare", "src", "c.git"]);
+        let dir = root.join("builds/1/tree");
+        let tree = Git
+            .add_tree(&clone, &dir, "mergeloop/build-1", &base)
+            .await
+            .unwrap();
+        assert!(
+            tree.git_dir.starts_with(clone.join("worktrees")),
+            "{tree:?}"
+        );
+        assert_eq!(tree.work_tree, dir);
+
+        let fired = root.join("fired");
+        // Hooks in the clone: off for every call.
+        for hook in ["pre-commit", "post-commit", "reference-transaction"] {
+            tripwire(&clone.join("hooks").join(hook), &fired.join(hook));
+        }
+        // A tree that points its `.git` at a repo of its own, with hooks, a filter and an
+        // fsmonitor, and a nested repo with an fsmonitor of its own.
+        let evil = dir.join("evil");
+        sh(&dir, &["init", "-q", "--bare", "evil"]);
+        tripwire(&evil.join("hooks/pre-commit"), &fired.join("tree-hook"));
+        tripwire(&root.join("monitor"), &fired.join("monitor"));
+        tripwire(&root.join("clean"), &fired.join("filter"));
+        let config = format!(
+            "[core]\n\tfsmonitor = {}\n[filter \"evil\"]\n\tclean = {}\n",
+            root.join("monitor").display(),
+            root.join("clean").display()
+        );
+        std::fs::write(evil.join("config"), &config).unwrap();
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        sh(&nested, &["init", "-q"]);
+        commit(&nested, "n.txt", "n");
+        std::fs::write(nested.join(".git/config"), &config).unwrap();
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
+
+        assert!(
+            Git.squash(&tree, &base, "Change a", ("Bot", "bot@example.com"))
+                .await
+                .unwrap()
+        );
+        let head = Git.tree_head(&tree).await.unwrap();
+        assert_eq!(
+            sh(&clone, &["rev-parse", "refs/heads/mergeloop/build-1"]),
+            head
+        );
+        assert_eq!(
+            sh(&clone, &["log", "-1", "--format=%s|%an|%cn", &head]),
+            "Change a|Bot|Bot"
+        );
+        let ran: Vec<_> = std::fs::read_dir(&fired)
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(ran.is_empty(), "ran {ran:?}");
+        // Nothing to commit is no commit.
+        assert!(
+            !Git.squash(&tree, &head, "Again", ("Bot", "bot@example.com"))
+                .await
+                .unwrap()
+        );
+        assert!(Git.tree_clean(&tree).await.unwrap());
+        std::fs::write(dir.join("new.txt"), "new").unwrap();
+        assert!(!Git.tree_clean(&tree).await.unwrap(), "a new file");
+        let ran = std::fs::read_dir(&fired).map_or(0, |d| d.count());
+        assert_eq!(ran, 0, "the check runs nothing of the tree's");
     }
 }

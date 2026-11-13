@@ -5,6 +5,7 @@ mod api;
 mod auth;
 mod billing;
 mod blog;
+mod builds;
 mod changelog;
 mod docs;
 mod gate;
@@ -27,9 +28,9 @@ use axum::response::{IntoResponse, Response};
 use mergepatrol_analytics::Analytics;
 use mergepatrol_billing::Billing;
 use mergepatrol_core::RepoSettings;
-use mergepatrol_github::AppCredentials;
+use mergepatrol_github::{AppCredentials, GitHub};
 use mergepatrol_resolver::ChatGptAuth;
-use mergepatrol_store::{GITHUB_APP, Scope, Store, Vault};
+use mergepatrol_store::{BuildStore, GITHUB_APP, Scope, Store, Vault};
 use secrecy::ExposeSecret;
 
 pub use api::*;
@@ -38,6 +39,7 @@ pub use auth::{
     UserView,
 };
 pub use billing::{AccessView, BillingView, PricingView, RedirectView};
+pub use builds::*;
 pub use gate::merge_requested;
 pub use review::*;
 pub use webhook::Wake;
@@ -65,6 +67,7 @@ pub struct WebConfig {
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn Store>,
+    builds: Arc<dyn BuildStore>,
     vault: Arc<Vault>,
     public_url: Arc<str>,
     hosted_app: Option<Arc<AppCredentials>>,
@@ -78,6 +81,8 @@ struct AppState {
     seen: Arc<auth::Seen>,
     /// The `/api/v1` calls each caller has left.
     budgets: Arc<v1::Budgets>,
+    /// Where GitHub is: a fake in tests.
+    github: GitHub,
 }
 
 impl AppState {
@@ -96,13 +101,24 @@ impl AppState {
     }
 }
 
-pub fn router(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> Router {
-    serve(state(store, vault, config))
+pub fn router(
+    store: Arc<dyn Store>,
+    builds: Arc<dyn BuildStore>,
+    vault: Arc<Vault>,
+    config: WebConfig,
+) -> Router {
+    serve(state(store, builds, vault, config))
 }
 
-fn state(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> AppState {
+fn state(
+    store: Arc<dyn Store>,
+    builds: Arc<dyn BuildStore>,
+    vault: Arc<Vault>,
+    config: WebConfig,
+) -> AppState {
     AppState {
         store,
+        builds,
         vault,
         public_url: config.public_url.trim_end_matches('/').into(),
         hosted_app: config.hosted_app.map(Arc::new),
@@ -114,6 +130,7 @@ fn state(store: Arc<dyn Store>, vault: Arc<Vault>, config: WebConfig) -> AppStat
         chatgpt: config.chatgpt,
         seen: Arc::default(),
         budgets: Arc::default(),
+        github: GitHub::default(),
     }
 }
 
@@ -124,14 +141,72 @@ fn serve(state: AppState) -> Router {
 enum ApiError {
     /// A message for the user.
     Status(StatusCode, String),
+    /// A message for the user, of a kind a client acts on: MCP names it beside the text.
+    Refused(Refusal, String),
     /// GitHub's rate limit is used up, until this much later.
     GitHubLimited(std::time::Duration, String),
     Internal(anyhow::Error),
 }
 
+/// The refusals a daemon must tell apart, because each asks something different of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The workspace's build lane is off: wait, and ask again later.
+    LaneOff,
+    /// The caller no longer holds the build: stop working on it.
+    Lost,
+    /// The build's issue stopped being a task before it had a PR: give it back.
+    Cancelled,
+    /// The build went unheard too long: heartbeat it, then ask again.
+    Unheard,
+    /// GitHub says the caller may not push to the repo: give the build back.
+    MayNotPush,
+    /// The build's PR merged: report it merged.
+    Merged,
+    /// A person closed the build's PR without merging it: release the build as stuck.
+    Closed,
+}
+
+impl Refusal {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::MayNotPush => StatusCode::FORBIDDEN,
+            Self::LaneOff
+            | Self::Lost
+            | Self::Cancelled
+            | Self::Unheard
+            | Self::Merged
+            | Self::Closed => StatusCode::CONFLICT,
+        }
+    }
+
+    /// Its name in MCP's answer.
+    fn name(self) -> &'static str {
+        match self {
+            Self::LaneOff => "lane_off",
+            Self::Lost => "lost",
+            Self::Cancelled => "cancelled",
+            Self::Unheard => "unheard",
+            Self::MayNotPush => "may_not_push",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 impl ApiError {
     fn bad_request(m: &str) -> Self {
         Self::Status(StatusCode::BAD_REQUEST, m.to_owned())
+    }
+
+    /// For a log.
+    fn message(&self) -> String {
+        match self {
+            Self::Status(code, m) => format!("{code}: {m}"),
+            Self::Refused(r, m) => format!("{}: {m}", r.status()),
+            Self::GitHubLimited(_, m) => m.clone(),
+            Self::Internal(e) => format!("{e:#}"),
+        }
     }
 }
 
@@ -148,6 +223,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             Self::Status(code, m) => (code, m).into_response(),
+            // MCP reads the refusal back from the response's extensions.
+            Self::Refused(r, m) => (r.status(), axum::Extension(r), m).into_response(),
             Self::GitHubLimited(wait, m) => {
                 let secs = wait.as_secs().max(1).to_string();
                 let retry = [(axum::http::header::RETRY_AFTER, secs)];
@@ -167,10 +244,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use mergepatrol_core::RepoName;
+    use mergepatrol_github::fake;
     use mergepatrol_github::setup::{Pkce, UserToken};
     use mergepatrol_store::{LoginCode, PgStore, Session, SessionKind};
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    mod build_lane;
 
     const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
@@ -211,44 +291,61 @@ mod tests {
     }
 
     async fn with_config(pool: PgPool, config: WebConfig) -> (Router, String) {
-        let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
+        (
+            serve(signed_in_state(pool, config).await),
+            "mp_session=tok".into(),
+        )
+    }
+
+    /// As `signed_in`, with the GitHub App set up, and GitHub answered by `github`.
+    async fn with_github(pool: PgPool, github: GitHub) -> (Router, String) {
+        let config = web_config(Some(app(None)), Arc::default());
+        let mut state = signed_in_state(pool, config).await;
+        state.github = github;
+        (serve(state), "mp_session=tok".into())
+    }
+
+    async fn signed_in_state(pool: PgPool, config: WebConfig) -> AppState {
+        let pg = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let store: Arc<dyn Store> = pg.clone();
         let vault = Arc::new(Vault::new(store.clone(), KEY).unwrap());
-        let expires_at = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 600) as i64;
-        let kind = SessionKind::User {
-            login: "ada".into(),
-            avatar_url: String::new(),
-            installations: vec![1],
-        };
-        let github = UserToken {
-            access_token: "ghu_tok".into(),
+        let state = state(store, pg, vault, config);
+        sign_in(&state, "tok", "ada", "ghu_tok").await;
+        state.seen.assume_repos("ghu_x", 1, &READABLE);
+        state
+    }
+
+    /// Signs `login` in with the session `token`, holding their GitHub token `github`, which
+    /// reads the `READABLE` repos of installation 1, as GitHub said.
+    async fn sign_in(state: &AppState, token: &str, login: &str, github: &str) {
+        let user_token = UserToken {
+            access_token: github.into(),
             expires_at: Some(now() + 3600),
             refresh_token: None,
         };
-        let sealed = vault
+        let sealed = state
+            .vault
             .seal(
-                &format!("session/{}", auth::hash("tok")),
-                &serde_json::to_string(&github).unwrap(),
+                &format!("session/{}", auth::hash(token)),
+                &serde_json::to_string(&user_token).unwrap(),
             )
             .unwrap();
         let session = Session {
-            kind,
-            expires_at,
+            kind: SessionKind::User {
+                login: login.into(),
+                avatar_url: String::new(),
+                installations: vec![1],
+            },
+            expires_at: now() + 600,
             checked_at: now(),
             github: Some(sealed),
         };
-        store
-            .create_session(&auth::hash("tok"), &session)
+        state
+            .store
+            .create_session(&auth::hash(token), &session)
             .await
             .unwrap();
-        let state = state(store, vault, config);
-        for token in ["ghu_tok", "ghu_x"] {
-            state.seen.assume_repos(token, 1, &READABLE);
-        }
-        (serve(state), "mp_session=tok".into())
+        state.seen.assume_repos(github, 1, &READABLE);
     }
 
     fn web_config(hosted_app: Option<AppCredentials>, wake: Arc<Woken>) -> WebConfig {
@@ -279,9 +376,10 @@ mod tests {
 
     /// Another process on the same database: as after a restart, or on another instance.
     async fn restarted(pool: PgPool, hosted_app: Option<AppCredentials>) -> Router {
-        let store: Arc<dyn Store> = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let pg = Arc::new(PgStore::migrate(pool).await.unwrap());
+        let store: Arc<dyn Store> = pg.clone();
         let vault = Arc::new(Vault::new(store.clone(), KEY).unwrap());
-        router(store, vault, web_config(hosted_app, Arc::default()))
+        router(store, pg, vault, web_config(hosted_app, Arc::default()))
     }
 
     /// Where a redirect goes, and the cookies it sets.
@@ -1053,8 +1151,12 @@ mod tests {
             price: "price".into(),
         };
         let mut config = web_config(None, Arc::default());
-        config.billing = Some(Arc::new(Billing::new(pg, stripe, "http://localhost:8080")));
-        router(store, vault, config)
+        config.billing = Some(Arc::new(Billing::new(
+            pg.clone(),
+            stripe,
+            "http://localhost:8080",
+        )));
+        router(store, pg, vault, config)
     }
 
     async fn body(router: &Router, path: &str, cookie: &str) -> String {
@@ -1854,9 +1956,13 @@ mod tests {
                 webhook_secret: "whsec".into(),
                 price: "price".into(),
             };
-            config.billing = Some(Arc::new(Billing::new(pg, stripe, "http://localhost:8080")));
+            config.billing = Some(Arc::new(Billing::new(
+                pg.clone(),
+                stripe,
+                "http://localhost:8080",
+            )));
         }
-        let state = state(store.clone(), Arc::new(vault), config);
+        let state = state(store.clone(), pg, Arc::new(vault), config);
         state.seen.assume_repos("ghu_x", 1, &READABLE);
         for token in ["ghu_x", "ghp_y"] {
             let r = |name: &str| RepoName::parse(name).unwrap();
@@ -2328,5 +2434,74 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
         let error = text_of(res).await;
         assert!(error.contains("spans a workspace"), "{error}");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_repos_listed_are_those_a_faked_github_gives_the_installation(pool: PgPool) {
+        let github = fake::github(|call| match (call.token, call.path) {
+            (fake::INSTALLATION_TOKEN, "/installation/repositories?per_page=100&page=1") => (
+                200,
+                r#"{"repositories":[{"full_name":"o/r","private":false},{"full_name":"o/unread","private":true}]}"#.into(),
+            ),
+            _ => (404, "{}".into()),
+        })
+        .await;
+        let (router, cookie) = with_github(pool, github).await;
+        let req = Request::get("/api/w/1/repos").header("cookie", cookie);
+        let res = send(&router, req.body(Body::empty()).unwrap()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let repos = json_of(res).await;
+        let names: Vec<&str> = repos
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["repo"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["o/r"]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_token_is_checked_against_a_faked_github(pool: PgPool) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let heard = calls.clone();
+        let github = fake::github(move |call| {
+            heard
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", call.token, call.path));
+            let permissions = |admin: bool| {
+                (
+                    200,
+                    format!(r#"{{"permissions":{{"push":true,"admin":{admin}}}}}"#),
+                )
+            };
+            match (call.token, call.path) {
+                (_, "/rate_limit") => (200, "{}".into()),
+                ("ghp_admin", "/repos/o/r") => permissions(true),
+                ("ghp_dev", "/repos/o/r") => permissions(false),
+                (_, "/repos/o/r/installation") => (200, r#"{"id":1}"#.into()),
+                _ => (404, "{}".into()),
+            }
+        })
+        .await;
+        let (router, _) = with_github(pool, github).await;
+        let set = |token: &str| {
+            let req = Request::put("/api/w/1/repos/o/r")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":true}"#))
+                .unwrap();
+            send(&router, req)
+        };
+
+        let res = set("ghp_dev").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(text_of(res).await, "You need admin access to o/r for this.");
+        assert_eq!(set("ghp_admin").await.status(), StatusCode::NO_CONTENT);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.contains(&"ghp_admin /repos/o/r".to_owned()),
+            "{calls:?}"
+        );
     }
 }

@@ -9,7 +9,7 @@ import type { ExitView } from "./api/ExitView";
 import type { LaneView } from "./api/LaneView";
 import type { LayerView } from "./api/LayerView";
 import { reviewBadge, reviewLine } from "./review";
-import { Avatar, primary, timeAgo } from "./ui";
+import { Avatar, Badge, Empty, ListHead, primary, timeAgo, tints } from "./ui";
 
 /*
  * The queues, read only: each lane's PRs in the order they merge, and why each is held. A PR
@@ -197,15 +197,9 @@ const heldByReview = (e: EntryView) => reviewBadge(e) !== null;
 const asks = (e: EntryView) => e.hold?.reason === "review_asks";
 
 const stateBadge: Record<EntryView["state"], [string, string]> = {
-  active: [
-    "Starting",
-    "bg-blue-50 text-blue-700 ring-blue-600/20 dark:bg-blue-400/10 dark:text-blue-300 dark:ring-blue-400/30",
-  ],
-  waiting: ["Waiting", "bg-sunken text-fg-2 ring-neutral-500/20"],
-  held: [
-    "Held",
-    "bg-amber-50 text-amber-800 ring-amber-600/20 dark:bg-amber-400/10 dark:text-amber-300 dark:ring-amber-400/30",
-  ],
+  active: ["Starting", tints.blue],
+  waiting: ["Waiting", tints.grey],
+  held: ["Held", tints.amber],
 };
 
 const stepLabel: Record<ActiveStepView, string> = {
@@ -226,35 +220,7 @@ function State({ entry }: { entry: EntryView }) {
   return <Badge style={style}>{label}</Badge>;
 }
 
-function Badge({ style, children }: { style: string; children: ReactNode }) {
-  return (
-    <span
-      className={`whitespace-nowrap rounded-md px-1.5 py-0.5 text-xs font-medium ring-1 ring-inset ${style}`}
-    >
-      {children}
-    </span>
-  );
-}
-
-const ejectedBadge =
-  "bg-red-50 text-red-700 ring-red-600/20 dark:bg-red-400/10 dark:text-red-300 dark:ring-red-400/30";
-
-/** A band over a list of PRs. */
-function ListHead({ title, note, count }: { title: string; note: string; count: number }) {
-  return (
-    <p className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-xs text-muted">
-      <span>
-        <span className="font-medium text-fg-2">{title}</span> · {note}
-      </span>
-      <span className="tabular-nums">{count}</span>
-    </p>
-  );
-}
-
-/** What a list says with no PRs in it. */
-function Empty({ children }: { children: ReactNode }) {
-  return <p className="px-4 py-3 text-xs text-faint">{children}</p>;
-}
+const ejectedBadge = tints.red;
 
 /** A list of PRs below the lane, with its band. */
 function Rows<T extends { number: number }>({
@@ -372,8 +338,7 @@ function layerStatuses(e: EntryView): LayerStatus[] {
   });
 }
 
-const approvedBadge =
-  "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/30";
+const approvedBadge = tints.green;
 
 const statusDot: Record<NonNullable<LayerStatus>, string> = {
   approved: "bg-ok",

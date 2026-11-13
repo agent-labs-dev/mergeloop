@@ -845,17 +845,7 @@ pub(crate) const FINDINGS_MAX: usize = 25;
 
 /// The review in the agent's answer, once it reviewed: its JSON, alone or in a code block.
 fn parse_review(outcome: &Outcome, text: &str) -> Result<ReviewOutput> {
-    match outcome {
-        Outcome::Failed(why) => bail!("the agent failed: {why}"),
-        Outcome::GaveUp(why) => bail!("the agent gave up: {why}"),
-        Outcome::Resolved => {}
-    }
-    let json = match (text.find('{'), text.rfind('}')) {
-        (Some(start), Some(end)) if start < end => &text[start..=end],
-        _ => bail!("the agent's review is not JSON"),
-    };
-    let mut output: ReviewOutput =
-        serde_json::from_str(json).context("the agent's review does not parse")?;
+    let mut output: ReviewOutput = mergepatrol_resolver::reply_json(outcome, text)?;
     output.findings.retain(|f| !f.title.trim().is_empty());
     output.findings = most_first(std::mem::take(&mut output.findings), FINDINGS_MAX);
     for (i, f) in output.findings.iter_mut().enumerate() {
@@ -1341,7 +1331,10 @@ mod tests {
         assert_eq!(r.findings[0].confidence, 100, "a percent is at most 100");
         assert_eq!(r.findings[0].kind, mergepatrol_core::Kind::Security);
         assert_eq!(r.findings[0].line, Some(3));
-        assert!(parse_review(&Outcome::Resolved, "I could not review it.").is_err());
+        let why = parse_review(&Outcome::Resolved, "I could not review it.").unwrap_err();
+        assert_eq!(why.to_string(), "the agent's review is not JSON");
+        let why = parse_review(&Outcome::Resolved, "{\"summary\": 1}").unwrap_err();
+        assert_eq!(why.to_string(), "the agent's review does not parse");
         let gave_up = Outcome::GaveUp("no access".into());
         let why = parse_review(&gave_up, text).unwrap_err().to_string();
         assert_eq!(why, "the agent gave up: no access");

@@ -1,14 +1,15 @@
 # Builds the `mergeloop` command for macOS and Linux. A PR that touches it checks every build;
 # each push to main that does publishes them to the cli-latest prerelease, which the skill
-# installs from, so its download URLs never change.
+# installs from, so its download URLs never change. The paths are the CLI's and the crates it
+# depends on.
 name: cli
 
 on:
   pull_request:
-    paths: ["crates/cli/**", "Cargo.lock", ".github/workflows/cli.yml"]
+    paths: ["crates/cli/**", "crates/resolver/**", "crates/core/**", "crates/git/**", "Cargo.lock", ".github/workflows/cli.yml"]
   push:
     branches: [main]
-    paths: ["crates/cli/**", "Cargo.lock", ".github/workflows/cli.yml"]
+    paths: ["crates/cli/**", "crates/resolver/**", "crates/core/**", "crates/git/**", "Cargo.lock", ".github/workflows/cli.yml"]
   workflow_dispatch:
 
 permissions:

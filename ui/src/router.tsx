@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { App } from "./App";
 import type { OutcomeView } from "./api/OutcomeView";
+import { Builds } from "./Builds";
 import { History, LISTS, type List, OUTCOMES, WINDOWS, type Window } from "./History";
 import { Permalink } from "./Permalink";
 import { Queue } from "./Queue";
@@ -59,6 +60,14 @@ const queue = createRoute({
   /** The lane in view, as `owner/repo:trunk`: the first by default. */
   validateSearch: (search): { lane?: string } => ({ lane: optional(search.lane, "string") }),
   component: () => <Queue workspace={useWorkspace().workspace} />,
+});
+
+const builds = createRoute({
+  getParentRoute: () => workspace,
+  path: "builds",
+  /** The repo in view: every repo by default. */
+  validateSearch: (search): { repo?: string } => ({ repo: optional(search.repo, "string") }),
+  component: () => <Builds workspace={useWorkspace().workspace} />,
 });
 
 const history = createRoute({
@@ -119,7 +128,7 @@ const settings = createRoute({
 export const router = createRouter({
   routeTree: root.addChildren([
     home,
-    workspace.addChildren([workspaceHome, you, queue, history, repos, settings, pull]),
+    workspace.addChildren([workspaceHome, you, queue, builds, history, repos, settings, pull]),
   ]),
 });
 

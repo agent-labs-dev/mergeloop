@@ -46,6 +46,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The daemon's confinement tests run under bubblewrap, and fail rather than skip without it.
+      # Where Ubuntu 24.04's AppArmor refuses unprivileged user namespaces, which bubblewrap
+      # needs, the sysctl lifts that. A runner without AppArmor has no such key.
+      - name: sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap socat
+          key=kernel.apparmor_restrict_unprivileged_userns
+          if sysctl -n "$key" >/dev/null 2>&1; then sudo sysctl -w "$key=0"; fi
       - run: cargo test --workspace --locked
+        env:
+          MERGELOOP_REQUIRE_SANDBOX: "1"
       # `cargo test` regenerates the API types in ui/src/api. A diff means they were not committed.
       - run: git diff --exit-code ui/src/api

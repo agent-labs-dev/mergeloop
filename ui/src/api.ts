@@ -1,4 +1,6 @@
 import type { BillingView } from "./api/BillingView";
+import type { BuildSettingsView } from "./api/BuildSettingsView";
+import type { BuildView } from "./api/BuildView";
 import type { ChangelogEntryView } from "./api/ChangelogEntryView";
 import type { ExitsPage } from "./api/ExitsPage";
 import type { HistoryStatsView } from "./api/HistoryStatsView";
@@ -163,3 +165,11 @@ export const fetchReviewSettings = (id: number) =>
 
 export const setReviewSettings = (id: number, body: SetReviewSettings) =>
   send<ReviewSettingsView>("PUT", w(id, "/settings/review"), body);
+
+/** The workspace's builds; refused while the lane is off. */
+export const fetchBuilds = (id: number) => get<BuildView[]>(w(id, "/builds"));
+
+export const fetchBuildSettings = (id: number) => get<BuildSettingsView>(w(id, "/settings/builds"));
+
+export const setBuildSettings = (id: number, body: BuildSettingsView) =>
+  send<BuildSettingsView>("PUT", w(id, "/settings/builds"), body);

@@ -1,21 +1,33 @@
 //! The agent: resolves the conflicts of one commit in a stopped rebase, fixes the failed
-//! checks of a PR, or reviews a PR. It edits files only: the caller checks the result and
+//! checks of a PR, or reviews a PR. On a developer's machine (`LocalAgent`), it builds an issue
+//! for the build lane. It edits files only: the caller checks the result and
 //! commits it. A review may run the repo and write tests to show what it finds, which the caller
 //! throws away but for its evidence: its answer is its last message.
 
+mod answers;
+mod build;
 mod chatgpt;
 mod claude;
 mod cli;
 mod codex;
 mod keys;
+mod local;
+mod review;
 mod vote;
 
+pub use answers::{REPLY, RESOLVE, ThreadAnswers, thread_answers};
+pub use build::{BuildRequest, VerifyFailed, build_description, build_prompt, failed_note};
 #[cfg(any(test, feature = "testing"))]
 pub use chatgpt::testing;
 pub use chatgpt::{ChatGptAuth, ChatGptLogin, DeviceLogin};
 pub use claude::ClaudeResolver;
 pub use codex::CodexResolver;
 pub use keys::{KeyCheck, check_api_key};
+pub use local::{Access, Env, LocalAgent, Room, Vendor};
+pub use review::{
+    BuildFinding, BuildReview, findings_note, reply_json, review_build_findings,
+    review_build_prompt,
+};
 pub use vote::{DOES_NOT_HOLD, HOLDS, claim, vote};
 
 use std::path::Path;
@@ -211,7 +223,7 @@ pub trait Resolver: Send + Sync {
 
 pub(crate) const GIVE_UP: &str = "MERGEPATROL_GIVE_UP:";
 const RETITLE: &str = "MERGEPATROL_RETITLE:";
-const COMMIT: &str = "MERGELOOP_COMMIT:";
+pub const COMMIT: &str = "MERGELOOP_COMMIT:";
 
 /// The reason the agent gave up, if its last message says it did.
 pub(crate) fn gave_up(text: &str) -> Option<String> {

@@ -1897,6 +1897,32 @@ async fn on_start_a_renamed_repos_clone_and_one_half_removed_are_cleaned_up() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_repos_clone_the_daemon_cannot_remove_refuses_the_start_and_says_what_to_do() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new().await;
+    w.mark();
+    let repos = w.workspace().join("repos/o");
+    std::fs::create_dir_all(&repos).unwrap();
+    let remote = w.remote();
+    git(
+        &repos,
+        &["clone", "-q", "--bare", remote.to_str().unwrap(), "old.git"],
+    );
+    std::fs::write(repos.join("old.git/mergeloop-renamed"), "o/r\n").unwrap();
+    // The owner's folder can be listed, and nothing in it can be moved or removed.
+    std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let agent = w.agent("idle", "", BUILT);
+
+    let said = w.refused(w.config(1, &agent)).await;
+
+    std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(said.contains("repos/o/old.git"), "{said}");
+    assert!(said.contains("permissions"), "{said}");
+    assert!(said.contains("another workspace"), "{said}");
+    assert_eq!(w.clones(), ["old.git"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pr_github_would_not_label_yet_is_opened_on_a_later_call() {
     let w = World::new().await;
     w.fake.add_task(w.task(1, 7, &[]));

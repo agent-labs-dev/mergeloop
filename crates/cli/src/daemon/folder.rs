@@ -399,7 +399,12 @@ async fn retire(clone: &Path) -> Result<()> {
     if kind(&gone)? == Some(Kind::Dir) {
         discard(&gone, HALF_REMOVED)?;
     }
-    std::fs::rename(clone, &gone).with_context(|| format!("move {}", clone.display()))?;
+    std::fs::rename(clone, &gone).with_context(|| {
+        format!(
+            "move {}: give the folder it is in back its permissions (chmod u+rwx), or give the daemon another workspace",
+            clone.display()
+        )
+    })?;
     discard(
         &gone,
         "the clone of a repo since renamed, which no build uses",
@@ -574,7 +579,12 @@ fn own_dir(path: &Path, shape: impl Fn(&str) -> bool) -> Result<bool> {
 /// Removes `path`, a folder of the daemon's own just seen there, saying why.
 fn discard(path: &Path, why: &str) -> Result<()> {
     eprintln!("mergeloop: removes {}: {why}", path.display());
-    std::fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
+    std::fs::remove_dir_all(path).with_context(|| {
+        format!(
+            "remove {}: give it back its permissions (chmod -R u+rwx), or remove it yourself, or give the daemon another workspace",
+            path.display()
+        )
+    })
 }
 
 /// The entries of `dir`, a folder of the daemon's own: none when it is not there. A symlink,

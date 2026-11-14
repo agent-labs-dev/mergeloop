@@ -219,6 +219,12 @@ On GCP, a deploy runs the old revision beside the new one for a while, and each 
 3. `<new>,<old>` again, once the revision from step 1 has stopped: it re-encrypts what that one wrote with the old key meanwhile.
 4. `<new>`.
 
+With Docker Compose, a plain restart does not recreate the container, so it keeps the
+old environment-backed key. After changing `MERGEPATROL_SECRET_KEY` or its secret
+file, run `docker compose up -d --force-recreate` and check the container logs for
+the startup re-encryption count before removing the old key. A restart alone is not
+a rotation.
+
 ## Repo settings
 
 Each repo sets its queue in `.mergeloop/mergeloop.yml` on its default branch. MergeLoop reads the file from there, so a PR cannot change its own settings. A setting the file leaves out follows the workspace, so an empty file is valid, and inherits everything. **Settings** sets the workspace's defaults for the label, batch size, model, effort, task models and CI fixes. They apply at once, with no PR, to every repo that follows them. A workspace that has set none follows the instance: on a self-hosted MergeLoop, the `MERGEPATROL_*` variables in [Environment variables](#environment-variables).
@@ -627,7 +633,7 @@ Each job runs in its own gVisor sandbox, through [Agent Sandbox](https://github.
 - GitHub, to fetch the repo and revoke the job's token.
 - The package registries the verify commands use: npm and Yarn, PyPI, the Go module proxy and its bucket, crates.io, and rustup's toolchains.
 
-A job that needs another host fails until the host is added there. The proxy logs every tunnel it opens or refuses (`kubectl -n mergepatrol-jobs logs -l app=mergepatrol-egress`). The allowlist goes by host name. So it doesn't stop a job that brings its own credentials from pushing to GitHub or publishing to a registry. It also doesn't stop a job from writing to a bucket that anyone can write to on `storage.googleapis.com`, where the Go proxy keeps large modules.
+A job that needs another host fails until the host is added there. The proxy logs every tunnel it opens or refuses (`kubectl -n mergepatrol-jobs logs -l app=mergepatrol-egress`). The allowlist goes by host name. So it doesn't stop a job that brings its own credentials from pushing to GitHub or publishing to a registry. It also doesn't stop a job from writing to a bucket that anyone can write to on `storage.googleapis.com`, where the Go proxy keeps large modules. CONNECT is checked against the requested hostname only; because the proxy does not intercept TLS or inspect SNI, a CDN can serve another hostname through an allowed tunnel. Treat the proxy as a coarse egress allowlist, not as end-to-end hostname identity enforcement.
 
 The orchestrator hands the sandbox its link, `http://<orchestrator pod IP>:8081/jobs/<token>`, over HTTP, since a claim that sets env would skip the warm pool. With that link, the job fetches its spec once, uploads its result in chunks, and reports that it is done.
 

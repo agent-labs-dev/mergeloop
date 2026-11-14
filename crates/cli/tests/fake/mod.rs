@@ -40,6 +40,13 @@ pub struct Lane {
     /// Refusals to answer once each, in place of the tool's answer: the tool, the refusal's
     /// kind as `_meta.refusal` names it, its status, and its text.
     pub refusals: Vec<(String, String, u16, String)>,
+    /// Calls GitHub's used up rate limit refuses, once each: the tool, the seconds until it
+    /// resets, and the text.
+    pub limits: Vec<(String, u64, String)>,
+    /// Calls refused before any tool runs, once each, as when GitHub's rate limit is used up
+    /// while the server checks the caller's token: HTTP 503 with `Retry-After`, the seconds
+    /// until it resets, and the text.
+    pub sign_in_limits: VecDeque<(u64, String)>,
     /// The needs `next_need` gives a daemon for each PR, in order, each once. Then the last
     /// one given stays the PR's need, as the server's stays until something changes it.
     pub needs: HashMap<u64, VecDeque<Value>>,
@@ -192,6 +199,20 @@ impl Server {
             .push((tool.into(), kind.into(), status, text.into()));
     }
 
+    /// Refuses the next call to `tool` as the server does when GitHub's rate limit is used up
+    /// for another `secs`.
+    pub fn limit(&self, tool: &str, secs: u64, text: &str) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.lane.limits.push((tool.into(), secs, text.into()));
+    }
+
+    /// Refuses the next call before its tool runs, as the server does when GitHub's rate limit
+    /// is used up while it checks the caller's token, for another `secs`.
+    pub fn limit_sign_in(&self, secs: u64, text: &str) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.lane.sign_in_limits.push_back((secs, text.into()));
+    }
+
     pub fn lane<T>(&self, f: impl FnOnce(&Lane) -> T) -> T {
         f(&self.seen.lock().unwrap().lane)
     }
@@ -324,9 +345,22 @@ fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Respons
     if !signed_in && bearer != GITHUB_TOKEN {
         return (StatusCode::UNAUTHORIZED, "Sign in, or pass a GitHub token").into_response();
     }
+    if let Some((secs, text)) = seen.lane.sign_in_limits.pop_front() {
+        let retry = [(header::RETRY_AFTER, secs.to_string())];
+        return (StatusCode::SERVICE_UNAVAILABLE, retry, text).into_response();
+    }
     let repo = args["repo"].as_str().unwrap_or_default();
     if seen.lane.gone.contains(repo) {
         return not_found(&message, repo);
+    }
+    if let Some(i) = seen.lane.limits.iter().position(|l| l.0 == tool) {
+        let (_, secs, text) = seen.lane.limits.remove(i);
+        let result = json!({
+            "content": [{ "type": "text", "text": text }], "isError": true,
+            "_meta": { "status": 503, "retry_after": secs },
+        });
+        return Json(json!({ "jsonrpc": "2.0", "id": message["id"], "result": result }))
+            .into_response();
     }
     if let Some(i) = seen.lane.refusals.iter().position(|r| r.0 == tool) {
         let (_, kind, status, text) = seen.lane.refusals.remove(i);

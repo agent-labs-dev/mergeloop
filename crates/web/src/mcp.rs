@@ -119,15 +119,22 @@ async fn call(app: &AppState, caller: &Caller, bearer: &str, params: &Value) -> 
         }
         Err(e) => e,
     };
-    // What a client acts on rides in `_meta`: the route's status, and the refusal's kind.
-    let (status, refusal, text) = match e {
-        ApiError::Status(status, m) => (status, None, m),
-        ApiError::Refused(r, m) => (r.status(), Some(r.name()), m),
-        ApiError::GitHubLimited(_, m) => (StatusCode::SERVICE_UNAVAILABLE, None, m),
+    // What a client acts on rides in `_meta`: the route's status, the refusal's kind, and how
+    // many seconds until asking again may work.
+    let (status, refusal, retry_after, text) = match e {
+        ApiError::Status(status, m) => (status, None, None, m),
+        ApiError::Refused(r, m) => (r.status(), Some(r.name()), None, m),
+        ApiError::GitHubLimited(wait, m) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            Some(wait.as_secs().max(1)),
+            m,
+        ),
         ApiError::Internal(e) => {
             tracing::error!(error = %format!("{e:#}"), tool = name, "MCP error");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                None,
                 None,
                 "Internal error.".into(),
             )
@@ -136,6 +143,9 @@ async fn call(app: &AppState, caller: &Caller, bearer: &str, params: &Value) -> 
     let mut meta = json!({ "status": status.as_u16() });
     if let Some(refusal) = refusal {
         meta["refusal"] = refusal.into();
+    }
+    if let Some(secs) = retry_after {
+        meta["retry_after"] = secs.into();
     }
     json!({ "content": [{ "type": "text", "text": text }], "isError": true, "_meta": meta })
 }
@@ -233,6 +243,15 @@ fn scalar(name: &str, value: Option<Value>) -> Result<String, ApiError> {
     }
 }
 
+/// A response's `Retry-After`, in seconds.
+fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let secs = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    secs.trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
 /// The route's answer, as the agent reads it.
 async fn answer(app: &AppState, req: Request<Body>) -> Result<String, ApiError> {
     let res = routes::router()
@@ -242,14 +261,20 @@ async fn answer(app: &AppState, req: Request<Body>) -> Result<String, ApiError> 
         .unwrap_or_else(|e| match e {});
     let status = res.status();
     let refusal = res.extensions().get::<Refusal>().copied();
+    // Only `GitHubLimited` answers a 503 with a `Retry-After`.
+    let limited = match status {
+        StatusCode::SERVICE_UNAVAILABLE => retry_after(res.headers()),
+        _ => None,
+    };
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    match (status.is_success(), text.is_empty(), refusal) {
-        (true, true, _) => Ok("Done.".into()),
-        (true, false, _) => Ok(text),
-        (false, _, Some(r)) => Err(ApiError::Refused(r, text)),
-        (false, _, None) => Err(ApiError::Status(status, text)),
+    match (status.is_success(), text.is_empty(), refusal, limited) {
+        (true, true, ..) => Ok("Done.".into()),
+        (true, false, ..) => Ok(text),
+        (false, _, Some(r), _) => Err(ApiError::Refused(r, text)),
+        (false, _, None, Some(wait)) => Err(ApiError::GitHubLimited(wait, text)),
+        (false, _, None, None) => Err(ApiError::Status(status, text)),
     }
 }

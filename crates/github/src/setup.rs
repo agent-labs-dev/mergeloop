@@ -358,7 +358,7 @@ pub async fn user_installation_repos(token: &str, id: u64) -> Result<Vec<String>
     Ok(all)
 }
 
-/// A 401 is `Revoked`: GitHub no longer takes the token.
+/// A 401 is `Revoked`: GitHub no longer takes the token. A used up rate limit is `RateLimited`.
 async fn user_get(token: &str, path: &str) -> Result<reqwest::Response> {
     get_as(&client()?, format!("{API}{path}"), token).await
 }
@@ -373,10 +373,25 @@ async fn get_as(http: &reqwest::Client, url: String, token: &str) -> Result<reqw
         .header("accept", "application/vnd.github+json")
         .send()
         .await?;
-    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(Revoked.into());
+    match res.status() {
+        reqwest::StatusCode::UNAUTHORIZED => Err(Revoked.into()),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            Err(refusal(res).await)
+        }
+        _ => Ok(res),
     }
-    Ok(res)
+}
+
+/// A 403 or 429's error: `RateLimited` when it says the token's rate limit is used up, told at
+/// once rather than waited out, so the caller hears why and when to ask again. Else GitHub's
+/// own words.
+async fn refusal(res: reqwest::Response) -> anyhow::Error {
+    let (status, headers) = (res.status(), res.headers().clone());
+    let body = res.text().await.unwrap_or_default();
+    match crate::app::rate_limited(status, &headers, &body) {
+        Some(limited) => limited.into(),
+        None => anyhow::anyhow!("GitHub answered {status}: {body}"),
+    }
 }
 
 /// GitHub refused the user's change: they lack the access it needs.
@@ -420,7 +435,8 @@ pub struct LineComment<'a> {
 
 /// What GitHub says of a user's token.
 impl AsUser {
-    /// A 401 is `Revoked`: GitHub no longer takes the token.
+    /// A 401 is `Revoked`: GitHub no longer takes the token. A used up rate limit is
+    /// `RateLimited`.
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
         get_as(&self.http, format!("{}{path}", self.api), &self.token).await
     }
@@ -530,7 +546,7 @@ impl AsUser {
     }
 }
 
-/// A 401 is `Revoked`, a 403 `Refused`.
+/// A 401 is `Revoked`, a used up rate limit `RateLimited`, any other 403 `Refused`.
 async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     let res = req
         .bearer_auth(token)
@@ -539,7 +555,14 @@ async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest
         .await?;
     match res.status() {
         reqwest::StatusCode::UNAUTHORIZED => Err(Revoked.into()),
-        reqwest::StatusCode::FORBIDDEN => Err(Refused.into()),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            let e = refusal(res).await;
+            Err(if e.is::<crate::RateLimited>() {
+                e
+            } else {
+                Refused.into()
+            })
+        }
         _ => Ok(res),
     }
 }
@@ -556,6 +579,8 @@ fn client() -> Result<reqwest::Client> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -642,5 +667,54 @@ mod tests {
         assert!(!may("ghp_dev", "o/private").await);
         let user = github.as_user("ghp_dev").unwrap().user().await.unwrap();
         assert_eq!(user.login, "ana");
+    }
+
+    #[tokio::test]
+    async fn a_used_up_rate_limit_is_rate_limited_at_once_not_waited_out() {
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let headers: &'static str = Box::leak(
+            format!("x-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}\r\n").into_boxed_str(),
+        );
+        let limited = (
+            403,
+            headers,
+            r#"{"message":"API rate limit exceeded for user ID 1."}"#,
+        );
+        let (user, requests) = crate::fake::as_user(vec![limited]).await;
+        let e = user.can_read("o/r").await.unwrap_err();
+        let limited = e.downcast_ref::<crate::RateLimited>().unwrap();
+        assert!(limited.remaining() > Duration::from_secs(590));
+        assert!(e.to_string().contains("resets at"), "{e}");
+        assert_eq!(requests.lock().len(), 1);
+
+        let secondary = (403, "", "You have exceeded a secondary rate limit.");
+        let (user, _) = crate::fake::as_user(vec![secondary]).await;
+        let e = user.add_labels("o/r", 1, &["x"]).await.unwrap_err();
+        assert!(e.is::<crate::RateLimited>(), "{e}");
+    }
+
+    #[tokio::test]
+    async fn any_other_403_is_no_rate_limit() {
+        let (user, _) = crate::fake::as_user(vec![(403, "", r#"{"message":"Forbidden"}"#)]).await;
+        let e = user.can_read("o/r").await.unwrap_err();
+        assert!(!e.is::<crate::RateLimited>(), "{e}");
+        let (user, _) = crate::fake::as_user(vec![(403, "", r#"{"message":"Forbidden"}"#)]).await;
+        let e = user.add_labels("o/r", 1, &["x"]).await.unwrap_err();
+        assert!(e.is::<Refused>(), "{e}");
+    }
+
+    #[test]
+    fn a_rate_limit_says_when_it_resets() {
+        let limited = crate::RateLimited {
+            until: UNIX_EPOCH + Duration::from_secs(1_794_159_000),
+        };
+        assert!(
+            limited.to_string().contains("resets at 17:30:00Z"),
+            "{limited}"
+        );
     }
 }

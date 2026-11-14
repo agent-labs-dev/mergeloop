@@ -2500,4 +2500,29 @@ mod tests {
             "{calls:?}"
         );
     }
+
+    #[sqlx::test(migrations = false)]
+    async fn mcp_says_the_callers_github_rate_limit_is_used_up_and_when_to_ask_again(pool: PgPool) {
+        let github = fake::github(|call| match call.path {
+            "/rate_limit" => (200, "{}".into()),
+            _ => (403, "You have exceeded a secondary rate limit.".into()),
+        })
+        .await;
+        let (router, _) = with_github(pool, github).await;
+        let call = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "pull_status", "arguments": { "repo": "o/r", "number": 5 } },
+        });
+
+        let res = json_of(mcp(&router, Some("Bearer ghp_dev"), call).await).await;
+
+        let result = &res["result"];
+        assert_eq!(result["isError"], true, "{res}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("rate limit is used up"), "{text}");
+        assert!(text.contains("resets at"), "{text}");
+        assert_eq!(result["_meta"]["status"], 503, "{res}");
+        let secs = result["_meta"]["retry_after"].as_u64().unwrap();
+        assert!((50..=60).contains(&secs), "{res}");
+    }
 }

@@ -182,6 +182,7 @@ impl Client {
                 tool: tool.to_owned(),
                 status: Some(401),
                 kind: None,
+                retry_after: None,
                 text: format!("{url} no longer takes your sign-in: run `mergeloop login`"),
             }
             .into(),
@@ -211,7 +212,24 @@ impl Client {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(Retry::No(self.refused(tool)));
         }
+        let limited = match status {
+            reqwest::StatusCode::SERVICE_UNAVAILABLE => retry_after_header(res.headers()),
+            _ => None,
+        };
         let body = res.text().await.map_err(|e| Retry::Yes(e.into()))?;
+        // GitHub's rate limit, used up before any tool ran, as while the server checks the token.
+        if let Some(secs) = limited {
+            return Err(Retry::No(
+                Refused {
+                    tool: tool.to_owned(),
+                    status: Some(503),
+                    kind: None,
+                    retry_after: Some(secs),
+                    text: body,
+                }
+                .into(),
+            ));
+        }
         if status.is_server_error() {
             return Err(Retry::Yes(
                 Unanswered {
@@ -238,6 +256,7 @@ impl Client {
             tool: tool.to_owned(),
             status: result["_meta"]["status"].as_u64(),
             kind: result["_meta"]["refusal"].as_str().and_then(Refusal::parse),
+            retry_after: result["_meta"]["retry_after"].as_u64(),
             text: text.clone(),
         });
         Ok(Answer { text, refused })
@@ -258,6 +277,8 @@ pub struct Refused {
     /// The route's HTTP status, when the server says it.
     pub status: Option<u64>,
     pub kind: Option<Refusal>,
+    /// Seconds until asking again may work, as when GitHub's rate limit is used up.
+    pub retry_after: Option<u64>,
     pub text: String,
 }
 
@@ -321,6 +342,24 @@ pub fn refusal(e: &anyhow::Error) -> Option<Refusal> {
     e.downcast_ref::<Refused>().and_then(|r| r.kind)
 }
 
+/// How long until asking again may work, when `e` is a refusal that says.
+pub fn retry_after(e: &anyhow::Error) -> Option<Duration> {
+    e.downcast_ref::<Refused>()
+        .and_then(|r| r.retry_after)
+        .map(Duration::from_secs)
+}
+
+/// A response's `Retry-After`, in seconds: the server sends only seconds, never a date.
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The server answered 5xx: it failed, and refused nothing.
 #[derive(Debug)]
 struct Unanswered {
@@ -367,6 +406,7 @@ mod tests {
                 tool: "report_build".into(),
                 status,
                 kind,
+                retry_after: None,
                 text: "no".into(),
             }
             .into()

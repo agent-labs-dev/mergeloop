@@ -671,14 +671,37 @@ impl RateLimited {
 impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mins = self.remaining().as_secs().div_ceil(60).max(1);
+        let at = self
+            .until
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            % 86_400;
         write!(
             f,
-            "GitHub's API rate limit is used up for another {mins} min"
+            "GitHub's API rate limit is used up: it resets at {:02}:{:02}:{:02}Z, in {mins} min",
+            at / 3600,
+            at / 60 % 60,
+            at % 60
         )
     }
 }
 
 impl std::error::Error for RateLimited {}
+
+/// The rate limit a response says is used up, at once: for a caller that would rather say so
+/// than wait for it to lift.
+pub(crate) fn rate_limited(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> Option<RateLimited> {
+    match retry_after(status, headers, body, Duration::ZERO, unix_now())? {
+        Retry::RateLimit(wait) => Some(RateLimited {
+            until: SystemTime::now() + wait,
+        }),
+        Retry::Backoff(_) => None,
+    }
+}
 
 /// How many times a request goes out before its transient failure counts.
 const ATTEMPTS: u32 = 5;

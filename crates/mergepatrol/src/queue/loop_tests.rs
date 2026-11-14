@@ -1631,6 +1631,7 @@ fn ctx(store: Arc<Mem>) -> Ctx {
         store,
         executor: Arc::new(LocalExecutor {
             program: PathBuf::new(),
+            args: Vec::new(),
             timeout: Duration::ZERO,
         }),
         proxy: Arc::new(ApiProxy::new(Upstreams::default())),

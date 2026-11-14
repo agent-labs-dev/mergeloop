@@ -123,6 +123,7 @@ async fn orchestrator() -> Result<()> {
             tracing::warn!("jobs run as local processes, without a sandbox");
             Arc::new(LocalExecutor {
                 program: std::env::current_exe().context("find the mergepatrol binary")?,
+                args: Vec::new(),
                 timeout: JOB_TIMEOUT,
             })
         }

@@ -67,6 +67,7 @@ impl Runner {
 
         let executor = LocalExecutor {
             program: self.job_bin.clone(),
+            args: Vec::new(),
             timeout: JOB_TIMEOUT,
         };
         let runs = stream::iter(cases)

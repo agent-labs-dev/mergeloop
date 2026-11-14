@@ -45,9 +45,12 @@ impl TimedOut {
     }
 }
 
-/// Runs `<program> job --out <dir>` on this machine. No isolation.
+/// Runs `<program> <args> job --out <dir>` on this machine. No isolation.
 pub struct LocalExecutor {
     pub program: PathBuf,
+    /// Arguments before the job's own, for a program that starts the job rather than being it,
+    /// such as `sh` with a script.
+    pub args: Vec<String>,
     pub timeout: Duration,
 }
 
@@ -56,7 +59,7 @@ impl Executor for LocalExecutor {
     async fn run(&self, _job_id: &str, spec: &JobSpec, out: &Path) -> Result<JobResult> {
         tokio::fs::create_dir_all(out).await?;
         let mut cmd = Command::new(&self.program);
-        cmd.arg("job").arg("--out").arg(out);
+        cmd.args(&self.args).arg("job").arg("--out").arg(out);
         let logs = run_with_spec(cmd, spec, self.timeout).await?;
         read_result(out, &logs).await
     }
@@ -225,6 +228,7 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let executor = LocalExecutor {
             program,
+            args: Vec::new(),
             timeout: Duration::from_millis(200),
         };
         let spec: JobSpec = serde_json::from_value(serde_json::json!({

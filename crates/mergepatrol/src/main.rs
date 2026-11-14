@@ -78,7 +78,7 @@ async fn orchestrator() -> Result<()> {
     if rotated > 0 {
         tracing::info!(
             rotated,
-            "re-encrypted secrets with the first MERGEPATROL_SECRET_KEY: the others can go"
+            "re-encrypted the stored secrets with the first MERGEPATROL_SECRET_KEY: keep the others until nothing that started with them is still running, as Rotate the secret key in the README says"
         );
     }
 

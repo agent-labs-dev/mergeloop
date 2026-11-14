@@ -1,10 +1,12 @@
 //! `mergeloop [PR]`: queues the PR, waits until it needs something of the agent, and prints
 //! that need with its brief.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::client::{Client, LONGEST_WAIT};
+use crate::client::{Client, LONGEST_WAIT, retry_after};
 use crate::gh::gh;
 
 /// A PR as the command line names it.
@@ -131,7 +133,7 @@ pub async fn next(
             }
             Some("queue") => {
                 if after.as_deref() != Some(id.as_str()) {
-                    client.json("queue_pull", pr.args()).await?;
+                    once_allowed(client, "queue_pull", pr.args()).await?;
                     eprintln!("mergeloop: queued {}#{}", pr.repo, pr.number);
                 }
                 *after = Some(id);
@@ -153,7 +155,29 @@ pub async fn ask(client: &Client, pr: &Pr<'_>, after: Option<&str>) -> Result<Va
     if let Some(after) = after {
         args["after"] = after.into();
     }
-    client.json("next_need", args).await
+    once_allowed(client, "next_need", args).await
+}
+
+/// The tool's answer, asked again once GitHub's rate limit lifts while it is used up. A used up
+/// rate limit is no failure of the PR's, and an agent told of one as a failure may route around
+/// the queue.
+async fn once_allowed(client: &Client, tool: &str, args: Value) -> Result<Value> {
+    loop {
+        let e = match client.json(tool, args.clone()).await {
+            Ok(answer) => return Ok(answer),
+            Err(e) => e,
+        };
+        let Some(wait) = retry_after(&e) else {
+            return Err(e);
+        };
+        eprintln!(
+            "mergeloop: {}; waiting {}s",
+            e.to_string().trim_end_matches('.'),
+            wait.as_secs()
+        );
+        // A second past the reset, so the limit has lifted by the time the call lands.
+        tokio::time::sleep(wait + Duration::from_secs(1)).await;
+    }
 }
 
 /// Queues the PR, and waits until it needs the agent: prints that need, and returns its exit

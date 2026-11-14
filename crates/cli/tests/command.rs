@@ -79,6 +79,63 @@ async fn without_a_session_a_pr_is_queued_and_its_need_printed_with_the_gh_token
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_used_up_github_rate_limit_is_waited_out_not_exited_on() {
+    let fake = fake::Server::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let said = "GitHub's API rate limit is used up: it resets at 17:46:40Z, in 1 min.";
+    fake.limit("next_need", 1, said);
+
+    let out = mergeloop(&fake, home.path(), None, &["o/r#5"]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("resets at 17:46:40Z"), "{stderr}");
+    let need: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(need["needs"], "threads");
+    assert_eq!(
+        fake.tools(),
+        ["next_need", "next_need", "queue_pull", "next_need"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limit_used_up_while_the_server_checks_the_token_is_waited_out_too() {
+    let fake = fake::Server::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let said = "GitHub's API rate limit is used up: it resets at 17:46:40Z, in 1 min.";
+    fake.limit_sign_in(1, said);
+
+    let out = mergeloop(&fake, home.path(), None, &["o/r#5"]).await;
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("resets at 17:46:40Z"), "{stderr}");
+    assert!(!stderr.contains("trying again"), "{stderr}");
+    let need: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(need["needs"], "threads");
+    assert_eq!(
+        fake.tools(),
+        ["next_need", "next_need", "queue_pull", "next_need"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_says_the_rate_limit_used_up_while_the_server_checks_the_token() {
+    let fake = fake::Server::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let said = "GitHub's API rate limit is used up: it resets at 17:46:40Z, in 1 min.";
+    fake.limit_sign_in(60, said);
+
+    let out = mergeloop(&fake, home.path(), None, &["call", "pull_status", "{}"]).await;
+
+    assert!(!out.status.success(), "{out:?}");
+    let told = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(told.contains("resets at 17:46:40Z"), "{out:?}");
+    assert!(!told.contains("trying again"), "{out:?}");
+    assert_eq!(fake.tools(), ["pull_status"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn signed_in_a_call_sends_the_session() {
     let fake = fake::Server::start().await;
     let home = tempfile::tempdir().unwrap();

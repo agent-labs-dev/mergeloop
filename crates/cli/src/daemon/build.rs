@@ -667,6 +667,7 @@ mod tests {
             tool: "heartbeat_build".into(),
             status: Some(status),
             kind,
+            retry_after: None,
             text: "no".into(),
         }
         .into()

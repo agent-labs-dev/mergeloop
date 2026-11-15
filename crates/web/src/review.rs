@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use mergepatrol_core::{
     Answer, Bar, CodeLine, Depth, Judged, Kind, Lean, LineKind, Outcome, PrNumber, Question,
     Related, RepoName, ReviewOverrides, ReviewSettings, ReviewStatus,
@@ -16,6 +17,8 @@ use ts_rs::TS;
 use crate::api::{installation, repo_name};
 use crate::auth::Caller;
 use crate::{ApiError, AppState};
+
+const AUTHOR_REVIEW_RETRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -627,6 +630,51 @@ pub(crate) async fn agent_review(
         .await?
         .pull_head(&repo, number)
         .await?;
+    let review = app.store.review_at_head(id, &repo, number, &head).await?;
+    Ok(Json(review.map(AgentReviewView::from)))
+}
+
+/// Lets the pull request's author retry a failed review of the exact current head.
+pub(crate) async fn retry_agent_review(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
+) -> Result<Json<Option<AgentReviewView>>, ApiError> {
+    let user = caller.user()?;
+    let repo = repo_name(owner, name)?;
+    let id = user.workspace(id)?;
+    let gh = installation(&app, id).await?;
+    let pull = gh.pull_request(&repo, number).await?;
+    if !pull.authored_by(user.login()) {
+        return Err(ApiError::Status(
+            StatusCode::FORBIDDEN,
+            "Only the pull request author may retry its review.".into(),
+        ));
+    }
+    let head = pull.head_ref_oid;
+    let Some(review) = app.store.review_at_head(id, &repo, number, &head).await? else {
+        return Err(ApiError::bad_request(
+            "There is no failed review for the current head.",
+        ));
+    };
+    if !review
+        .error
+        .is_some_and(|_| review.status == ReviewStatus::Asks)
+    {
+        return Err(ApiError::bad_request(
+            "The current review is not a failed review.",
+        ));
+    }
+    if !app
+        .store
+        .retry_author_review(review.id, &head, AUTHOR_REVIEW_RETRIES)
+        .await?
+    {
+        return Err(ApiError::Status(
+            StatusCode::CONFLICT,
+            "The review retry limit has been reached.".into(),
+        ));
+    }
     let review = app.store.review_at_head(id, &repo, number, &head).await?;
     Ok(Json(review.map(AgentReviewView::from)))
 }

@@ -119,6 +119,11 @@ pub trait ReviewStore: Send + Sync {
         head: &str,
         diff_id: Option<&str>,
     ) -> Result<ReviewRecord>;
+    /// Re-queues a failed review when its author requests another bounded attempt.
+    async fn retry_author_review(&self, id: i64, head: &str, max_attempts: u32) -> Result<bool> {
+        let _ = (id, head, max_attempts);
+        anyhow::bail!("author review retry is unavailable")
+    }
     /// The PR's newest review approved a head whose changes `head`'s are too, by `diff_id`: a
     /// stack layer the layers below moved. Its approval holds for `head`, which is not reviewed
     /// again. False if it holds for no other head.
@@ -477,6 +482,22 @@ impl ReviewStore for PgStore {
         .fetch_one(&self.pool)
         .await?;
         record(&row)
+    }
+
+    async fn retry_author_review(&self, id: i64, head: &str, max_attempts: u32) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE agent_reviews
+             SET status = 'pending', error = NULL, attempts = attempts + 1,
+                 claimed_at = NULL, retry_at = NULL, updated_at = now()
+             WHERE id = $1 AND head_sha = $2 AND status = 'asks' AND error IS NOT NULL
+               AND attempts < $3",
+        )
+        .bind(id)
+        .bind(head)
+        .bind(max_attempts as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn carry_unchanged(

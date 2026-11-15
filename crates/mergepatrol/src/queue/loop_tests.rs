@@ -1040,6 +1040,20 @@ impl ReviewStore for Mem {
         let reviews = self.reviews.lock().unwrap();
         Ok(reviews.iter().rev().find(|r| r.number == pr).cloned())
     }
+    async fn review_at_head(
+        &self,
+        _: u64,
+        _: &RepoName,
+        pr: PrNumber,
+        head: &str,
+    ) -> Result<Option<ReviewRecord>> {
+        let reviews = self.reviews.lock().unwrap();
+        Ok(reviews
+            .iter()
+            .rev()
+            .find(|r| r.number == pr && r.head_sha == head)
+            .cloned())
+    }
     async fn latest_reviews(
         &self,
         _: u64,

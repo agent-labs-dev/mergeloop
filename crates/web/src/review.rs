@@ -627,12 +627,7 @@ pub(crate) async fn agent_review(
         .await?
         .pull_head(&repo, number)
         .await?;
-    let review = app
-        .store
-        .reviews_of(id, &repo, number, 100)
-        .await?
-        .into_iter()
-        .find(|r| r.head_sha == head);
+    let review = app.store.review_at_head(id, &repo, number, &head).await?;
     Ok(Json(review.map(AgentReviewView::from)))
 }
 

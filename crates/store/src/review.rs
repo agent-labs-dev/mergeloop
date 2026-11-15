@@ -86,6 +86,14 @@ pub trait ReviewStore: Send + Sync {
         repo: &RepoName,
         pr: PrNumber,
     ) -> Result<Option<ReviewRecord>>;
+    /// The newest review of this exact PR head, independent of reviews of intervening heads.
+    async fn review_at_head(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+        head: &str,
+    ) -> Result<Option<ReviewRecord>>;
     /// The newest review of each of these PRs that has one.
     async fn latest_reviews(
         &self,
@@ -362,6 +370,29 @@ impl ReviewStore for PgStore {
             .await?
             .into_iter()
             .next())
+    }
+
+    async fn review_at_head(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+        head: &str,
+    ) -> Result<Option<ReviewRecord>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM agent_reviews
+             WHERE installation_id = $1 AND repo = $2 AND number = $3 AND head_sha = $4
+             ORDER BY created_at DESC, id DESC LIMIT 1"
+        ))
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(pr as i64)
+        .bind(head)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(record).transpose()
     }
 
     async fn latest_reviews(

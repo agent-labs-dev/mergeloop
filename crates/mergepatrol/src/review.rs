@@ -232,9 +232,24 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
 }
 
 async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) -> Result<()> {
+    let error = format!("{error:#}");
     if review.attempts + 1 < ATTEMPTS && !error.to_string().starts_with(NO_KEY) {
         ctx.store
-            .retry_review(review.id, review.claim, &format!("{error:#}"), RETRY_AFTER)
+            .retry_review(review.id, review.claim, &error, RETRY_AFTER)
+            .await?;
+    } else {
+        ctx.store
+            .finish_review(
+                review.id,
+                review.claim,
+                &ReviewDone {
+                    status: ReviewStatus::Asks,
+                    error: Some(error.clone()),
+                    summary: "The automatic review could not start after the retry limit.".into(),
+                    findings: Vec::new(),
+                    asked: Vec::new(),
+                },
+            )
             .await?;
     }
     Ok(())

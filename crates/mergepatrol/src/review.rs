@@ -173,16 +173,36 @@ impl<'a> Reviewing<'a> {
 }
 
 async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
-    let (gh, pr) = pull(ctx, &r).await?;
+    let (gh, pr) = match pull(ctx, &r).await {
+        Ok(value) => value,
+        Err(error) => {
+            retry_setup(ctx, &r, &error).await?;
+            return Err(error);
+        }
+    };
     // A fork PR's head is its pull ref's, which its GraphQL lags behind: no run, so no check.
     if !pr.is_cross_repository && pr.head_ref_oid != r.head_sha {
         // A newer head has its own review, which the next tick starts.
         return ctx.store.stale_review(r.id, r.claim).await;
     }
-    let settings = settings(ctx, &gh, &r.repo).await?;
+    let settings = match settings(ctx, &gh, &r.repo).await {
+        Ok(value) => value,
+        Err(error) => {
+            retry_setup(ctx, &r, &error).await?;
+            return Err(error);
+        }
+    };
     // Only a PR told to merge gets the agent's review: no label, or no place in the lane, and the
     // review is dropped rather than run. Nothing is run and nothing is posted.
-    if !merge_requested(ctx.store.as_ref(), &gh, &r.repo, &pr, &settings.label).await? {
+    let requested =
+        match merge_requested(ctx.store.as_ref(), &gh, &r.repo, &pr, &settings.label).await {
+            Ok(value) => value,
+            Err(error) => {
+                retry_setup(ctx, &r, &error).await?;
+                return Err(error);
+            }
+        };
+    if !requested {
         return ctx.store.stale_review(r.id, r.claim).await;
     }
     let workspace = ctx
@@ -209,6 +229,15 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         Err(why) => Err(why),
     };
     reviewing.conclude(ctx, output).await
+}
+
+async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) -> Result<()> {
+    if review.attempts + 1 < ATTEMPTS && !error.to_string().starts_with(NO_KEY) {
+        ctx.store
+            .retry_review(review.id, review.claim, &format!("{error:#}"), RETRY_AFTER)
+            .await?;
+    }
+    Ok(())
 }
 
 /// The PR as GitHub has it now, if it is still the one the review is of: the head it reviewed,

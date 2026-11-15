@@ -531,8 +531,9 @@ impl ReviewStore for PgStore {
 
     async fn claim_review(&self, stale: Duration) -> Result<Option<ReviewRecord>> {
         let row = sqlx::query(concat!(
-            "UPDATE agent_reviews SET status = 'running', claim = claim + 1, claimed_at = now(),
-                 updated_at = now()
+            "UPDATE agent_reviews SET status = 'running', claim = claim + 1,
+                 attempts = attempts + CASE WHEN status = 'running' THEN 1 ELSE 0 END,
+                 claimed_at = now(), updated_at = now()
              WHERE id = (
                  SELECT id FROM agent_reviews
                  WHERE (status = 'pending' AND (retry_at IS NULL OR retry_at <= now()))

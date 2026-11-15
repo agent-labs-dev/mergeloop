@@ -623,10 +623,13 @@ pub(crate) async fn agent_review(
     // The newest row can belong to an intervening head. If the PR was force-pushed
     // back to an older SHA, select the review for the head GitHub serves now so the
     // review holding the queue remains visible and answerable.
-    let head = installation(&app, id).await?.pull_head(&repo, number).await?;
+    let head = installation(&app, id)
+        .await?
+        .pull_head(&repo, number)
+        .await?;
     let review = app
         .store
-        .reviews_of(id, &repo, number, u32::MAX)
+        .reviews_of(id, &repo, number, 100)
         .await?
         .into_iter()
         .find(|r| r.head_sha == head);

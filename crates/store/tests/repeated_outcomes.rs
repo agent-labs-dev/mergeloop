@@ -121,7 +121,10 @@ async fn a_human_dismissing_a_recurring_finding_settles_every_request(pool: PgPo
 #[sqlx::test(migrations = false)]
 async fn reclaiming_a_stale_review_lease_counts_against_attempts(pool: PgPool) {
     let store = PgStore::migrate(pool.clone()).await.unwrap();
-    let review = store.start_review(1, &repo(), 9, "head", None).await.unwrap();
+    let review = store
+        .start_review(1, &repo(), 9, "head", None)
+        .await
+        .unwrap();
     let first = store
         .claim_review(Duration::from_secs(600))
         .await

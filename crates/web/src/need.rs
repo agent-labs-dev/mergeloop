@@ -515,6 +515,24 @@ mod tests {
     }
 
     #[test]
+    fn a_hold_transition_does_not_replay_the_old_threads_need() {
+        let first = view(
+            status(held(HoldReasonView::UnresolvedThreads, None)),
+            None,
+            Some(&event("review-sent-back")),
+            None,
+        );
+        let current = view(
+            status(held(HoldReasonView::ReviewRequired, None)),
+            None,
+            Some(&event("review-sent-back")),
+            Some(&first.id),
+        );
+        assert_eq!(current.needs, NeedKind::Human);
+        assert_ne!(current.id, first.id);
+    }
+
+    #[test]
     fn an_ejection_the_agent_saw_is_queued_again() {
         let ejected = view(status(None), Some(&exit(4, "ejected")), None, None);
         assert_eq!((ejected.needs, ejected.exit_code), (NeedKind::Ejected, 11));

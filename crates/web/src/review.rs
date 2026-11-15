@@ -13,7 +13,7 @@ use mergepatrol_store::ReviewRecord;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::api::repo_name;
+use crate::api::{installation, repo_name};
 use crate::auth::Caller;
 use crate::{ApiError, AppState};
 
@@ -620,7 +620,16 @@ pub(crate) async fn agent_review(
 ) -> Result<Json<Option<AgentReviewView>>, ApiError> {
     let repo = repo_name(owner, name)?;
     let id = caller.repo(&app, id, &repo).await?;
-    let review = app.store.latest_review(id, &repo, number).await?;
+    // The newest row can belong to an intervening head. If the PR was force-pushed
+    // back to an older SHA, select the review for the head GitHub serves now so the
+    // review holding the queue remains visible and answerable.
+    let head = installation(&app, id).await?.pull_head(&repo, number).await?;
+    let review = app
+        .store
+        .reviews_of(id, &repo, number, u32::MAX)
+        .await?
+        .into_iter()
+        .find(|r| r.head_sha == head);
     Ok(Json(review.map(AgentReviewView::from)))
 }
 

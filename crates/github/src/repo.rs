@@ -31,7 +31,6 @@ pub struct RepoSnapshot {
     pub merge_methods: Vec<String>,
     /// Open PRs with the trigger label, oldest first.
     pub labeled: Vec<PullRequest>,
-    pub failed: Vec<PullRequest>,
     /// Queue labels the repo does not have yet.
     pub missing_labels: Vec<String>,
 }
@@ -492,16 +491,6 @@ impl RepoSnapshot {
             .into_iter()
             .map(|pr| PullRequest::from_node(pr, r))
             .collect::<Result<_>>()?;
-        let failed = prs
-            .iter()
-            .filter(|pr| {
-                pr["state"] == "OPEN"
-                    && pr["labels"]["nodes"]
-                        .as_array()
-                        .is_some_and(|l| l.iter().any(|l| l["name"] == labels.failed))
-            })
-            .map(|pr| PullRequest::from_node(pr, r))
-            .collect::<Result<_>>()?;
         let missing_labels = [
             ("trigger", &labels.trigger),
             ("priority", &labels.priority),
@@ -536,7 +525,6 @@ impl RepoSnapshot {
             .map(|(method, _)| method.to_owned())
             .collect(),
             labeled,
-            failed,
             missing_labels,
         })
     }
@@ -585,7 +573,6 @@ impl Installation {
                   nodes {{ {PR_FIELDS} }}
                   pageInfo {{ hasNextPage endCursor }}
                 }}
-                failedPullRequests: pullRequests(states: OPEN, labels: [$failed], first: $page) {{ nodes {{ {PR_FIELDS} }} }}
               }}
             }}",
             code_owners = codeowners::FIELDS,
@@ -632,13 +619,7 @@ impl Installation {
             .as_object_mut()
             .and_then(|r| r.remove("pullRequests"))
             .context("repository.pullRequests")?;
-        let mut prs = page["nodes"].as_array().cloned().unwrap_or_default();
-        if let Some(failed) = repository
-            .as_object_mut()
-            .and_then(|r| r.remove("failedPullRequests"))
-        {
-            prs.extend(failed["nodes"].as_array().cloned().unwrap_or_default());
-        }
+        let prs = page["nodes"].as_array().cloned().unwrap_or_default();
         let next = &page["pageInfo"];
         let more = next["hasNextPage"] == true && !next["endCursor"].is_null();
         let after = more.then(|| next["endCursor"].clone());

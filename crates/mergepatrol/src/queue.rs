@@ -748,6 +748,37 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.store.set_config_error(installation, repo, None).await?;
     let labels = settings.labels();
     let snap = gh.snapshot(repo, &labels).await?;
+    // An ejected PR is retried only after its author pushes a new head. The ejection
+    // event stores the exact tested head, so a failed label alone never requeues a
+    // PR a maintainer deliberately left out.
+    for pr in &snap.failed {
+        let events = ctx
+            .store
+            .events(installation, repo, Some(pr.number), 20)
+            .await?;
+        let Some(event) = events.iter().find(|e| e.kind == "ejected") else {
+            continue;
+        };
+        let Some(old) = event
+            .message
+            .split("[head:")
+            .nth(1)
+            .and_then(|s| s.strip_suffix(']'))
+        else {
+            continue;
+        };
+        if old == pr.head_ref_oid {
+            continue;
+        }
+        gh.remove_label(repo, pr.number, &labels.failed).await?;
+        gh.add_label(repo, pr.number, &labels.trigger).await?;
+        gh.sticky_comment(
+            repo,
+            pr.number,
+            "Author pushed a new head after the failed checks. MergeLoop queued it again.",
+        )
+        .await?;
+    }
     // So people find the labels in GitHub's picker, not only in the docs.
     for spec in labels.specs() {
         if snap.missing_labels.iter().any(|m| m == spec.name) {
@@ -1246,7 +1277,17 @@ async fn sync_lane(
     for &unit in &units {
         if unit.stacked && unit.layers.iter().any(|pr| pr.is_cross_repository) {
             let why = "Stacks with a PR from a fork are not supported yet.";
-            eject(ctx, settings, gh, key, &unit.prs(), why, "fork").await?;
+            eject(
+                ctx,
+                settings,
+                gh,
+                key,
+                &unit.prs(),
+                &unit.top().head_ref_oid,
+                why,
+                "fork",
+            )
+            .await?;
             dropped.extend(unit.prs());
             continue;
         }
@@ -1310,7 +1351,17 @@ async fn sync_lane(
                 Some(Block::Hold(reason)) => Some(reason),
                 Some(Block::Eject(why)) => {
                     let why = format!("Ejected: {why}.");
-                    eject(ctx, settings, gh, key, &unit.prs(), &why, "fork").await?;
+                    eject(
+                        ctx,
+                        settings,
+                        gh,
+                        key,
+                        &unit.prs(),
+                        &unit.top().head_ref_oid,
+                        &why,
+                        "fork",
+                    )
+                    .await?;
                     dropped.extend(unit.prs());
                     continue;
                 }
@@ -1986,6 +2037,7 @@ async fn finish(
                 gh,
                 key,
                 &prs,
+                &unit.top().head_ref_oid,
                 &format!("Ejected: {reason}."),
                 reason.kind(),
             )
@@ -2841,6 +2893,7 @@ async fn eject(
     gh: &dyn GitHub,
     key: &LaneKey,
     prs: &[PrNumber],
+    head: &str,
     why: &str,
     reason: &str,
 ) -> Result<()> {
@@ -2850,7 +2903,15 @@ async fn eject(
         gh.remove_label(&key.repo, *n, &labels.trigger).await?;
         gh.add_label(&key.repo, *n, &labels.failed).await?;
         gh.sticky_comment(&key.repo, *n, &comment).await?;
-        exit(ctx, key, *n, "ejected", why, Some(reason)).await?;
+        exit(
+            ctx,
+            key,
+            *n,
+            "ejected",
+            why,
+            Some(&format!("{reason} [head:{head}]")),
+        )
+        .await?;
     }
     Ok(())
 }

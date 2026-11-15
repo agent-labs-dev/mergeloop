@@ -748,6 +748,37 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.store.set_config_error(installation, repo, None).await?;
     let labels = settings.labels();
     let snap = gh.snapshot(repo, &labels).await?;
+    // Only an ejection caused by required checks records retry intent. Keeping
+    // the failed label is required: removing it is an explicit opt-out.
+    for pr in &snap.failed {
+        if pr.has_label(&labels.trigger) || pr.is_cross_repository || pr.hold_reason().is_some() {
+            continue;
+        }
+        let marker = format!("retry-checks:{}", labels.failed);
+        let Some(failed_head) = ctx
+            .store
+            .label_head(installation, repo, pr.number, &marker)
+            .await?
+        else {
+            continue;
+        };
+        if failed_head.is_empty() || failed_head == pr.head_ref_oid {
+            continue;
+        }
+        let rules = gh.branch_rules(repo, &pr.base_ref_name).await?;
+        let checks = gh.checks(repo, &pr.head_ref_oid).await?;
+        if checks.by_name.is_empty() || checks.verdict(&rules.checks).0 != CheckState::Passed {
+            continue;
+        }
+        gh.add_label(repo, pr.number, &labels.trigger).await?;
+        gh.remove_label(repo, pr.number, &labels.failed).await?;
+        gh.sticky_comment(
+            repo,
+            pr.number,
+            "The new head passes the required checks. Queued again after the check failure.",
+        )
+        .await?;
+    }
     // So people find the labels in GitHub's picker, not only in the docs.
     for spec in labels.specs() {
         if snap.missing_labels.iter().any(|m| m == spec.name) {
@@ -2847,6 +2878,17 @@ async fn eject(
     let labels = settings.labels();
     let comment = format!("{why}\n\nAdd `{}` again to retry.", labels.trigger);
     for n in prs {
+        if reason != "checks-failed" {
+            ctx.store
+                .set_label_head(
+                    key.installation_id,
+                    &key.repo,
+                    *n,
+                    &format!("retry-checks:{}", labels.failed),
+                    "",
+                )
+                .await?;
+        }
         gh.remove_label(&key.repo, *n, &labels.trigger).await?;
         gh.add_label(&key.repo, *n, &labels.failed).await?;
         gh.sticky_comment(&key.repo, *n, &comment).await?;
@@ -3175,7 +3217,17 @@ async fn run_job(
         job = match job.step(event) {
             Transition::Continue(j) => j,
             Transition::Merged => unreachable!("merges return above"),
-            Transition::Ejected(r) => return Ok(Outcome::Ejected(r)),
+            Transition::Ejected(r) => {
+                if matches!(r, EjectReason::ChecksFailed { .. }) {
+                    let marker = format!("retry-checks:{}", settings.labels().failed);
+                    for (pr, head) in now.layers.iter().zip(&heads) {
+                        ctx.store
+                            .set_label_head(key.installation_id, repo, pr.number, &marker, head)
+                            .await?;
+                    }
+                }
+                return Ok(Outcome::Ejected(r));
+            }
             Transition::Held(r) => return Ok(Outcome::Held(r)),
         };
     }

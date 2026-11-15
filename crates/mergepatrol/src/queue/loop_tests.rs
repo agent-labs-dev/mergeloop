@@ -456,6 +456,12 @@ impl GitHub for Fake {
                 .filter(|pr| pr.has_label(label) && !s.merged.contains(&pr.number))
                 .cloned()
                 .collect(),
+            failed: s
+                .prs
+                .values()
+                .filter(|pr| pr.has_label(&labels.failed) && !s.merged.contains(&pr.number))
+                .cloned()
+                .collect(),
             missing_labels: [&labels.trigger, &labels.priority, &labels.failed]
                 .into_iter()
                 .filter(|l| !s.repo_labels.contains(l))
@@ -946,6 +952,7 @@ struct Mem {
     repo_read: Mutex<Option<(bool, Vec<AgentTask>)>>,
     /// The head each PR had when the trigger label went on, as the webhook told.
     label_heads: Mutex<HashMap<PrNumber, String>>,
+    retry_heads: Mutex<HashMap<PrNumber, String>>,
     /// The agent's reviews, oldest first.
     reviews: Mutex<Vec<ReviewRecord>>,
     /// Reading a review fails, as when the database is down.
@@ -1549,11 +1556,13 @@ impl Store for Mem {
         &self,
         _: u64,
         _: &RepoName,
-        _: PrNumber,
-        _: &str,
-        _: &str,
+        pr: PrNumber,
+        label: &str,
+        head: &str,
     ) -> Result<()> {
-        unreachable!()
+        assert!(label.starts_with("retry-checks:"));
+        self.retry_heads.lock().unwrap().insert(pr, head.to_owned());
+        Ok(())
     }
     async fn label_head(
         &self,
@@ -1562,6 +1571,9 @@ impl Store for Mem {
         pr: PrNumber,
         label: &str,
     ) -> Result<Option<String>> {
+        if label.starts_with("retry-checks:") {
+            return Ok(self.retry_heads.lock().unwrap().get(&pr).cloned());
+        }
         assert_eq!(label, TRIGGER);
         Ok(self.label_heads.lock().unwrap().get(&pr).cloned())
     }
@@ -5490,3 +5502,38 @@ async fn a_stack_layer_gets_its_own_missing_check_clock() {
     assert!(last_comment(&run).contains("finished: sift."));
 }
 mod status_comment_regression;
+
+#[tokio::test(start_paused = true)]
+async fn failed_checks_retry_only_a_different_green_head_with_retained_intent() {
+    for (old_head, current_head, label, check, retry) in [
+        (Some("old"), "new", FAILED, CheckState::Passed, true),
+        (Some("same"), "same", FAILED, CheckState::Passed, false),
+        (None, "new", FAILED, CheckState::Passed, false),
+        (Some(""), "new", FAILED, CheckState::Passed, false),
+        (Some("old"), "new", FAILED, CheckState::Failed, false),
+        (Some("old"), "new", FAILED, CheckState::Pending, false),
+        (Some("old"), "new", "manual-hold", CheckState::Passed, false),
+    ] {
+        let run = Run::new(Fake::new(|s| {
+            s.add_pr(1);
+            let pr = s.prs.get_mut(&1).unwrap();
+            pr.labels = vec![label.into()];
+            pr.head_ref_oid = current_head.into();
+            s.required = vec!["ci".into()];
+            s.checks.insert("ci".into(), check);
+        }));
+        if let Some(head) = old_head {
+            run.store.retry_heads.lock().unwrap().insert(1, head.into());
+        }
+        read_repo(&run.ctx, &*run.gh, &repo()).await.unwrap();
+        assert_eq!(
+            run.labels(1).contains(&TRIGGER.to_owned()),
+            retry,
+            "{old_head:?} -> {current_head}, {label}, {check:?}"
+        );
+        assert_eq!(
+            run.labels(1).contains(&FAILED.to_owned()),
+            label == FAILED && !retry
+        );
+    }
+}

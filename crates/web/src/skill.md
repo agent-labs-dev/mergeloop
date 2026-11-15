@@ -49,6 +49,8 @@ MergeLoop keeps one comment on each queued PR up to date, from the moment it joi
 - **On hold**: the PR is a draft, waits for a required review, or has changes requested. MergeLoop comments the reason on the PR. It keeps its place, and runs once GitHub shows it ready.
 - **Under review**: with automatic review on, as it is by default, an agent reviews the PR before it takes its place in line. What it is sure should change it sends back to the PR's author, which is you if you built it, as review comments on their lines. The PR goes on once every review thread on it is resolved, with no human approval. It asks a human only about what the author can't settle: a call on scope or product, access, a change outside the repo. `get_agent_review` over MCP reads the review. If you built the PR, work the review as "After you queue" says, but never answer it.
 - **Ejected**: the rebase, the checks or the merge failed, and the comment says which. The trigger label is gone and `<label>:failed` is on. Fix the cause, push, then add `<label>` again.
+
+If the automatic review itself failed outside the pull request, its author may call the `retry_agent_review` tool once the current head is unchanged. It retries only that exact head, is bounded, and never answers findings or bypasses a human decision.
 - **Merged**: done. The queue labels are removed.
 - **Left the queue**: the label was removed, the PR was closed, or it was merged outside MergeLoop. Nothing is queued.
 

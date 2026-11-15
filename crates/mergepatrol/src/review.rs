@@ -205,11 +205,13 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
     if !requested {
         return ctx.store.stale_review(r.id, r.claim).await;
     }
-    let workspace = ctx
-        .store
-        .review_settings(r.installation_id)
-        .await?
-        .unwrap_or_default();
+    let workspace = match ctx.store.review_settings(r.installation_id).await {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            retry_setup(ctx, &r, &error).await?;
+            return Err(error);
+        }
+    };
     let bars = workspace.with(&settings.review);
     let reviewing = Reviewing::new(&gh, &pr, &r, &settings, &bars);
 

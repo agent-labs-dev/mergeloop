@@ -456,6 +456,12 @@ impl GitHub for Fake {
                 .filter(|pr| pr.has_label(label) && !s.merged.contains(&pr.number))
                 .cloned()
                 .collect(),
+            failed: s
+                .prs
+                .values()
+                .filter(|pr| pr.has_label(&labels.failed) && !s.merged.contains(&pr.number))
+                .cloned()
+                .collect(),
             missing_labels: [&labels.trigger, &labels.priority, &labels.failed]
                 .into_iter()
                 .filter(|l| !s.repo_labels.contains(l))

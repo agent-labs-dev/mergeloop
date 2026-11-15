@@ -487,10 +487,10 @@ impl ReviewStore for PgStore {
     async fn retry_author_review(&self, id: i64, head: &str, max_attempts: u32) -> Result<bool> {
         let updated = sqlx::query(
             "UPDATE agent_reviews
-             SET status = 'pending', error = NULL, attempts = attempts + 1,
+             SET status = 'pending', error = NULL, author_attempts = author_attempts + 1,
                  claimed_at = NULL, retry_at = NULL, updated_at = now()
              WHERE id = $1 AND head_sha = $2 AND status = 'asks' AND error IS NOT NULL
-               AND attempts < $3",
+               AND author_attempts < $3",
         )
         .bind(id)
         .bind(head)

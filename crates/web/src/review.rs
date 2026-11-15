@@ -20,6 +20,10 @@ use crate::{ApiError, AppState};
 
 const AUTHOR_REVIEW_RETRIES: u32 = 3;
 
+fn retryable_author_review(review: &ReviewRecord, head: &str) -> bool {
+    review.head_sha == head && review.status == ReviewStatus::Asks && review.error.is_some()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -640,12 +644,13 @@ pub(crate) async fn retry_agent_review(
     caller: Caller,
     Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
 ) -> Result<Json<Option<AgentReviewView>>, ApiError> {
-    let user = caller.user()?;
     let repo = repo_name(owner, name)?;
-    let id = user.workspace(id)?;
+    let id = caller.repo(&app, id, &repo).await?;
+    let token = caller.github_token(&app)?;
+    let login = app.github.as_user(&token)?.user().await?.login;
     let gh = installation(&app, id).await?;
     let pull = gh.pull_request(&repo, number).await?;
-    if !pull.authored_by(user.login()) {
+    if !pull.authored_by(&login) {
         return Err(ApiError::Status(
             StatusCode::FORBIDDEN,
             "Only the pull request author may retry its review.".into(),
@@ -657,10 +662,7 @@ pub(crate) async fn retry_agent_review(
             "There is no failed review for the current head.",
         ));
     };
-    if !review
-        .error
-        .is_some_and(|_| review.status == ReviewStatus::Asks)
-    {
+    if !retryable_author_review(&review, &head) {
         return Err(ApiError::bad_request(
             "The current review is not a failed review.",
         ));
@@ -812,6 +814,19 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn author_retry_requires_failed_review_of_exact_head() {
+        let mut review = record(Vec::new(), BTreeMap::new());
+        review.error = Some("reviewer timed out".into());
+        assert!(retryable_author_review(&review, "h"));
+        assert!(!retryable_author_review(&review, "new"));
+        review.error = None;
+        assert!(!retryable_author_review(&review, "h"));
+        review.error = Some("reviewer timed out".into());
+        review.status = ReviewStatus::Approved;
+        assert!(!retryable_author_review(&review, "h"));
     }
 
     #[test]

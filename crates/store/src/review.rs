@@ -1249,6 +1249,133 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn author_retries_are_atomic_exact_head_and_independently_bounded(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let review = store
+            .start_review(1, &repo(), 7, "head-a", None)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .retry_author_review(review.id, "head-a", 3)
+                .await
+                .unwrap(),
+            "pending is not failed"
+        );
+        for attempt in 0..=3 {
+            let claimed = store
+                .claim_review(Duration::from_secs(600))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !store
+                    .retry_author_review(review.id, "head-a", 3)
+                    .await
+                    .unwrap(),
+                "running is not failed"
+            );
+            let failed = ReviewDone {
+                status: ReviewStatus::Asks,
+                error: Some("worker timeout".into()),
+                summary: String::new(),
+                findings: vec![],
+                asked: vec![],
+            };
+            assert!(
+                store
+                    .finish_review(review.id, claimed.claim, &failed)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .retry_author_review(review.id, "head-b", 3)
+                    .await
+                    .unwrap(),
+                "wrong head"
+            );
+            let (first, duplicate) = tokio::join!(
+                store.retry_author_review(review.id, "head-a", 3),
+                store.retry_author_review(review.id, "head-a", 3),
+            );
+            let successes = u8::from(first.unwrap()) + u8::from(duplicate.unwrap());
+            assert_eq!(
+                successes,
+                u8::from(attempt < 3),
+                "one concurrent request at most, three retries total"
+            );
+        }
+        let fresh = store
+            .start_review(1, &repo(), 8, "approved", None)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_review(Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.id, fresh.id);
+        let approved = ReviewDone {
+            status: ReviewStatus::Approved,
+            error: None,
+            summary: String::new(),
+            findings: vec![],
+            asked: vec![],
+        };
+        assert!(
+            store
+                .finish_review(fresh.id, claim.claim, &approved)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .retry_author_review(fresh.id, "approved", 3)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn exact_head_lookup_finds_an_older_head_after_the_pr_returns_to_it(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let first = store
+            .start_review(1, &repo(), 7, "head-a", None)
+            .await
+            .unwrap();
+        store
+            .start_review(1, &repo(), 7, "head-b", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_review(1, &repo(), 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            "head-b"
+        );
+        assert_eq!(
+            store
+                .review_at_head(1, &repo(), 7, "head-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(
+            store
+                .review_at_head(1, &repo(), 7, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn a_review_runs_once_per_head_and_waits_for_its_answers(pool: PgPool) {
         let store = PgStore::migrate(pool).await.unwrap();
         let r = store

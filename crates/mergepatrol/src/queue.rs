@@ -767,7 +767,7 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
         else {
             continue;
         };
-        if old == pr.head_ref_oid {
+        if !author_pushed_since_ejection(old, &pr.head_ref_oid) {
             continue;
         }
         gh.remove_label(repo, pr.number, &labels.failed).await?;
@@ -846,6 +846,10 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
         gate,
         builders,
     }))
+}
+
+fn author_pushed_since_ejection(ejected_head: &str, current_head: &str) -> bool {
+    !ejected_head.is_empty() && ejected_head != current_head
 }
 
 /// Why a unit into `base` waits: the branch has no queue.
@@ -4233,6 +4237,13 @@ mod loop_tests;
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn failed_retry_requires_a_recorded_new_head() {
+        assert!(!author_pushed_since_ejection("", "new"));
+        assert!(!author_pushed_since_ejection("old", "old"));
+        assert!(author_pushed_since_ejection("old", "new"));
+    }
 
     #[test]
     fn the_agent_changes_only_a_unit_still_queued_as_it_was() {

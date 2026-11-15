@@ -19,7 +19,7 @@ use mergepatrol_executor::protocol::{
 use mergepatrol_github::setup::Verdict as ReviewVerdict;
 use mergepatrol_github::{App, CodeOwners, Installation, PullRequest, ReviewThread, ThreadComment};
 use mergepatrol_resolver::withdraws;
-use mergepatrol_store::{LaneKey, ReviewDone, ReviewRecord};
+use mergepatrol_store::{LaneKey, ReviewDone, ReviewRecord, ReviewStore};
 use mergepatrol_web::merge_requested;
 use tokio::task::JoinSet;
 
@@ -230,12 +230,25 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         }
         Err(why) => Err(why),
     };
-    match reviewing.conclude(ctx, output).await {
+    recover_conclusion(
+        ctx.store.as_ref(),
+        &r,
+        reviewing.conclude(ctx, output).await,
+    )
+    .await
+}
+
+async fn recover_conclusion(
+    store: &dyn ReviewStore,
+    review: &ReviewRecord,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
             retry_after_error(
-                ctx,
-                &r,
+                store,
+                review,
                 &error,
                 "The automatic review could not complete after the retry limit.",
             )
@@ -247,7 +260,7 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
 
 async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) -> Result<()> {
     retry_after_error(
-        ctx,
+        ctx.store.as_ref(),
         review,
         error,
         "The automatic review could not start after the retry limit.",
@@ -256,18 +269,18 @@ async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) ->
 }
 
 async fn retry_after_error(
-    ctx: &Ctx,
+    store: &dyn ReviewStore,
     review: &ReviewRecord,
     error: &anyhow::Error,
     summary: &str,
 ) -> Result<()> {
     let error = format!("{error:#}");
-    if review.attempts + 1 < ATTEMPTS && !error.to_string().starts_with(NO_KEY) {
-        ctx.store
+    if review.attempts + 1 < ATTEMPTS && !error.starts_with(NO_KEY) {
+        store
             .retry_review(review.id, review.claim, &error, RETRY_AFTER)
             .await?;
     } else {
-        ctx.store
+        store
             .finish_review(
                 review.id,
                 review.claim,
@@ -1252,6 +1265,57 @@ mod tests {
             waited_secs: None,
             created_at: String::new(),
             updated_at: String::new(),
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn unpersistable_review_output_retries_then_becomes_an_explicit_error(
+        pool: sqlx::PgPool,
+    ) {
+        let store = mergepatrol_store::PgStore::migrate(pool.clone())
+            .await
+            .unwrap();
+        let repo = RepoName::parse("o/r").unwrap();
+        let started = store.start_review(1, &repo, 7, "head", None).await.unwrap();
+        let mut finding = review(1, true, None).findings.remove(0);
+        finding.finding.evidence.as_mut().unwrap().output = "before\0after".into();
+        let done = ReviewDone {
+            status: ReviewStatus::Changes,
+            error: None,
+            summary: "Review completed".into(),
+            findings: vec![finding],
+            asked: Vec::new(),
+        };
+        for attempt in 0..ATTEMPTS {
+            let claimed = store.claim_review(STALE).await.unwrap().unwrap();
+            assert_eq!(claimed.attempts, attempt);
+            let failed = store
+                .finish_review(claimed.id, claimed.claim, &done)
+                .await
+                .unwrap_err();
+            assert!(format!("{failed:#}").contains("unsupported Unicode escape"));
+            assert!(
+                recover_conclusion(&store, &claimed, Err(failed))
+                    .await
+                    .is_err()
+            );
+            let saved = store.review(started.id).await.unwrap().unwrap();
+            if attempt + 1 < ATTEMPTS {
+                assert_eq!(saved.status, ReviewStatus::Pending);
+                sqlx::query(
+                    "UPDATE agent_reviews SET retry_at = now() - interval '1 second' WHERE id = $1",
+                )
+                .bind(started.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            } else {
+                assert_eq!(saved.status, ReviewStatus::Asks);
+                assert!(saved.error.unwrap().contains("unsupported Unicode escape"));
+                assert!(saved.summary.contains("could not complete"));
+                assert!(saved.findings.is_empty());
+                assert!(store.claim_review(STALE).await.unwrap().is_none());
+            }
         }
     }
 

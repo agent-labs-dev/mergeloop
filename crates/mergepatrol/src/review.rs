@@ -230,10 +230,37 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         }
         Err(why) => Err(why),
     };
-    reviewing.conclude(ctx, output).await
+    match reviewing.conclude(ctx, output).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            retry_after_error(
+                ctx,
+                &r,
+                &error,
+                "The automatic review could not complete after the retry limit.",
+            )
+            .await?;
+            Err(error)
+        }
+    }
 }
 
 async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) -> Result<()> {
+    retry_after_error(
+        ctx,
+        review,
+        error,
+        "The automatic review could not start after the retry limit.",
+    )
+    .await
+}
+
+async fn retry_after_error(
+    ctx: &Ctx,
+    review: &ReviewRecord,
+    error: &anyhow::Error,
+    summary: &str,
+) -> Result<()> {
     let error = format!("{error:#}");
     if review.attempts + 1 < ATTEMPTS && !error.to_string().starts_with(NO_KEY) {
         ctx.store
@@ -247,7 +274,7 @@ async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) ->
                 &ReviewDone {
                     status: ReviewStatus::Asks,
                     error: Some(error.clone()),
-                    summary: "The automatic review could not start after the retry limit.".into(),
+                    summary: summary.into(),
                     findings: Vec::new(),
                     asked: Vec::new(),
                 },

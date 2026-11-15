@@ -402,6 +402,8 @@ Rules:
 
 {verify}
 
+Before you finish, read the repository's contributor and agent instructions for fast pre-push checks. Run those fast checks as well as the commands above, and run the focused unit tests that cover the files you changed. MergeLoop will only commit and push after all of these checks pass.
+
 MergeLoop commits your fix. End your reply with one line: `{COMMIT} <the commit's subject>`. \
 Write it in the form the repo's commit history and its commit hooks ask for, such as a \
 Conventional Commits type and scope when the repo uses them.

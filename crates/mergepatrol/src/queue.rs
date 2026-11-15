@@ -1485,8 +1485,9 @@ async fn sync_lane(
         }
         if !joined.is_empty() {
             record_all(ctx, key, &joined, "enqueued", "added to the queue").await?;
-            let covered = comments.iter().any(|(n, _)| *n == e.number);
-            if let Some(comment) = standing(&e.state, gate.as_ref()).filter(|_| !covered) {
+            // A stack entry's standing comment covers its existing layers, but newly joined
+            // layers may still show a stale pre-stack comment. Refresh those layers directly.
+            if let Some(comment) = standing(&e.state, gate.as_ref()) {
                 joined_comments.push((joined, comment));
             }
         }

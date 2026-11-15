@@ -2134,12 +2134,18 @@ async fn resume_merge(
         // A stack can change while this process is down. Confirm each recorded layer instead of
         // treating the old list as the result of the merge. A removed layer must not receive a
         // merged exit or comment just because the recorded top PR merged.
-        let merged_prs = units
-            .iter()
-            .find(|u| u.number == merge.number)
-            .map(|u| u.prs().into_iter().filter(|pr| merge.prs.contains(pr)).collect())
-            .unwrap_or_else(|| merge.prs.clone());
-        if let Some(sha) = gh.merged_as(repo, merge.top, &merge.head).await? {
+        let mut merged_prs = Vec::with_capacity(merge.prs.len());
+        let mut top_sha = None;
+        for pr in &merge.prs {
+            let current = gh.pull_request(repo, *pr).await?;
+            if let Some(pr_sha) = gh.merged_as(repo, *pr, &current.head_ref_oid).await? {
+                if *pr == merge.top {
+                    top_sha = Some(pr_sha);
+                }
+                merged_prs.push(*pr);
+            }
+        }
+        if let Some(sha) = top_sha {
             // Preserve the actual set for the reporting call below.
             lane.merging = None;
             lane.remove(merge.number);

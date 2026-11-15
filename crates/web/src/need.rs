@@ -126,7 +126,9 @@ pub(crate) async fn next_need(
         let view = read(&app, id, &repo, number, after, reader).await?;
         let seen = Some(view.id.as_str()) == after;
         let settled = matches!(view.needs, NeedKind::Merged | NeedKind::Off);
-        if settled || (!seen && view.needs != NeedKind::Wait) {
+        // An acknowledged need is never replayed: wait for a newer status or event, even when
+        // the current hold still asks for agent work. Settled states return immediately.
+        if settled || !seen {
             return Ok(Json(view));
         }
         if Instant::now() + POLL > deadline {

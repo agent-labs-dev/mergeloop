@@ -627,6 +627,9 @@ pub(crate) async fn agent_review(
 ) -> Result<Json<Option<AgentReviewView>>, ApiError> {
     let repo = repo_name(owner, name)?;
     let id = caller.repo(&app, id, &repo).await?;
+    let Some(_latest) = app.store.latest_review(id, &repo, number).await? else {
+        return Ok(Json(None));
+    };
     // The newest row can belong to an intervening head. If the PR was force-pushed
     // back to an older SHA, select the review for the head GitHub serves now so the
     // review holding the queue remains visible and answerable.

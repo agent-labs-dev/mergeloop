@@ -81,6 +81,7 @@ fn spec(url: &Path, head: &str, trunk: &str) -> JobSpec {
 fn executor() -> LocalExecutor {
     LocalExecutor {
         program: env!("CARGO_BIN_EXE_mergepatrol").into(),
+        args: Vec::new(),
         timeout: Duration::from_secs(60),
     }
 }
@@ -299,23 +300,26 @@ fn with_fake_claude_running(dir: &Path, shell: &str, answer: &str) -> LocalExecu
     ];
     let lines: String = events.iter().map(|e| format!("echo '{e}'\n")).collect();
     let lines = format!("{shell}\n{lines}");
-    let script = |path: &Path, body: &str| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    };
-    script(&bin.join("claude"), &lines);
+    // A script this test writes, which a process then executes, can be "Text file busy"
+    // (ETXTBSY): another test of this binary that forks while the file is written holds its
+    // descriptor open until its own `exec`. So neither file is written here and executed: `sh`
+    // reads the fake job's script, and that script writes the fake `claude` that the job runs.
+    std::fs::write(dir.join("claude"), format!("#!/bin/sh\n{lines}")).unwrap();
     let job = dir.join("job.sh");
-    script(
+    std::fs::write(
         &job,
-        &format!(
-            "PATH={}:$PATH exec {} \"$@\"\n",
-            bin.display(),
-            env!("CARGO_BIN_EXE_mergepatrol")
+        format!(
+            "cp {dir}/claude {bin}/claude\nchmod +x {bin}/claude\n\
+             PATH={bin}:$PATH exec {job_bin} \"$@\"\n",
+            dir = dir.display(),
+            bin = bin.display(),
+            job_bin = env!("CARGO_BIN_EXE_mergepatrol"),
         ),
-    );
+    )
+    .unwrap();
     LocalExecutor {
-        program: job,
+        program: "sh".into(),
+        args: vec![job.display().to_string()],
         timeout: Duration::from_secs(60),
     }
 }
@@ -1069,6 +1073,7 @@ async fn an_openai_conflict_is_resolved_through_the_proxy() {
     let out = tmp.path().join("out");
     let executor = LocalExecutor {
         program: env!("CARGO_BIN_EXE_mergepatrol").into(),
+        args: Vec::new(),
         timeout: Duration::from_secs(360),
     };
     let result = executor.run("live", &spec, &out).await.unwrap();

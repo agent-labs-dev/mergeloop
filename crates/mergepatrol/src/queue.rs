@@ -888,6 +888,8 @@ async fn review_hold(
     if !review.enabled {
         return Ok(None);
     }
+    let mut statuses = Vec::with_capacity(heads.len());
+    let mut unresolved_hold = None;
     for (i, &(number, head, unresolved)) in heads.iter().enumerate() {
         let latest = ctx
             .store
@@ -957,21 +959,21 @@ async fn review_hold(
                 }
             }
         };
-        if let Some(hold) = Hold::of_reviews(stacked, [(number, status)]) {
-            return Ok(Some(hold));
-        }
+        statuses.push((number, status));
         if review.require_resolved && unresolved > 0 {
             let hold = Hold::UnresolvedThreads { count: unresolved };
-            return Ok(Some(match stacked {
-                true => Hold::Layer {
-                    number,
-                    hold: Box::new(hold),
-                },
-                false => hold,
-            }));
+            if unresolved_hold.is_none() {
+                unresolved_hold = Some(match stacked {
+                    true => Hold::Layer {
+                        number,
+                        hold: Box::new(hold),
+                    },
+                    false => hold,
+                });
+            }
         }
     }
-    Ok(None)
+    Ok(Hold::of_reviews(stacked, statuses).or(unresolved_hold))
 }
 
 /// Shows on GitHub that the review gate lets the PRs go on: MergeLoop dismisses the changes its

@@ -5537,3 +5537,38 @@ async fn failed_checks_retry_only_a_different_green_head_with_retained_intent() 
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_stack_starts_every_layer_review_before_reporting_the_first_hold() {
+    let run = Run::new(Fake::new(|s| {
+        s.add_stack(10, &[1, 2, 3], &[2, 3]);
+        for (base, head, id) in [
+            ("main", "one", "one"),
+            ("one", "two", "two"),
+            ("two", "three", "three"),
+        ] {
+            s.diff_ids.insert((base.into(), head.into()), id.into());
+        }
+    }));
+    let settings = ReviewSettings {
+        enabled: true,
+        ..ReviewSettings::default()
+    };
+    let key = LaneKey {
+        installation_id: 1,
+        repo: repo(),
+        trunk: "main".into(),
+    };
+    let heads = [(1, "one", 0), (2, "two", 0), (3, "three", 0)];
+    assert!(matches!(
+        review_hold(
+            &run.ctx, &*run.gh, &key, &settings, true, &heads, &mut false
+        )
+        .await
+        .unwrap(),
+        Some(Hold::Layer { number: 1, .. })
+    ));
+    assert_eq!(run.store.newest_review(1).0, "one");
+    assert_eq!(run.store.newest_review(2).0, "two");
+    assert_eq!(run.store.newest_review(3).0, "three");
+}

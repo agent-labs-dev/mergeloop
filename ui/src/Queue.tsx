@@ -24,7 +24,7 @@ const EJECTED_DAYS = 7;
 /** Two panes: the lanes, and the selected lane's PRs in merge order. A narrow screen stacks
  * them. */
 export function Queue({ workspace }: { workspace: number }) {
-  const { lane: laneId } = useSearch({ from: "/$account/queue" });
+  const { lane: laneId, pr: requestedPr } = useSearch({ from: "/$account/queue" });
   const navigate = useNavigate({ from: "/$account/queue" });
   const { account } = useParams({ from: "/$account/queue" });
   const lanes = useQuery({
@@ -71,6 +71,13 @@ export function Queue({ workspace }: { workspace: number }) {
       </div>
     );
   if (!lanes.data) return null;
+
+  // A permalink may name a PR that is outside the API's bounded lane page. Never
+  // silently select the first lane in that case: that makes a valid link appear
+  // to point at an unrelated PR on narrow screens.
+  if (requestedPr !== undefined && !lanes.data.some((l) => l.entries.some((e) => e.number === requestedPr))) {
+    return <p className="p-6 text-muted">Pull request #{requestedPr} was not found in the queue.</p>;
+  }
 
   const lane = current ?? lanes.data[0];
   const queued = lane.entries;

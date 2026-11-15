@@ -2122,6 +2122,7 @@ async fn resume_merge(
         u.number == merge.number
             && u.top().number == merge.top
             && u.top().head_ref_oid == merge.head
+            && u.prs() == merge.prs
             && u.hold_reason().is_none()
     });
     let sha = if open {
@@ -2130,7 +2131,23 @@ async fn resume_merge(
             MergeOutcome::Rejected(_) => None,
         }
     } else {
-        gh.merged_as(repo, merge.top, &merge.head).await?
+        // A stack can change while this process is down. Confirm each recorded layer instead of
+        // treating the old list as the result of the merge. A removed layer must not receive a
+        // merged exit or comment just because the recorded top PR merged.
+        let merged_prs = units
+            .iter()
+            .find(|u| u.number == merge.number)
+            .map(|u| u.prs().into_iter().filter(|pr| merge.prs.contains(pr)).collect())
+            .unwrap_or_else(|| merge.prs.clone());
+        if let Some(sha) = gh.merged_as(repo, merge.top, &merge.head).await? {
+            // Preserve the actual set for the reporting call below.
+            lane.merging = None;
+            lane.remove(merge.number);
+            merged(ctx, settings, gh, key, &merged_prs, &sha).await?;
+            ctx.store.save_lane(key, lane).await?;
+            return Ok(true);
+        }
+        None
     };
     lane.merging = None;
     if let Some(sha) = &sha {

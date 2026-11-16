@@ -156,6 +156,9 @@ async fn github(hub: Shared) -> GitHub {
                     None => (404, "{}".into()),
                 }
             }
+            ("GET", path) if path.starts_with("/repos/o/r/git/ref/pull/") && path.ends_with("/head") => {
+                (200, json!({ "object": { "sha": "h40" } }).to_string())
+            }
             ("POST", "/repos/o/r/pulls") => {
                 let body: Value = serde_json::from_str(call.body).unwrap();
                 let head = body["head"].as_str().unwrap().to_owned();

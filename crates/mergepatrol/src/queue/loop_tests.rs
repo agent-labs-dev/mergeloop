@@ -456,6 +456,12 @@ impl GitHub for Fake {
                 .filter(|pr| pr.has_label(label) && !s.merged.contains(&pr.number))
                 .cloned()
                 .collect(),
+            failed: s
+                .prs
+                .values()
+                .filter(|pr| pr.has_label(&labels.failed) && !s.merged.contains(&pr.number))
+                .cloned()
+                .collect(),
             missing_labels: [&labels.trigger, &labels.priority, &labels.failed]
                 .into_iter()
                 .filter(|l| !s.repo_labels.contains(l))
@@ -946,6 +952,7 @@ struct Mem {
     repo_read: Mutex<Option<(bool, Vec<AgentTask>)>>,
     /// The head each PR had when the trigger label went on, as the webhook told.
     label_heads: Mutex<HashMap<PrNumber, String>>,
+    retry_heads: Mutex<HashMap<PrNumber, String>>,
     /// The agent's reviews, oldest first.
     reviews: Mutex<Vec<ReviewRecord>>,
     /// Reading a review fails, as when the database is down.
@@ -1039,6 +1046,20 @@ impl ReviewStore for Mem {
     ) -> Result<Option<ReviewRecord>> {
         let reviews = self.reviews.lock().unwrap();
         Ok(reviews.iter().rev().find(|r| r.number == pr).cloned())
+    }
+    async fn review_at_head(
+        &self,
+        _: u64,
+        _: &RepoName,
+        pr: PrNumber,
+        head: &str,
+    ) -> Result<Option<ReviewRecord>> {
+        let reviews = self.reviews.lock().unwrap();
+        Ok(reviews
+            .iter()
+            .rev()
+            .find(|r| r.number == pr && r.head_sha == head)
+            .cloned())
     }
     async fn latest_reviews(
         &self,
@@ -1535,11 +1556,13 @@ impl Store for Mem {
         &self,
         _: u64,
         _: &RepoName,
-        _: PrNumber,
-        _: &str,
-        _: &str,
+        pr: PrNumber,
+        label: &str,
+        head: &str,
     ) -> Result<()> {
-        unreachable!()
+        assert!(label.starts_with("retry-checks:"));
+        self.retry_heads.lock().unwrap().insert(pr, head.to_owned());
+        Ok(())
     }
     async fn label_head(
         &self,
@@ -1548,6 +1571,9 @@ impl Store for Mem {
         pr: PrNumber,
         label: &str,
     ) -> Result<Option<String>> {
+        if label.starts_with("retry-checks:") {
+            return Ok(self.retry_heads.lock().unwrap().get(&pr).cloned());
+        }
         assert_eq!(label, TRIGGER);
         Ok(self.label_heads.lock().unwrap().get(&pr).cloned())
     }
@@ -5476,3 +5502,73 @@ async fn a_stack_layer_gets_its_own_missing_check_clock() {
     assert!(last_comment(&run).contains("finished: sift."));
 }
 mod status_comment_regression;
+
+#[tokio::test(start_paused = true)]
+async fn failed_checks_retry_only_a_different_green_head_with_retained_intent() {
+    for (old_head, current_head, label, check, retry) in [
+        (Some("old"), "new", FAILED, CheckState::Passed, true),
+        (Some("same"), "same", FAILED, CheckState::Passed, false),
+        (None, "new", FAILED, CheckState::Passed, false),
+        (Some(""), "new", FAILED, CheckState::Passed, false),
+        (Some("old"), "new", FAILED, CheckState::Failed, false),
+        (Some("old"), "new", FAILED, CheckState::Pending, false),
+        (Some("old"), "new", "manual-hold", CheckState::Passed, false),
+    ] {
+        let run = Run::new(Fake::new(|s| {
+            s.add_pr(1);
+            let pr = s.prs.get_mut(&1).unwrap();
+            pr.labels = vec![label.into()];
+            pr.head_ref_oid = current_head.into();
+            s.required = vec!["ci".into()];
+            s.checks.insert("ci".into(), check);
+        }));
+        if let Some(head) = old_head {
+            run.store.retry_heads.lock().unwrap().insert(1, head.into());
+        }
+        read_repo(&run.ctx, &*run.gh, &repo()).await.unwrap();
+        assert_eq!(
+            run.labels(1).contains(&TRIGGER.to_owned()),
+            retry,
+            "{old_head:?} -> {current_head}, {label}, {check:?}"
+        );
+        assert_eq!(
+            run.labels(1).contains(&FAILED.to_owned()),
+            label == FAILED && !retry
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stack_starts_every_layer_review_before_reporting_the_first_hold() {
+    let run = Run::new(Fake::new(|s| {
+        s.add_stack(10, &[1, 2, 3], &[2, 3]);
+        for (base, head, id) in [
+            ("main", "one", "one"),
+            ("one", "two", "two"),
+            ("two", "three", "three"),
+        ] {
+            s.diff_ids.insert((base.into(), head.into()), id.into());
+        }
+    }));
+    let settings = ReviewSettings {
+        enabled: true,
+        ..ReviewSettings::default()
+    };
+    let key = LaneKey {
+        installation_id: 1,
+        repo: repo(),
+        trunk: "main".into(),
+    };
+    let heads = [(1, "one", 0), (2, "two", 0), (3, "three", 0)];
+    assert!(matches!(
+        review_hold(
+            &run.ctx, &*run.gh, &key, &settings, true, &heads, &mut false
+        )
+        .await
+        .unwrap(),
+        Some(Hold::Layer { number: 1, .. })
+    ));
+    assert_eq!(run.store.newest_review(1).0, "one");
+    assert_eq!(run.store.newest_review(2).0, "two");
+    assert_eq!(run.store.newest_review(3).0, "three");
+}

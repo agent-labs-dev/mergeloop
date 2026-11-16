@@ -52,6 +52,8 @@ MergeLoop keeps one comment on each queued PR up to date, from the moment it joi
 - **Merged**: done. The queue labels are removed.
 - **Left the queue**: the label was removed, the PR was closed, or it was merged outside MergeLoop. Nothing is queued.
 
+If the automatic review itself failed outside the pull request, its author may call the `retry_agent_review` tool once the current head is unchanged. It retries only that exact head, is bounded, and never answers findings or bypasses a human decision.
+
 ## After you queue: work the review
 
 Queuing is not the end of your job. If you built the PR, stay with it until it merges, is ejected, or holds only on a human. Go over every review comment yourself, without waiting for the user to tell you to: fix it, or dismiss it with your reasoning, and resolve it. The PR is held while any review thread is unresolved, and goes on to the queue once none is. Ask a human only for a call you can't make from the code, the repo and what the user told you.

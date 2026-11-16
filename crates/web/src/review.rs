@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use mergepatrol_core::{
     Answer, Bar, CodeLine, Depth, Judged, Kind, Lean, LineKind, Outcome, PrNumber, Question,
     Related, RepoName, ReviewOverrides, ReviewSettings, ReviewStatus,
@@ -13,9 +14,15 @@ use mergepatrol_store::ReviewRecord;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::api::repo_name;
+use crate::api::{installation, repo_name};
 use crate::auth::Caller;
 use crate::{ApiError, AppState};
+
+const AUTHOR_REVIEW_RETRIES: u32 = 3;
+
+fn retryable_author_review(review: &ReviewRecord, head: &str) -> bool {
+    review.head_sha == head && review.status == ReviewStatus::Asks && review.error.is_some()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -620,7 +627,60 @@ pub(crate) async fn agent_review(
 ) -> Result<Json<Option<AgentReviewView>>, ApiError> {
     let repo = repo_name(owner, name)?;
     let id = caller.repo(&app, id, &repo).await?;
-    let review = app.store.latest_review(id, &repo, number).await?;
+    let Some(_latest) = app.store.latest_review(id, &repo, number).await? else {
+        return Ok(Json(None));
+    };
+    // The newest row can belong to an intervening head. If the PR was force-pushed
+    // back to an older SHA, select the review for the head GitHub serves now so the
+    // review holding the queue remains visible and answerable.
+    let head = installation(&app, id)
+        .await?
+        .pull_head(&repo, number)
+        .await?;
+    let review = app.store.review_at_head(id, &repo, number, &head).await?;
+    Ok(Json(review.map(AgentReviewView::from)))
+}
+
+/// Lets the pull request's author retry a failed review of the exact current head.
+pub(crate) async fn retry_agent_review(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path((id, owner, name, number)): Path<(u64, String, String, u64)>,
+) -> Result<Json<Option<AgentReviewView>>, ApiError> {
+    let repo = repo_name(owner, name)?;
+    let id = caller.repo(&app, id, &repo).await?;
+    let token = caller.github_token(&app)?;
+    let login = app.github.as_user(&token)?.user().await?.login;
+    let gh = installation(&app, id).await?;
+    let pull = gh.pull_request(&repo, number).await?;
+    if !pull.authored_by(&login) {
+        return Err(ApiError::Status(
+            StatusCode::FORBIDDEN,
+            "Only the pull request author may retry its review.".into(),
+        ));
+    }
+    let head = pull.head_ref_oid;
+    let Some(review) = app.store.review_at_head(id, &repo, number, &head).await? else {
+        return Err(ApiError::bad_request(
+            "There is no failed review for the current head.",
+        ));
+    };
+    if !retryable_author_review(&review, &head) {
+        return Err(ApiError::bad_request(
+            "The current review is not a failed review.",
+        ));
+    }
+    if !app
+        .store
+        .retry_author_review(review.id, &head, AUTHOR_REVIEW_RETRIES)
+        .await?
+    {
+        return Err(ApiError::Status(
+            StatusCode::CONFLICT,
+            "The review retry limit has been reached.".into(),
+        ));
+    }
+    let review = app.store.review_at_head(id, &repo, number, &head).await?;
     Ok(Json(review.map(AgentReviewView::from)))
 }
 
@@ -757,6 +817,19 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn author_retry_requires_failed_review_of_exact_head() {
+        let mut review = record(Vec::new(), BTreeMap::new());
+        review.error = Some("reviewer timed out".into());
+        assert!(retryable_author_review(&review, "h"));
+        assert!(!retryable_author_review(&review, "new"));
+        review.error = None;
+        assert!(!retryable_author_review(&review, "h"));
+        review.error = Some("reviewer timed out".into());
+        review.status = ReviewStatus::Approved;
+        assert!(!retryable_author_review(&review, "h"));
     }
 
     #[test]

@@ -748,6 +748,37 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.store.set_config_error(installation, repo, None).await?;
     let labels = settings.labels();
     let snap = gh.snapshot(repo, &labels).await?;
+    // Only an ejection caused by required checks records retry intent. Keeping
+    // the failed label is required: removing it is an explicit opt-out.
+    for pr in &snap.failed {
+        if pr.has_label(&labels.trigger) || pr.is_cross_repository || pr.hold_reason().is_some() {
+            continue;
+        }
+        let marker = format!("retry-checks:{}", labels.failed);
+        let Some(failed_head) = ctx
+            .store
+            .label_head(installation, repo, pr.number, &marker)
+            .await?
+        else {
+            continue;
+        };
+        if failed_head.is_empty() || failed_head == pr.head_ref_oid {
+            continue;
+        }
+        let rules = gh.branch_rules(repo, &pr.base_ref_name).await?;
+        let checks = gh.checks(repo, &pr.head_ref_oid).await?;
+        if checks.by_name.is_empty() || checks.verdict(&rules.checks).0 != CheckState::Passed {
+            continue;
+        }
+        gh.add_label(repo, pr.number, &labels.trigger).await?;
+        gh.remove_label(repo, pr.number, &labels.failed).await?;
+        gh.sticky_comment(
+            repo,
+            pr.number,
+            "The new head passes the required checks. Queued again after the check failure.",
+        )
+        .await?;
+    }
     // So people find the labels in GitHub's picker, not only in the docs.
     for spec in labels.specs() {
         if snap.missing_labels.iter().any(|m| m == spec.name) {
@@ -857,6 +888,8 @@ async fn review_hold(
     if !review.enabled {
         return Ok(None);
     }
+    let mut statuses = Vec::with_capacity(heads.len());
+    let mut unresolved_hold = None;
     for (i, &(number, head, unresolved)) in heads.iter().enumerate() {
         let latest = ctx
             .store
@@ -926,21 +959,21 @@ async fn review_hold(
                 }
             }
         };
-        if let Some(hold) = Hold::of_reviews(stacked, [(number, status)]) {
-            return Ok(Some(hold));
-        }
+        statuses.push((number, status));
         if review.require_resolved && unresolved > 0 {
             let hold = Hold::UnresolvedThreads { count: unresolved };
-            return Ok(Some(match stacked {
-                true => Hold::Layer {
-                    number,
-                    hold: Box::new(hold),
-                },
-                false => hold,
-            }));
+            if unresolved_hold.is_none() {
+                unresolved_hold = Some(match stacked {
+                    true => Hold::Layer {
+                        number,
+                        hold: Box::new(hold),
+                    },
+                    false => hold,
+                });
+            }
         }
     }
-    Ok(None)
+    Ok(Hold::of_reviews(stacked, statuses).or(unresolved_hold))
 }
 
 /// Shows on GitHub that the review gate lets the PRs go on: MergeLoop dismisses the changes its
@@ -1452,8 +1485,9 @@ async fn sync_lane(
         }
         if !joined.is_empty() {
             record_all(ctx, key, &joined, "enqueued", "added to the queue").await?;
-            let covered = comments.iter().any(|(n, _)| *n == e.number);
-            if let Some(comment) = standing(&e.state, gate.as_ref()).filter(|_| !covered) {
+            // A stack entry's standing comment covers its existing layers, but newly joined
+            // layers may still show a stale pre-stack comment. Refresh those layers directly.
+            if let Some(comment) = standing(&e.state, gate.as_ref()) {
                 joined_comments.push((joined, comment));
             }
         }
@@ -2122,6 +2156,7 @@ async fn resume_merge(
         u.number == merge.number
             && u.top().number == merge.top
             && u.top().head_ref_oid == merge.head
+            && u.prs() == merge.prs
             && u.hold_reason().is_none()
     });
     let sha = if open {
@@ -2130,7 +2165,29 @@ async fn resume_merge(
             MergeOutcome::Rejected(_) => None,
         }
     } else {
-        gh.merged_as(repo, merge.top, &merge.head).await?
+        // A stack can change while this process is down. Confirm each recorded layer instead of
+        // treating the old list as the result of the merge. A removed layer must not receive a
+        // merged exit or comment just because the recorded top PR merged.
+        let mut merged_prs = Vec::with_capacity(merge.prs.len());
+        let mut top_sha = None;
+        for pr in &merge.prs {
+            let current = gh.pull_request(repo, *pr).await?;
+            if let Some(pr_sha) = gh.merged_as(repo, *pr, &current.head_ref_oid).await? {
+                if *pr == merge.top {
+                    top_sha = Some(pr_sha);
+                }
+                merged_prs.push(*pr);
+            }
+        }
+        if let Some(sha) = top_sha {
+            // Preserve the actual set for the reporting call below.
+            lane.merging = None;
+            lane.remove(merge.number);
+            merged(ctx, settings, gh, key, &merged_prs, &sha).await?;
+            ctx.store.save_lane(key, lane).await?;
+            return Ok(true);
+        }
+        None
     };
     lane.merging = None;
     if let Some(sha) = &sha {
@@ -2824,6 +2881,17 @@ async fn eject(
     let labels = settings.labels();
     let comment = format!("{why}\n\nAdd `{}` again to retry.", labels.trigger);
     for n in prs {
+        if reason != "checks-failed" {
+            ctx.store
+                .set_label_head(
+                    key.installation_id,
+                    &key.repo,
+                    *n,
+                    &format!("retry-checks:{}", labels.failed),
+                    "",
+                )
+                .await?;
+        }
         gh.remove_label(&key.repo, *n, &labels.trigger).await?;
         gh.add_label(&key.repo, *n, &labels.failed).await?;
         gh.sticky_comment(&key.repo, *n, &comment).await?;
@@ -3152,7 +3220,17 @@ async fn run_job(
         job = match job.step(event) {
             Transition::Continue(j) => j,
             Transition::Merged => unreachable!("merges return above"),
-            Transition::Ejected(r) => return Ok(Outcome::Ejected(r)),
+            Transition::Ejected(r) => {
+                if matches!(r, EjectReason::ChecksFailed { .. }) {
+                    let marker = format!("retry-checks:{}", settings.labels().failed);
+                    for (pr, head) in now.layers.iter().zip(&heads) {
+                        ctx.store
+                            .set_label_head(key.installation_id, repo, pr.number, &marker, head)
+                            .await?;
+                    }
+                }
+                return Ok(Outcome::Ejected(r));
+            }
             Transition::Held(r) => return Ok(Outcome::Held(r)),
         };
     }

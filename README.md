@@ -348,7 +348,8 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `next_need` | What a PR needs next from the agent that queued it, with what to do: waits for a newer one with `after` and `wait` | |
 | `queue_pull` | Queues a PR, or its stack. `priority` puts it at the front. Says when it goes on hold whatever the PR, or the agent has no model key | |
 | `dequeue_pull` | Takes a PR, and its stack, out of the queue | |
-| `get_agent_review` | The agent's review of a queued PR: what it found, what it sent back to the author, and what it asks a human | |
+| `get_agent_review` | The agent's review of the exact GitHub head currently published for a queued PR: what it found, what it sent back to the author, and what it asks a human | |
+| `retry_agent_review` | Retry a failed automatic review of the exact current head, as its author, within the retry limit | Yes |
 | `get_repo_config` | A repo's queue settings | |
 | `propose_repo_config` | Opens a PR that changes a repo's queue settings | Yes |
 | `get_repo_skill` | Whether a repo has the current `mergeloop` agent skill | |

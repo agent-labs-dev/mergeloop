@@ -86,6 +86,14 @@ pub trait ReviewStore: Send + Sync {
         repo: &RepoName,
         pr: PrNumber,
     ) -> Result<Option<ReviewRecord>>;
+    /// The newest review of this exact PR head, independent of reviews of intervening heads.
+    async fn review_at_head(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+        head: &str,
+    ) -> Result<Option<ReviewRecord>>;
     /// The newest review of each of these PRs that has one.
     async fn latest_reviews(
         &self,
@@ -111,6 +119,11 @@ pub trait ReviewStore: Send + Sync {
         head: &str,
         diff_id: Option<&str>,
     ) -> Result<ReviewRecord>;
+    /// Re-queues a failed review when its author requests another bounded attempt.
+    async fn retry_author_review(&self, id: i64, head: &str, max_attempts: u32) -> Result<bool> {
+        let _ = (id, head, max_attempts);
+        anyhow::bail!("author review retry is unavailable")
+    }
     /// The PR's newest review approved a head whose changes `head`'s are too, by `diff_id`: a
     /// stack layer the layers below moved. Its approval holds for `head`, which is not reviewed
     /// again. False if it holds for no other head.
@@ -364,6 +377,29 @@ impl ReviewStore for PgStore {
             .next())
     }
 
+    async fn review_at_head(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+        head: &str,
+    ) -> Result<Option<ReviewRecord>> {
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM agent_reviews
+             WHERE installation_id = $1 AND repo = $2 AND number = $3 AND head_sha = $4
+             ORDER BY created_at DESC, id DESC LIMIT 1"
+        ))
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(pr as i64)
+        .bind(head)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(record).transpose()
+    }
+
     async fn latest_reviews(
         &self,
         installation_id: u64,
@@ -448,6 +484,22 @@ impl ReviewStore for PgStore {
         record(&row)
     }
 
+    async fn retry_author_review(&self, id: i64, head: &str, max_attempts: u32) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE agent_reviews
+             SET status = 'pending', error = NULL, author_attempts = author_attempts + 1,
+                 claimed_at = NULL, retry_at = NULL, updated_at = now()
+             WHERE id = $1 AND head_sha = $2 AND status = 'asks' AND error IS NOT NULL
+               AND author_attempts < $3",
+        )
+        .bind(id)
+        .bind(head)
+        .bind(max_attempts as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     async fn carry_unchanged(
         &self,
         installation_id: u64,
@@ -479,8 +531,9 @@ impl ReviewStore for PgStore {
 
     async fn claim_review(&self, stale: Duration) -> Result<Option<ReviewRecord>> {
         let row = sqlx::query(concat!(
-            "UPDATE agent_reviews SET status = 'running', claim = claim + 1, claimed_at = now(),
-                 updated_at = now()
+            "UPDATE agent_reviews SET status = 'running', claim = claim + 1,
+                 attempts = attempts + CASE WHEN status = 'running' THEN 1 ELSE 0 END,
+                 claimed_at = now(), updated_at = now()
              WHERE id = (
                  SELECT id FROM agent_reviews
                  WHERE (status = 'pending' AND (retry_at IS NULL OR retry_at <= now()))
@@ -1193,6 +1246,133 @@ mod tests {
         assert_eq!(
             outcomes(&r),
             [Some(Outcome::Wrong), Some(Outcome::Wrong), None]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn author_retries_are_atomic_exact_head_and_independently_bounded(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let review = store
+            .start_review(1, &repo(), 7, "head-a", None)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .retry_author_review(review.id, "head-a", 3)
+                .await
+                .unwrap(),
+            "pending is not failed"
+        );
+        for attempt in 0..=3 {
+            let claimed = store
+                .claim_review(Duration::from_secs(600))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !store
+                    .retry_author_review(review.id, "head-a", 3)
+                    .await
+                    .unwrap(),
+                "running is not failed"
+            );
+            let failed = ReviewDone {
+                status: ReviewStatus::Asks,
+                error: Some("worker timeout".into()),
+                summary: String::new(),
+                findings: vec![],
+                asked: vec![],
+            };
+            assert!(
+                store
+                    .finish_review(review.id, claimed.claim, &failed)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .retry_author_review(review.id, "head-b", 3)
+                    .await
+                    .unwrap(),
+                "wrong head"
+            );
+            let (first, duplicate) = tokio::join!(
+                store.retry_author_review(review.id, "head-a", 3),
+                store.retry_author_review(review.id, "head-a", 3),
+            );
+            let successes = u8::from(first.unwrap()) + u8::from(duplicate.unwrap());
+            assert_eq!(
+                successes,
+                u8::from(attempt < 3),
+                "one concurrent request at most, three retries total"
+            );
+        }
+        let fresh = store
+            .start_review(1, &repo(), 8, "approved", None)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_review(Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.id, fresh.id);
+        let approved = ReviewDone {
+            status: ReviewStatus::Approved,
+            error: None,
+            summary: String::new(),
+            findings: vec![],
+            asked: vec![],
+        };
+        assert!(
+            store
+                .finish_review(fresh.id, claim.claim, &approved)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .retry_author_review(fresh.id, "approved", 3)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn exact_head_lookup_finds_an_older_head_after_the_pr_returns_to_it(pool: PgPool) {
+        let store = PgStore::migrate(pool).await.unwrap();
+        let first = store
+            .start_review(1, &repo(), 7, "head-a", None)
+            .await
+            .unwrap();
+        store
+            .start_review(1, &repo(), 7, "head-b", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_review(1, &repo(), 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            "head-b"
+        );
+        assert_eq!(
+            store
+                .review_at_head(1, &repo(), 7, "head-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(
+            store
+                .review_at_head(1, &repo(), 7, "missing")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

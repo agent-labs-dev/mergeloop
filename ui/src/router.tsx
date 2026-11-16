@@ -58,7 +58,10 @@ const queue = createRoute({
   getParentRoute: () => workspace,
   path: "queue",
   /** The lane in view, as `owner/repo:trunk`: the first by default. */
-  validateSearch: (search): { lane?: string } => ({ lane: optional(search.lane, "string") }),
+  validateSearch: (search): { lane?: string; pr?: number } => ({
+    lane: optional(search.lane, "string"),
+    pr: optional(search.pr, "number"),
+  }),
   component: () => <Queue workspace={useWorkspace().workspace} />,
 });
 

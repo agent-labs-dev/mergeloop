@@ -1356,7 +1356,15 @@ mod tests {
         use mergepatrol_core::{Bar, Finding, Judged, Kind, Lean, ReviewStatus};
         use mergepatrol_store::{ReviewDone, ReviewStore};
         let store = PgStore::migrate(pool.clone()).await.unwrap();
-        let (router, cookie) = signed_in(pool).await;
+        let github = fake::github(|call| match call.path {
+            "/repos/o/r/git/ref/pull/7/head" => (
+                200,
+                serde_json::json!({"object":{"sha":"head"}}).to_string(),
+            ),
+            _ => (404, "{}".into()),
+        })
+        .await;
+        let (router, cookie) = with_github(pool, github).await;
         let repo = RepoName::parse("o/r").unwrap();
         let path = "/api/w/1/repos/o/r/pulls/7/agent-review";
 

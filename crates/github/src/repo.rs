@@ -31,6 +31,8 @@ pub struct RepoSnapshot {
     pub merge_methods: Vec<String>,
     /// Open PRs with the trigger label, oldest first.
     pub labeled: Vec<PullRequest>,
+    /// Open PRs with the failed label, eligible for a later author retry.
+    pub failed: Vec<PullRequest>,
     /// Queue labels the repo does not have yet.
     pub missing_labels: Vec<String>,
 }
@@ -491,6 +493,11 @@ impl RepoSnapshot {
             .into_iter()
             .map(|pr| PullRequest::from_node(pr, r))
             .collect::<Result<_>>()?;
+        let failed = prs
+            .iter()
+            .filter(|pr| queued(pr, &labels.failed))
+            .map(|pr| PullRequest::from_node(pr, r))
+            .collect::<Result<_>>()?;
         let missing_labels = [
             ("trigger", &labels.trigger),
             ("priority", &labels.priority),
@@ -525,6 +532,7 @@ impl RepoSnapshot {
             .map(|(method, _)| method.to_owned())
             .collect(),
             labeled,
+            failed,
             missing_labels,
         })
     }
@@ -587,6 +595,21 @@ impl Installation {
             prs.extend(page);
             after = next;
         }
+        // Read the failed-label connection independently, including every page.
+        let failed_query = query.replace("labels: [$label]", "labels: [$failed]");
+        let (_, failed, mut after) = self
+            .snapshot_page(repo, labels, &failed_query, Value::Null)
+            .await?;
+        prs.extend(failed);
+        while let Some(cursor) = after {
+            let (_, page, next) = self
+                .snapshot_page(repo, labels, &failed_query, cursor)
+                .await?;
+            prs.extend(page);
+            after = next;
+        }
+        prs.sort_by_key(|pr| pr["number"].as_u64());
+        prs.dedup_by_key(|pr| pr["number"].as_u64());
         Ok(SnapshotParts { repository, prs })
     }
 
@@ -1850,6 +1873,22 @@ mod tests {
         let (gh, requests) = fake::serve(vec![
             (200, "", snapshot_page(1..101, Some("c1"))),
             (200, "", snapshot_page(101..103, None)),
+            (
+                200,
+                "",
+                leak(
+                    snapshot_page(103..203, Some("f1"))
+                        .replace("\"name\":\"mp\"", "\"name\":\"mp:failed\""),
+                ),
+            ),
+            (
+                200,
+                "",
+                leak(
+                    snapshot_page(203..205, None)
+                        .replace("\"name\":\"mp\"", "\"name\":\"mp:failed\""),
+                ),
+            ),
         ])
         .await;
         let repo = RepoName::parse("o/r").unwrap();
@@ -1861,8 +1900,12 @@ mod tests {
         let snap = gh.snapshot(&repo, &labels).await.unwrap();
         let numbers: Vec<u64> = snap.labeled.iter().map(|p| p.number).collect();
         assert_eq!(numbers, (1..103).collect::<Vec<_>>());
+        assert_eq!(
+            snap.failed.iter().map(|p| p.number).collect::<Vec<_>>(),
+            (103..205).collect::<Vec<_>>()
+        );
         assert_eq!(snap.missing_labels, ["mp:priority"]);
-        assert_eq!(requests.lock().len(), 2);
+        assert_eq!(requests.lock().len(), 4);
     }
 
     #[tokio::test]

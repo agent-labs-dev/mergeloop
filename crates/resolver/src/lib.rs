@@ -291,7 +291,7 @@ find how it runs its tests in its docs and its config. {setup}"
             verify.listed()
         ),
         Verify::Configured(_) => format!(
-            "The repo declares these verify commands, which a fix must pass:\n{}\n\n{setup}",
+            "The repo declares these verify commands. Do not finish until all of these checks pass:\n{}\n\n{setup}",
             verify.listed()
         ),
     }
@@ -358,6 +358,8 @@ MergeLoop rejects a result that changes any other file.
 
 {verify}
 
+Before you finish, read the repository's contributor and agent instructions for fast pre-push checks. Run those fast checks as well as the commands above, and run the focused unit tests that cover the files you changed. Do not finish until all of these checks pass.
+
 If you cannot resolve the conflict with confidence, stop and reply with one line: \
 `{GIVE_UP} <the reason>`. Do not guess."
     )
@@ -399,6 +401,8 @@ Rules:
 - Do not refactor or improve unrelated code.
 
 {verify}
+
+Before you finish, read the repository's contributor and agent instructions for fast pre-push checks. Run those fast checks as well as the commands above, and run the focused unit tests that cover the files you changed. Do not finish until all of these checks pass.
 
 MergeLoop commits your fix. End your reply with one line: `{COMMIT} <the commit's subject>`. \
 Write it in the form the repo's commit history and its commit hooks ask for, such as a \

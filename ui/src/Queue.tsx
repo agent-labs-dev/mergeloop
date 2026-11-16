@@ -83,7 +83,9 @@ export function Queue({ workspace }: { workspace: number }) {
   // to point at an unrelated PR on narrow screens.
   if (
     requestedPr !== undefined &&
-    (current === undefined || !current.entries.some((e) => containsPr(e, requestedPr)))
+    (laneId === undefined ||
+      current === undefined ||
+      !current.entries.some((e) => containsPr(e, requestedPr)))
   ) {
     return (
       <p className="p-6 text-muted">Pull request #{requestedPr} was not found in the queue.</p>

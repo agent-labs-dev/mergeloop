@@ -51,7 +51,7 @@ export function Permalink() {
       <Navigate
         to="/$account/queue"
         params={{ account }}
-        search={{ lane: `${full}:${s.queue.trunk}` }}
+        search={{ lane: `${full}:${s.queue.trunk}`, pr: n }}
         replace
       />
     );

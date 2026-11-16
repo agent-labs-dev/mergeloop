@@ -18,6 +18,11 @@ import { Avatar, Badge, Empty, ListHead, primary, timeAgo, tints } from "./ui";
 
 const laneKey = (l: LaneView) => `${l.repo}:${l.trunk}`;
 
+const containsPr = (entry: EntryView, pr: number) =>
+  entry.number === pr ||
+  entry.layers.includes(pr) ||
+  entry.stack.some((layer) => layer.number === pr);
+
 /** How far back the lane lists a PR the queue ejected, while it is not queued again. */
 const EJECTED_DAYS = 7;
 
@@ -32,7 +37,8 @@ export function Queue({ workspace }: { workspace: number }) {
     queryFn: () => fetchLanes(workspace),
     refetchInterval: 3000,
   });
-  const current = lanes.data?.find((l) => laneKey(l) === laneId) ?? lanes.data?.[0];
+  const current =
+    laneId !== undefined ? lanes.data?.find((l) => laneKey(l) === laneId) : lanes.data?.[0];
   const exits = useQuery({
     queryKey: ["exits", workspace, current?.repo, current?.trunk],
     queryFn: async () => {
@@ -77,7 +83,7 @@ export function Queue({ workspace }: { workspace: number }) {
   // to point at an unrelated PR on narrow screens.
   if (
     requestedPr !== undefined &&
-    !lanes.data.some((l) => l.entries.some((e) => e.number === requestedPr))
+    (current === undefined || !current.entries.some((e) => containsPr(e, requestedPr)))
   ) {
     return (
       <p className="p-6 text-muted">Pull request #{requestedPr} was not found in the queue.</p>

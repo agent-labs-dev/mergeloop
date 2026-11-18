@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# The fast local check: rustfmt, clippy and the dashboard's biome check.
+# `scripts/gate --changed` lints only the crates and the dashboard that this branch's changes
+# (against origin/main, plus uncommitted work) reach. `cargo test` needs Postgres and bubblewrap,
+# so CI runs it; `CONTRIBUTING.md` says how to run it locally.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+ui=1
+packages=(--workspace)
+if [[ "${1:-}" == "--changed" ]]; then
+  base=$(git merge-base origin/main HEAD)
+  mapfile -t files < <({ git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
+  ui=0
+  workspace=0
+  packages=()
+  for f in "${files[@]}"; do
+    case "$f" in
+      ui/*) ui=1 ;;
+      Cargo.toml | Cargo.lock | clippy.toml | rust-toolchain.toml) workspace=1 ;;
+      crates/*/*)
+        dir=${f#crates/}; dir=${dir%%/*}
+        # A deleted or renamed crate has no manifest here: lint the whole workspace.
+        if [[ ! -f "crates/$dir/Cargo.toml" ]]; then workspace=1; continue; fi
+        name=$(sed -n 's/^name = "\(.*\)"/\1/p' "crates/$dir/Cargo.toml" | head -1)
+        if [[ " ${packages[*]} " != *" $name "* ]]; then packages+=(-p "$name"); fi ;;
+    esac
+  done
+  if [[ $workspace == 1 ]]; then packages=(--workspace); fi
+elif [[ $# -gt 0 ]]; then
+  echo "usage: scripts/gate [--changed]" >&2
+  exit 2
+fi
+
+cargo fmt --all --check
+if [[ ${#packages[@]} -gt 0 ]]; then
+  cargo clippy "${packages[@]}" --all-targets --locked -- -D warnings
+fi
+if [[ $ui == 1 ]]; then
+  (cd ui && pnpm check)
+fi

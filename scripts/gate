@@ -10,11 +10,13 @@ ui=1
 packages=(--workspace)
 if [[ "${1:-}" == "--changed" ]]; then
   base=$(git merge-base origin/main HEAD)
-  mapfile -t files < <({ git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
+  # A read loop rather than mapfile, which the Bash 3.2 that macOS ships lacks.
+  files=()
+  while IFS= read -r f; do files+=("$f"); done < <({ git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
   ui=0
   workspace=0
   packages=()
-  for f in "${files[@]}"; do
+  for f in ${files[@]+"${files[@]}"}; do
     case "$f" in
       ui/*) ui=1 ;;
       Cargo.toml | Cargo.lock | clippy.toml | rust-toolchain.toml) workspace=1 ;;
@@ -23,7 +25,7 @@ if [[ "${1:-}" == "--changed" ]]; then
         # A deleted or renamed crate has no manifest here: lint the whole workspace.
         if [[ ! -f "crates/$dir/Cargo.toml" ]]; then workspace=1; continue; fi
         name=$(sed -n 's/^name = "\(.*\)"/\1/p' "crates/$dir/Cargo.toml" | head -1)
-        if [[ " ${packages[*]} " != *" $name "* ]]; then packages+=(-p "$name"); fi ;;
+        if [[ " ${packages[*]+${packages[*]}} " != *" $name "* ]]; then packages+=(-p "$name"); fi ;;
     esac
   done
   if [[ $workspace == 1 ]]; then packages=(--workspace); fi

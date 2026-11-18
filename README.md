@@ -281,6 +281,20 @@ The dashboard edits the file through PRs. **Set up** opens a PR that adds a file
 
 When the file does not parse, the queue pauses, and **Settings** shows why, until the file is fixed.
 
+### Install the agent skill by hand
+
+A repo that does not use the dashboard can install the same skill itself. Both paths get the same file, the one **Set up** writes:
+
+```sh
+for dir in .agents .claude; do
+  mkdir -p "$dir/skills/mergeloop"
+  curl -fsSL https://raw.githubusercontent.com/agent-labs-dev/mergeloop/main/crates/web/src/skill.md \
+    -o "$dir/skills/mergeloop/SKILL.md"
+done
+```
+
+Delete any older copy under `skills/mergepatrol`. Run it again to update, or let **Update all** do it. `get_repo_skill` tells whether a repo's copy is current.
+
 ## From an agent, or the API
 
 MergeLoop serves an MCP server at `/mcp`, so a coding agent can do anything the dashboard does: queue a PR, take it out, read where it is and what it needs next, read the agent's review and the queue's history, change a repo's settings. Reviews, approvals and comments happen on GitHub, with `gh`. Every call acts as a GitHub user or bot: MergeLoop puts the labels on, comments, and reviews with their token, so GitHub checks they may.

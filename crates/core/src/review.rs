@@ -670,6 +670,9 @@ pub enum ReviewStatus {
     Running,
     /// Waiting for a human's answers.
     Asks,
+    /// The agent could not review, or its review could not be kept: `error` says why. Its
+    /// author may retry it, or a human reviews the PR on GitHub instead.
+    Failed,
     Approved,
     /// The agent sent findings back to the author, or a human asked for changes: it waits for
     /// a push.
@@ -684,6 +687,7 @@ impl ReviewStatus {
             ReviewStatus::Pending => "pending",
             ReviewStatus::Running => "running",
             ReviewStatus::Asks => "asks",
+            ReviewStatus::Failed => "failed",
             ReviewStatus::Approved => "approved",
             ReviewStatus::Changes => "changes",
             ReviewStatus::Stale => "stale",
@@ -695,12 +699,19 @@ impl ReviewStatus {
             ReviewStatus::Pending,
             ReviewStatus::Running,
             ReviewStatus::Asks,
+            ReviewStatus::Failed,
             ReviewStatus::Approved,
             ReviewStatus::Changes,
             ReviewStatus::Stale,
         ]
         .into_iter()
         .find(|s2| s2.as_str() == s)
+    }
+
+    /// Whether it waits for a human's review on GitHub: one that asks, or one the agent could
+    /// not make, which a human's approval or request for changes settles.
+    pub fn waits_on_a_human(self) -> bool {
+        matches!(self, ReviewStatus::Asks | ReviewStatus::Failed)
     }
 
     /// What the queue's first gate holds a PR for while its review is here, or `None` once the
@@ -712,6 +723,7 @@ impl ReviewStatus {
                 Some(Hold::Reviewing)
             }
             ReviewStatus::Asks => Some(Hold::ReviewAsks),
+            ReviewStatus::Failed => Some(Hold::ReviewFailed),
             ReviewStatus::Changes => Some(Hold::ReviewChanges),
         }
     }
@@ -958,10 +970,13 @@ impl ReviewSettings {
     }
 }
 
-/// How a review ends: a human is asked when anything goes to one or the agent could not review;
-/// else it waits for the author's push while anything is sent back; else it is approved.
+/// How a review ends: failed when the agent could not review; else a human is asked when
+/// anything goes to one; else it waits for the author's push while anything is sent back; else
+/// it is approved.
 pub fn review_status(findings: &[Judged], failed: bool) -> ReviewStatus {
-    if failed || findings.iter().any(|f| f.asked) {
+    if failed {
+        ReviewStatus::Failed
+    } else if findings.iter().any(|f| f.asked) {
         ReviewStatus::Asks
     } else if findings.iter().any(|f| f.sent_back) {
         ReviewStatus::Changes
@@ -1219,7 +1234,7 @@ mod tests {
         let s = ReviewSettings::default();
         let fine = s.judge(vec![finding(Kind::Other, 90, Lean::Fine)]);
         assert_eq!(review_status(&fine, false), ReviewStatus::Approved);
-        assert_eq!(review_status(&fine, true), ReviewStatus::Asks);
+        assert_eq!(review_status(&fine, true), ReviewStatus::Failed);
         let back = s.judge(vec![
             finding(Kind::Other, 90, Lean::Fine),
             finding(Kind::Other, 90, Lean::Change),

@@ -1439,9 +1439,13 @@ async fn sync_lane(
                 let comment = match &gate {
                     Some(g) if g.reason == reason => Some(g.comment.clone()),
                     // The agent's review, and a human's answer to it, are on the PR already. How
-                    // many comments are unresolved is not: it says so as the count changes.
+                    // many comments are unresolved is not: it says so as the count changes. Nor
+                    // is a review that failed before it could post one.
                     _ if reason.of_review()
-                        && !matches!(reason.innermost(), Hold::UnresolvedThreads { .. }) =>
+                        && !matches!(
+                            reason.innermost(),
+                            Hold::UnresolvedThreads { .. } | Hold::ReviewFailed
+                        ) =>
                     {
                         None
                     }

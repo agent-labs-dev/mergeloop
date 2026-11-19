@@ -725,10 +725,12 @@ impl Git {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// A file's text at `rev`, or `None` when it has no such file.
+    /// A file's text at `rev`, or `None` when it has no such file, or is binary: holds a NUL
+    /// byte, as git itself tells binary from text.
     pub async fn show_file(&self, wt: &Path, rev: &str, path: &str) -> Result<Option<String>> {
         let spec = format!("{rev}:{path}");
         match self.output(wt, &["show", &spec]).await {
+            Ok(out) if out.contains(&0) => Ok(None),
             Ok(out) => Ok(Some(String::from_utf8_lossy(&out).into_owned())),
             Err(_) => Ok(None),
         }
@@ -1017,6 +1019,25 @@ mod tests {
         sh(dir, &["add", file]);
         sh(dir, &["commit", "-q", "-m", file]);
         sh(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A binary file has no text to show: its bytes would carry a NUL, which Postgres refuses.
+    #[tokio::test]
+    async fn a_binary_file_has_no_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        sh(dir, &["init", "-q", "-b", "main"]);
+        commit(dir, "a.txt", "text\n");
+        let head = commit(dir, "cassette.gz", "\u{1f}\u{8b}\0\0data");
+        assert_eq!(
+            Git.show_file(dir, &head, "a.txt").await.unwrap().as_deref(),
+            Some("text\n")
+        );
+        assert_eq!(
+            Git.show_file(dir, &head, "cassette.gz").await.unwrap(),
+            None
+        );
+        assert_eq!(Git.show_file(dir, &head, "gone.txt").await.unwrap(), None);
     }
 
     /// What `publish` relies on to skip uploads: a rebase makes a new blob only for a file both

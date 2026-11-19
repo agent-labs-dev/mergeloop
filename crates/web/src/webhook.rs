@@ -170,17 +170,24 @@ impl Off {
         label: &str,
     ) -> Option<Off> {
         // Without a config file, either path's label is one a user may have meant.
-        let triggers: Vec<String> = match file {
+        let settings: Vec<RepoSettings> = match file {
             Some(_) => vec![
                 RepoSettings::from_file_at(at, file, defaults)
-                    .map_or_else(|_| at.inherit(defaults).label, |s| s.label),
+                    .unwrap_or_else(|_| at.inherit(defaults)),
             ],
             None => ConfigPath::ALL
                 .iter()
-                .map(|p| p.inherit(defaults).label)
+                .map(|p| p.inherit(defaults))
                 .collect(),
         };
-        if !triggers.iter().any(|t| t.eq_ignore_ascii_case(label)) {
+        // The trigger label queues a PR, and its priority form queues it first.
+        let queues = |s: &RepoSettings| {
+            let l = s.labels();
+            [l.trigger, l.priority]
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(label))
+        };
+        if !settings.iter().any(queues) {
             return None;
         }
         if state.is_some_and(|s| s.enabled == Some(false)) {
@@ -434,6 +441,8 @@ mod tests {
             Some(Off::NoConfig)
         );
         assert_eq!(of(None, None, "bug"), None);
+        assert_eq!(of(None, None, "mergeloop:priority"), Some(Off::NoConfig));
+        assert_eq!(of(None, None, "mergeloop:failed"), None);
         // Turned off in the dashboard: only the file's label is the trigger.
         let file = Some("label: ship\n");
         assert_eq!(

@@ -706,7 +706,9 @@ impl Git {
         Ok(lines(&self.run(wt, &args).await?))
     }
 
-    /// One file's changes from `from` to `to`, with `context` lines around each hunk.
+    /// One file's changes from `from` to `to`, with `context` lines around each hunk. A NUL, which
+    /// git shows in a file it took for text as it reads only the start, becomes U+FFFD: Postgres
+    /// refuses it in text it keeps.
     pub async fn diff_file(
         &self,
         wt: &Path,
@@ -722,7 +724,7 @@ impl Git {
                 &["diff", "--no-renames", &unified, from, to, "--", path],
             )
             .await?;
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        Ok(String::from_utf8_lossy(&out).replace('\0', "\u{FFFD}"))
     }
 
     /// A file's text at `rev`, or `None` when it has no such file, or is binary: holds a NUL
@@ -1038,6 +1040,20 @@ mod tests {
             None
         );
         assert_eq!(Git.show_file(dir, &head, "gone.txt").await.unwrap(), None);
+    }
+
+    /// Git takes a file for text from its start alone, so a NUL past that shows in its diff.
+    #[tokio::test]
+    async fn a_diff_keeps_no_nul() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        sh(dir, &["init", "-q", "-b", "main"]);
+        let base = commit(dir, "a.txt", "text\n");
+        let late = format!("{}\nend\0\n", "x".repeat(10_000));
+        let head = commit(dir, "a.txt", &late);
+        let diff = Git.diff_file(dir, &base, &head, "a.txt", 0).await.unwrap();
+        assert!(diff.contains("end\u{FFFD}"), "{diff}");
+        assert!(!diff.contains('\0'));
     }
 
     /// What `publish` relies on to skip uploads: a rebase makes a new blob only for a file both

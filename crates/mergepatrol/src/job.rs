@@ -1243,10 +1243,9 @@ struct Ran {
 const TAIL_LINES: usize = 20;
 const TAIL_BYTES: usize = 4_000;
 
-/// A command's output as text to show and keep: what is not UTF-8, and NUL, which Postgres
-/// refuses in text, become U+FFFD.
+/// A command's output as text to show and keep: what is not UTF-8, and NUL, become U+FFFD.
 fn shown(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).replace('\0', "\u{FFFD}")
+    mergepatrol_core::keepable(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Runs a command from the repo's root. One that runs past the timeout did not pass.

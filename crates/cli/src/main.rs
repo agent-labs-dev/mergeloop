@@ -31,7 +31,8 @@ Usage:
 PR is 123, owner/name#123, or a PR's URL. Without one, the current branch's PR.
 Do what a need's `brief` says, then run its `then`, until mergeloop exits 10.
 
-Exit codes: 0 a need for you, 10 merged, 11 ejected, 12 waiting on a human, 2 an error.
+Exit codes: 0 a need for you, 10 merged, 11 ejected, 12 waiting on a human (as is a repo
+whose queue does not run: `needs` is `off`, and the brief says why), 2 an error.
 
 A PR and `call` act as the first of: MERGELOOP_TOKEN; the session from `mergeloop login`
 for MERGELOOP_URL's server; `gh auth token`. A session reaches the tools for a whole

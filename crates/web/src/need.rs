@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use mergepatrol_core::RepoName;
+use mergepatrol_core::{REPO_CONFIG_PATH, RepoName};
 use mergepatrol_resolver::{COMMIT, REPLY, RESOLVE};
 use mergepatrol_store::{EventRecord, ExitRecord};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,9 @@ use ts_rs::TS;
 
 use crate::api::repo_name;
 use crate::auth::{Caller, hash};
-use crate::v1::{HoldReasonView, PullStateView, QueueStateView, RepoStateView};
+use crate::v1::{
+    HoldReasonView, PullStateView, QueueStateView, RepoStateView, RepoStatusView, SwitchView,
+};
 use crate::{ApiError, AppState};
 
 /// The longest a call waits for something new. The load balancer allows an hour.
@@ -54,7 +56,8 @@ pub enum NeedKind {
 
 impl NeedKind {
     /// The `mergeloop` CLI's exit code for it: 0 for work to do, a failed review to retry
-    /// included, 10 merged, 11 ejected, 12 waiting on a human, 2 for a queue that cannot take it.
+    /// included, 10 merged, 11 ejected, 12 waiting on a human. A repo whose queue does not run
+    /// waits on one too: only a human sets it up. 2 is the CLI's own, for an error.
     fn exit_code(self) -> u8 {
         match self {
             NeedKind::Queue
@@ -65,8 +68,7 @@ impl NeedKind {
             | NeedKind::ReviewFailed => 0,
             NeedKind::Merged => 10,
             NeedKind::Ejected => 11,
-            NeedKind::Human | NeedKind::Removed => 12,
-            NeedKind::Off => 2,
+            NeedKind::Human | NeedKind::Removed | NeedKind::Off => 12,
         }
     }
 }
@@ -229,11 +231,7 @@ fn need(status: &PullStateView, exit: Option<&ExitRecord>) -> Need {
         detail,
     };
     if status.mergeloop.state != RepoStateView::On {
-        let why = status.mergeloop.config_error.clone().map_or_else(
-            || "MergeLoop is not installed on it, it has no config file, or the dashboard turned it off".to_owned(),
-            |e| format!("its config file does not parse: {e}"),
-        );
-        return of(NeedKind::Off, why);
+        return of(NeedKind::Off, off(&status.mergeloop));
     }
     let Some(queue) = &status.queue else {
         return match exit {
@@ -277,6 +275,28 @@ fn need(status: &PullStateView, exit: Option<&ExitRecord>) -> Need {
         kind,
         layer: hold.layer,
         detail: hold.message.clone(),
+    }
+}
+
+/// Why a repo's queue does not run, and the one thing that runs it.
+fn off(repo: &RepoStatusView) -> String {
+    // Only a queue that would run is paused by its config: an off repo's error can be stale.
+    // The error starts with the file's path, which may be the legacy one.
+    if let (RepoStateView::Paused, Some(e)) = (repo.state, &repo.config_error) {
+        return format!(
+            "its config file does not parse: {e}. A PR that fixes that file, merged outside the queue, runs it"
+        );
+    }
+    if !repo.installed {
+        return "MergeLoop's GitHub App is not installed on it. A human installs the App on the repo, from the MergeLoop dashboard".into();
+    }
+    match repo.forced {
+        Some(SwitchView::Off) => {
+            "the MergeLoop dashboard turned it off. A human turns it on there".into()
+        }
+        _ => format!(
+            "its default branch has no `{REPO_CONFIG_PATH}`. A PR that adds one, merged outside the queue, turns it on, or a human turns it on in the MergeLoop dashboard"
+        ),
     }
 }
 
@@ -330,7 +350,7 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
         ),
         NeedKind::Merged => format!("#{number} merged, as {detail}. Nothing is left to do."),
         NeedKind::Off => format!(
-            "MergeLoop does not queue {repo}: {detail}. A human sets it up, or turns it on, in the MergeLoop dashboard. Tell the user."
+            "MergeLoop does not queue {repo}: {detail}. Nothing here is yours to do unless the user asks: tell them."
         ),
     }
 }
@@ -405,7 +425,7 @@ Leave each thread MergeLoop's review marked **For a human** to them: resolving i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1::{EjectedView, HoldView, MergedView, QueueView, RepoStatusView};
+    use crate::v1::{EjectedView, HoldView, MergedView, QueueView};
 
     /// The need as an agent that acts on GitHub itself reads it.
     fn view(
@@ -503,11 +523,86 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_whose_queue_does_not_run_needs_a_human() {
-        let mut off = status(None);
-        off.mergeloop.state = RepoStateView::Off;
-        let v = view(off, None, None, None);
-        assert_eq!((v.needs, v.exit_code), (NeedKind::Off, 2));
+    fn a_repo_whose_queue_does_not_run_needs_a_human_and_says_why() {
+        let base = status(None).mergeloop;
+        let cases = [
+            (
+                RepoStatusView {
+                    installed: false,
+                    ..base.clone()
+                },
+                "GitHub App is not installed",
+            ),
+            (
+                RepoStatusView {
+                    forced: Some(SwitchView::Off),
+                    ..base.clone()
+                },
+                "dashboard turned it off",
+            ),
+            (
+                RepoStatusView {
+                    has_config: false,
+                    ..base.clone()
+                },
+                "has no `.mergeloop/mergeloop.yml`",
+            ),
+            (
+                RepoStatusView {
+                    config_error: Some("bad yaml".into()),
+                    ..base.clone()
+                },
+                "does not parse: bad yaml",
+            ),
+            // The file that did not parse was deleted: the error is stale.
+            (
+                RepoStatusView {
+                    has_config: false,
+                    config_error: Some("bad yaml".into()),
+                    ..base
+                },
+                "has no `.mergeloop/mergeloop.yml`",
+            ),
+        ];
+        for (mut repo, said) in cases {
+            repo.state = match repo.config_error {
+                Some(_) if repo.has_config => RepoStateView::Paused,
+                _ => RepoStateView::Off,
+            };
+            let v = view(
+                PullStateView {
+                    mergeloop: repo,
+                    ..status(None)
+                },
+                None,
+                None,
+                None,
+            );
+            assert_eq!((v.needs, v.exit_code), (NeedKind::Off, 12));
+            assert!(v.brief.contains(said), "{said}:\n{}", v.brief);
+        }
+    }
+
+    #[test]
+    fn a_config_error_names_the_file_that_does_not_parse() {
+        let mut repo = status(None).mergeloop;
+        repo.state = RepoStateView::Paused;
+        repo.config_error = Some(".mergepatrol/mergepatrol.yml: bad yaml".into());
+        let v = view(
+            PullStateView {
+                mergeloop: repo,
+                ..status(None)
+            },
+            None,
+            None,
+            None,
+        );
+        assert!(
+            v.brief.contains(".mergepatrol/mergepatrol.yml: bad yaml"),
+            "{}",
+            v.brief
+        );
+        assert!(!v.brief.contains(".mergeloop/mergeloop.yml"), "{}", v.brief);
     }
 
     #[test]

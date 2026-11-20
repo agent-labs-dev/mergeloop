@@ -1310,7 +1310,10 @@ mod tests {
             .await
             .unwrap();
         let repo = RepoName::parse("o/r").unwrap();
-        let started = store.start_review(1, &repo, 7, "head", None).await.unwrap();
+        let started = store
+            .start_review(1, &repo, 7, "head", None, None)
+            .await
+            .unwrap();
         let mut finding = review(1, true, None).findings.remove(0);
         finding.finding.evidence.as_mut().unwrap().output = "before\0after".into();
         let done = ReviewDone {

@@ -769,7 +769,7 @@ impl World {
         let head = self.pr(1).head_ref_oid;
         let r = self
             .store
-            .start_review(1, &repo(), 1, &head, None)
+            .start_review(1, &repo(), 1, &head, None, None)
             .await
             .unwrap();
         self.conclude_review(&r, finding(confidence), settings)
@@ -1397,7 +1397,7 @@ async fn approved_stack(
         let head = world.pr(n).head_ref_oid;
         let r = world
             .store
-            .start_review(1, &repo(), n, &head, None)
+            .start_review(1, &repo(), n, &head, None, None)
             .await
             .unwrap();
         world.store.finish_review(r.number, ReviewStatus::Approved);
@@ -1585,7 +1585,7 @@ async fn a_pr_pushed_to_during_the_review_gets_no_out_of_date_review() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head, None)
+        .start_review(1, &repo(), 1, &head, None, None)
         .await
         .unwrap();
     world.gh.with_mut(|s| s.push(1, "pushed"));
@@ -1618,7 +1618,7 @@ async fn the_next_review_says_what_became_of_what_the_last_sent_back() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head, None)
+        .start_review(1, &repo(), 1, &head, None, None)
         .await
         .unwrap();
     world.conclude_review(&r, fixed, &settings).await;
@@ -1661,7 +1661,7 @@ async fn a_review_that_asks_a_human_comments_and_dismisses_what_it_sent_back() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head, None)
+        .start_review(1, &repo(), 1, &head, None, None)
         .await
         .unwrap();
     let asks = Finding {

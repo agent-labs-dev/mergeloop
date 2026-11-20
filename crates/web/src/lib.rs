@@ -1231,7 +1231,7 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .start_review(1, &key.repo, number, "h", None)
+                .start_review(1, &key.repo, number, "h", None, None)
                 .await
                 .unwrap();
         }
@@ -1371,7 +1371,10 @@ mod tests {
         let (status, body) = json(&router, "GET", path, &cookie, None).await;
         assert_eq!((status, body), (StatusCode::OK, serde_json::Value::Null));
 
-        let r = store.start_review(1, &repo, 7, "head", None).await.unwrap();
+        let r = store
+            .start_review(1, &repo, 7, "head", None, None)
+            .await
+            .unwrap();
         let claim = store
             .claim_review(std::time::Duration::from_secs(60))
             .await

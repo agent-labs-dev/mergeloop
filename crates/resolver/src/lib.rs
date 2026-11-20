@@ -141,6 +141,9 @@ pub enum Scope<'a> {
     /// `base..HEAD`: the first review, or one after a rebase.
     #[default]
     Whole,
+    /// The commit of HEAD whose changes a review approved, which the author pushed more commits
+    /// on: only `<it>..HEAD` needs reviewing.
+    Approved(&'a str),
     /// What the queue's agent committed on a version already approved, as "sha subject".
     QueueCommits(&'a [String]),
     /// The head the last review sent findings back on, which HEAD descends from: only
@@ -149,13 +152,19 @@ pub enum Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    /// What a review reads: the queue's commits on an approved version, else what changed since
-    /// `reviewed`, the head findings went back on that HEAD still descends from, else all of it.
-    pub fn of(queue_commits: &'a [String], reviewed: Option<&'a str>) -> Self {
-        match (queue_commits, reviewed) {
-            ([], Some(at)) => Scope::Since(at),
-            ([], None) => Scope::Whole,
-            (commits, _) => Scope::QueueCommits(commits),
+    /// What a review reads: what the author pushed on the `approved` commit, else the queue's
+    /// commits on an approved version, else what changed since `reviewed`, the head findings
+    /// went back on that HEAD still descends from, else all of it.
+    pub fn of(
+        approved: Option<&'a str>,
+        queue_commits: &'a [String],
+        reviewed: Option<&'a str>,
+    ) -> Self {
+        match (approved, queue_commits, reviewed) {
+            (Some(at), ..) => Scope::Approved(at),
+            (None, [], Some(at)) => Scope::Since(at),
+            (None, [], None) => Scope::Whole,
+            (None, commits, _) => Scope::QueueCommits(commits),
         }
     }
 }
@@ -555,6 +564,13 @@ only `git diff {reviewed}..HEAD`, what changed since, with `git log` and `git sh
 rest of the PR only to judge it. Check the findings you sent back wherever they are, but report \
 nothing else about the rest of the PR unless what changed since breaks it: what you did not find \
 on the first pass is not the author's to fix now.\n"
+        ),
+        Scope::Approved(at) => format!(
+            "\nYou approved this PR's changes up to `{at}`, at an earlier version: a rebase may have \
+moved them since, but not changed them. Then its author pushed the commits after it. Review only \
+`git diff {at}..HEAD`, what they changed, with `git log` and `git show`, and read the rest of the \
+PR only to judge them. Report nothing about the rest of the PR unless one of these commits breaks \
+it.\n"
         ),
         Scope::QueueCommits(commits) => format!(
             "\nThis PR was approved at an earlier version. Since then the merge queue's agent \
@@ -1121,11 +1137,29 @@ mod scope_tests {
     }
 
     #[test]
-    fn the_queues_commits_then_the_reviewed_head_narrow_a_review() {
+    fn the_authors_push_then_the_queues_commits_then_the_reviewed_head_narrow_a_review() {
         let queue = ["abc Fix ci".to_owned()];
-        assert_eq!(Scope::of(&queue, Some("0ld")), Scope::QueueCommits(&queue));
-        assert_eq!(Scope::of(&[], Some("0ld")), Scope::Since("0ld"));
-        assert_eq!(Scope::of(&[], None), Scope::Whole);
+        assert_eq!(
+            Scope::of(Some("ok"), &queue, Some("0ld")),
+            Scope::Approved("ok")
+        );
+        assert_eq!(
+            Scope::of(None, &queue, Some("0ld")),
+            Scope::QueueCommits(&queue)
+        );
+        assert_eq!(Scope::of(None, &[], Some("0ld")), Scope::Since("0ld"));
+        assert_eq!(Scope::of(None, &[], None), Scope::Whole);
+    }
+
+    #[test]
+    fn a_push_on_an_approved_version_reviews_only_the_commits_after_it() {
+        let approved = with(Scope::Approved("0k"));
+        assert!(
+            approved.contains("Review only `git diff 0k..HEAD`"),
+            "{approved}"
+        );
+        assert!(approved.contains("Report nothing about the rest of the PR unless"));
+        assert!(approved.contains("git diff b4se..HEAD"));
     }
 
     #[test]

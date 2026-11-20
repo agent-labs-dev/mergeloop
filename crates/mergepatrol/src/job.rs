@@ -294,8 +294,9 @@ struct Job<'a> {
 }
 
 /// What a review goes on from, as `Task::Review` carries it: what humans answered on earlier
-/// heads, what the last review sent back, the approved head `since` (only what the queue's agent
-/// changed after it needs reading), and the head `sent_back` went back on, `reviewed`.
+/// heads, what the last review sent back, the approved commit `since` (only the commits after it
+/// need reading, the queue's agent's or the author's), and the head `sent_back` went back on,
+/// `reviewed`.
 #[derive(Default)]
 struct Earlier<'a> {
     answered: &'a [Answered],
@@ -606,15 +607,17 @@ impl Job<'_> {
             reviewed,
         } = *earlier;
         let base = git.merge_base(dir, &spec.trunk_sha, &spec.head_sha).await?;
-        let queue_commits = queue_commits(git, dir, &spec.head_sha, &base, since).await?;
-        let reviewed = since_reviewed(git, dir, spec, &base, reviewed).await?;
+        let (trunk, head) = (spec.trunk_sha.as_str(), spec.head_sha.as_str());
+        let approved = pushed_on(git, dir, trunk, head, &base, since).await?;
+        let queue_commits = queue_commits(git, dir, head, &base, since).await?;
+        let reviewed = on_base(git, dir, trunk, head, &base, reviewed).await?;
         event(events, "reviewing", reviewing(&base, &spec.head_sha, depth));
         let bench = self.bench();
         let review_in = |workdir: PathBuf, name: String| {
             let transcript = out
                 .join("transcripts")
                 .join(format!("{name}-{}.jsonl", &spec.head_sha[..12]));
-            let (base, scope) = (base.as_str(), Scope::of(&queue_commits, reviewed));
+            let (base, scope) = (base.as_str(), Scope::of(approved, &queue_commits, reviewed));
             async move {
                 let req = ReviewRequest {
                     workdir: &workdir,
@@ -780,19 +783,38 @@ async fn queue_commits(
     git.commits_with(dir, from, head, &AGENT_TRAILERS).await
 }
 
-/// `at`, the head findings went back on, while all that lies between it and the PR's head is the
-/// author's: a rebase leaves it behind, and a merge of the trunk moves the PR's `base`.
-async fn since_reviewed<'a>(
+/// `since`, the approved commit, once the author pushed on it: not every commit after it is the
+/// queue's agent's.
+async fn pushed_on<'a>(
     git: &Git,
     dir: &Path,
-    spec: &JobSpec,
+    trunk: &str,
+    head: &str,
+    base: &str,
+    since: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    let Some(at) = on_base(git, dir, trunk, head, base, since).await? else {
+        return Ok(None);
+    };
+    let after = git.commits_with(dir, at, head, &[]).await?;
+    let queue = git.commits_with(dir, at, head, &AGENT_TRAILERS).await?;
+    Ok((after.len() > queue.len()).then_some(at))
+}
+
+/// `at`, while the PR's head descends from it on the same base: a rebase leaves it behind, and a
+/// merge of the trunk moves the PR's `base`.
+async fn on_base<'a>(
+    git: &Git,
+    dir: &Path,
+    trunk: &str,
+    head: &str,
     base: &str,
     at: Option<&'a str>,
 ) -> Result<Option<&'a str>> {
-    let Some(at) = on_head(git, dir, &spec.head_sha, at).await? else {
+    let Some(at) = on_head(git, dir, head, at).await? else {
         return Ok(None);
     };
-    let same_base = git.merge_base(dir, &spec.trunk_sha, at).await? == base;
+    let same_base = git.merge_base(dir, trunk, at).await? == base;
     Ok(same_base.then_some(at))
 }
 
@@ -1355,6 +1377,43 @@ mod tests {
         let gave_up = Outcome::GaveUp("no access".into());
         let why = parse_review(&gave_up, text).unwrap_err().to_string();
         assert_eq!(why, "the agent gave up: no access");
+    }
+
+    #[tokio::test]
+    async fn the_authors_commits_on_an_approved_one_are_what_a_review_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = |cmd: &str| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{cmd}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        sh(
+            "git init -q && git config user.email t@t && git config user.name t \
+            && git commit -q --allow-empty -m base \
+            && git commit -q --allow-empty -m pr \
+            && git commit -q --allow-empty -m 'fix: lint' -m 'Fixed-by: mergeloop'",
+        );
+        let base = sh("git rev-parse HEAD~2");
+        let (approved, fixed) = (sh("git rev-parse HEAD~1"), sh("git rev-parse HEAD"));
+        sh("git commit -q --allow-empty -m 'the author, after'");
+        let pushed = sh("git rev-parse HEAD");
+        let on = |head, since| pushed_on(&Git, dir.path(), &base, head, &base, since);
+        assert_eq!(on(&pushed, None).await.unwrap(), None);
+        assert_eq!(
+            on(&fixed, Some(&approved)).await.unwrap(),
+            None,
+            "the queue's fix alone"
+        );
+        assert_eq!(
+            on(&pushed, Some(&approved)).await.unwrap(),
+            Some(approved.as_str())
+        );
+        let gone = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(on(&pushed, Some(gone)).await.unwrap(), None, "not in it");
     }
 
     #[tokio::test]

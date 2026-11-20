@@ -25,6 +25,10 @@ pub trait GitHub: Send + Sync {
     /// What `head` changes since it left `base`, as an id a restack keeps. `None` when
     /// GitHub does not show the whole diff.
     async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>>;
+    /// The commits `head` has since it left `base`, oldest first. `None` when they are not one
+    /// line of commits, or GitHub may list only some.
+    async fn commits(&self, repo: &RepoName, base: &str, head: &str)
+    -> Result<Option<Vec<String>>>;
     /// Whether workflow runs on `sha` wait for a maintainer's approval.
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool>;
     /// Whether PR `number` changes a file under `dir`.
@@ -139,6 +143,14 @@ impl GitHub for Installation {
     }
     async fn diff_id(&self, repo: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
         Installation::diff_id(self, repo, base, head).await
+    }
+    async fn commits(
+        &self,
+        repo: &RepoName,
+        base: &str,
+        head: &str,
+    ) -> Result<Option<Vec<String>>> {
+        Installation::commits(self, repo, base, head).await
     }
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool> {
         Installation::awaiting_approval(self, repo, sha).await

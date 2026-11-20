@@ -39,6 +39,16 @@ use serde::{Deserialize, Serialize};
 
 pub type PrNumber = u64;
 
+/// Text as Postgres can keep it: `text` and `jsonb` refuse U+0000, so each becomes U+FFFD, as a
+/// byte that is not UTF-8 does.
+pub fn keepable(text: String) -> String {
+    if text.contains('\0') {
+        text.replace('\0', "\u{FFFD}")
+    } else {
+        text
+    }
+}
+
 /// The trailer on every commit the fix agent makes, before the agent's name.
 pub const FIXED_BY: &str = "Fixed-by: mergeloop";
 /// The trailer of a commit whose conflict the agent resolved in a rebase.

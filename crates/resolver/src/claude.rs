@@ -130,10 +130,12 @@ impl Run {
         Resolution {
             turns: self.turns,
             cost_usd: result.and_then(cost_usd),
-            text: result
-                .and_then(|r| r["result"].as_str())
-                .unwrap_or_default()
-                .to_owned(),
+            text: mergepatrol_core::keepable(
+                result
+                    .and_then(|r| r["result"].as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
             outcome: outcome(ended, result),
         }
     }

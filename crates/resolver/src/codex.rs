@@ -166,7 +166,7 @@ impl Run {
             // Codex reports tokens, not what they cost.
             cost_usd: self.usage.zip(priced).and_then(|(u, m)| u.cost_usd(m)),
             outcome: self.outcome(ended),
-            text: self.last_message,
+            text: mergepatrol_core::keepable(self.last_message),
         }
     }
 

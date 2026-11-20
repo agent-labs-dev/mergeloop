@@ -97,7 +97,22 @@ pub fn reply_json<T: DeserializeOwned>(outcome: &Outcome, text: &str) -> Result<
         (Some(start), Some(end)) if start < end => &text[start..=end],
         _ => bail!("the agent's review is not JSON"),
     };
-    serde_json::from_str(json).context("the agent's review does not parse")
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).context("the agent's review does not parse")?;
+    keep_strings(&mut value);
+    serde_json::from_value(value).context("the agent's review does not parse")
+}
+
+/// Makes each string in an agent's JSON keepable: it may write a NUL as `\u0000`, as when it
+/// quotes a binary file.
+fn keep_strings(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => *s = mergepatrol_core::keepable(std::mem::take(s)),
+        Value::Array(items) => items.iter_mut().for_each(keep_strings),
+        Value::Object(fields) => fields.values_mut().for_each(keep_strings),
+        _ => {}
+    }
 }
 
 /// What the builder's next run is told of the reviewer's findings.
@@ -148,6 +163,15 @@ mod tests {
             review_build_findings(&Outcome::Resolved, "{\"findings\": []}").unwrap(),
             []
         );
+    }
+
+    /// An agent that quotes a binary file writes NUL as `\u0000`, which Postgres refuses.
+    #[test]
+    fn a_nul_an_agent_writes_in_its_json_is_kept_as_u_fffd() {
+        let text =
+            r#"{"findings": [{"file": "a.gz", "line": 1, "finding": "reads \u0000\u001f"}]}"#;
+        let found = review_build_findings(&Outcome::Resolved, text).unwrap();
+        assert_eq!(found[0].finding, "reads \u{FFFD}\u{1f}");
     }
 
     #[test]

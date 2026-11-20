@@ -285,7 +285,7 @@ async fn retry_after_error(
                 review.id,
                 review.claim,
                 &ReviewDone {
-                    status: ReviewStatus::Asks,
+                    status: ReviewStatus::Failed,
                     error: Some(error.clone()),
                     summary: summary.into(),
                     findings: Vec::new(),
@@ -568,7 +568,7 @@ async fn judge(
     }
     let status = review_status(&findings, error.is_some());
     let asked = match status {
-        ReviewStatus::Asks => askees(gh, &r.repo, pr, &findings).await,
+        ReviewStatus::Asks | ReviewStatus::Failed => askees(gh, &r.repo, pr, &findings).await,
         _ => Vec::new(),
     };
     Ok(ReviewDone {
@@ -1026,7 +1026,7 @@ fn review_body(mention: &str, repo: &RepoName, number: PrNumber, done: &ReviewDo
     let mut body = String::from("**MergeLoop's review**");
     if let Some(why) = &done.error {
         body.push_str(&format!(
-            "\n\nThe agent could not review this PR: {}\n\nA human reviews it instead: approve it, or request changes, here on GitHub.",
+            "\n\nThe agent could not review this PR: {}\n\nIts author can retry the review with `mergeloop call retry_agent_review`, or a human reviews it instead: approve it, or request changes, here on GitHub.",
             clip(why, TEXT_CHARS)
         ));
         return body;
@@ -1344,7 +1344,7 @@ mod tests {
                 .await
                 .unwrap();
             } else {
-                assert_eq!(saved.status, ReviewStatus::Asks);
+                assert_eq!(saved.status, ReviewStatus::Failed);
                 assert!(saved.error.unwrap().contains("unsupported Unicode escape"));
                 assert!(saved.summary.contains("could not complete"));
                 assert!(saved.findings.is_empty());

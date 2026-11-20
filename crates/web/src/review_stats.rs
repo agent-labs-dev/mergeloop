@@ -126,7 +126,7 @@ fn reviews_to_pass(of: &[&ReviewRecord]) -> Option<u32> {
     for r in of {
         match r.status {
             ReviewStatus::Approved => return Some(n + 1),
-            ReviewStatus::Changes | ReviewStatus::Asks => n += 1,
+            ReviewStatus::Changes | ReviewStatus::Asks | ReviewStatus::Failed => n += 1,
             _ => {}
         }
     }
@@ -152,7 +152,7 @@ fn rounds(each: impl Iterator<Item = Option<u32>>) -> RoundsView {
 }
 
 fn humans(prs: &[Vec<&ReviewRecord>]) -> HumanTimeView {
-    let asked = |r: &&ReviewRecord| r.status == ReviewStatus::Asks || r.answered_by.is_some();
+    let asked = |r: &&ReviewRecord| r.status.waits_on_a_human() || r.answered_by.is_some();
     let mut waits: Vec<u32> = prs.iter().flatten().filter_map(|r| r.waited_secs).collect();
     waits.sort_unstable();
     HumanTimeView {

@@ -213,8 +213,10 @@ function lastEjected(exits: ExitView[], lane: LaneView): ExitView[] {
 /** A held PR that is getting ready or waits on the agent's review or its threads, not on
  * GitHub's own rules. */
 const heldByReview = (e: EntryView) => reviewBadge(e) !== null;
-/** A PR the agent's review asks a human about: the one thing here that a person can move. */
-const asks = (e: EntryView) => e.hold?.reason === "review_asks";
+/** A PR the agent's review asks a human about, or failed to review: the one thing here that a
+ * person can move. */
+const asks = (e: EntryView) =>
+  e.hold?.reason === "review_asks" || e.hold?.reason === "review_failed";
 
 const stateBadge: Record<EntryView["state"], [string, string]> = {
   active: ["Starting", tints.blue],
@@ -636,7 +638,11 @@ function stageColor(e: EntryView, i: number) {
   if (i < at) return "bg-ok";
   if (i > at) return "bg-line-strong/50";
   if (e.state === "waiting") return "bg-ok";
-  if (e.hold?.reason === "review_asks" || e.hold?.reason === "review_changes")
+  if (
+    e.hold?.reason === "review_asks" ||
+    e.hold?.reason === "review_failed" ||
+    e.hold?.reason === "review_changes"
+  )
     return "bg-amber-500";
   return "bg-blue-500 motion-safe:animate-pulse";
 }

@@ -40,6 +40,8 @@ pub enum Hold {
     Reviewing,
     /// The agent's review asks a human about what it was not sure of.
     ReviewAsks,
+    /// The agent's review failed: its author may retry it, or a human reviews the PR instead.
+    ReviewFailed,
     /// The agent sent findings back to the author, or a human answering its review asked for
     /// changes: it waits for a push, or for the author to resolve the review's threads.
     ReviewChanges,
@@ -69,6 +71,7 @@ impl Hold {
         match self.innermost() {
             Hold::Reviewing
             | Hold::ReviewAsks
+            | Hold::ReviewFailed
             | Hold::ReviewChanges
             | Hold::UnresolvedThreads { .. } => true,
             Hold::PrepRebasing
@@ -154,6 +157,9 @@ impl fmt::Display for Hold {
             Hold::ReviewAsks => {
                 f.write_str("the agent's review asks a human, in its threads on GitHub, about what it was not sure of")
             }
+            Hold::ReviewFailed => f.write_str(
+                "the agent's review failed, and `get_agent_review` says why: the PR's author can retry it with `retry_agent_review`, or a human reviews the PR on GitHub instead, approving it or requesting changes",
+            ),
             Hold::ReviewChanges => f.write_str(
                 "its review sent changes back to the author: it goes on once they resolve each comment, or push and it is reviewed again",
             ),

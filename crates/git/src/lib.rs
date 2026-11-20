@@ -706,7 +706,9 @@ impl Git {
         Ok(lines(&self.run(wt, &args).await?))
     }
 
-    /// One file's changes from `from` to `to`, with `context` lines around each hunk.
+    /// One file's changes from `from` to `to`, with `context` lines around each hunk. A NUL, which
+    /// git shows in a file it took for text as it reads only the start, becomes U+FFFD: Postgres
+    /// refuses it in text it keeps.
     pub async fn diff_file(
         &self,
         wt: &Path,
@@ -722,13 +724,15 @@ impl Git {
                 &["diff", "--no-renames", &unified, from, to, "--", path],
             )
             .await?;
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        Ok(String::from_utf8_lossy(&out).replace('\0', "\u{FFFD}"))
     }
 
-    /// A file's text at `rev`, or `None` when it has no such file.
+    /// A file's text at `rev`, or `None` when it has no such file, or is binary: holds a NUL
+    /// byte, as git itself tells binary from text.
     pub async fn show_file(&self, wt: &Path, rev: &str, path: &str) -> Result<Option<String>> {
         let spec = format!("{rev}:{path}");
         match self.output(wt, &["show", &spec]).await {
+            Ok(out) if out.contains(&0) => Ok(None),
             Ok(out) => Ok(Some(String::from_utf8_lossy(&out).into_owned())),
             Err(_) => Ok(None),
         }
@@ -1017,6 +1021,39 @@ mod tests {
         sh(dir, &["add", file]);
         sh(dir, &["commit", "-q", "-m", file]);
         sh(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A binary file has no text to show: its bytes would carry a NUL, which Postgres refuses.
+    #[tokio::test]
+    async fn a_binary_file_has_no_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        sh(dir, &["init", "-q", "-b", "main"]);
+        commit(dir, "a.txt", "text\n");
+        let head = commit(dir, "cassette.gz", "\u{1f}\u{8b}\0\0data");
+        assert_eq!(
+            Git.show_file(dir, &head, "a.txt").await.unwrap().as_deref(),
+            Some("text\n")
+        );
+        assert_eq!(
+            Git.show_file(dir, &head, "cassette.gz").await.unwrap(),
+            None
+        );
+        assert_eq!(Git.show_file(dir, &head, "gone.txt").await.unwrap(), None);
+    }
+
+    /// Git takes a file for text from its start alone, so a NUL past that shows in its diff.
+    #[tokio::test]
+    async fn a_diff_keeps_no_nul() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        sh(dir, &["init", "-q", "-b", "main"]);
+        let base = commit(dir, "a.txt", "text\n");
+        let late = format!("{}\nend\0\n", "x".repeat(10_000));
+        let head = commit(dir, "a.txt", &late);
+        let diff = Git.diff_file(dir, &base, &head, "a.txt", 0).await.unwrap();
+        assert!(diff.contains("end\u{FFFD}"), "{diff}");
+        assert!(!diff.contains('\0'));
     }
 
     /// What `publish` relies on to skip uploads: a rebase makes a new blob only for a file both

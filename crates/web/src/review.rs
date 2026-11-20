@@ -21,7 +21,7 @@ use crate::{ApiError, AppState};
 const AUTHOR_REVIEW_RETRIES: u32 = 3;
 
 fn retryable_author_review(review: &ReviewRecord, head: &str) -> bool {
-    review.head_sha == head && review.status == ReviewStatus::Asks && review.error.is_some()
+    review.head_sha == head && review.status == ReviewStatus::Failed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -285,6 +285,8 @@ pub enum AgentReviewStatusView {
     Pending,
     Running,
     Asks,
+    /// The agent could not review: `error` says why.
+    Failed,
     Approved,
     Changes,
     Stale,
@@ -296,6 +298,7 @@ impl From<ReviewStatus> for AgentReviewStatusView {
             ReviewStatus::Pending => Self::Pending,
             ReviewStatus::Running => Self::Running,
             ReviewStatus::Asks => Self::Asks,
+            ReviewStatus::Failed => Self::Failed,
             ReviewStatus::Approved => Self::Approved,
             ReviewStatus::Changes => Self::Changes,
             ReviewStatus::Stale => Self::Stale,
@@ -718,7 +721,7 @@ impl From<&ReviewRecord> for ReviewBriefView {
             cleared: r.findings.len() as u32 - asks - sent_back,
             asked: r.asked.clone(),
             answered_by: r.answered_by.clone(),
-            failed: r.error.is_some() && r.status == ReviewStatus::Asks,
+            failed: r.status == ReviewStatus::Failed,
         }
     }
 }
@@ -822,12 +825,13 @@ mod tests {
     #[test]
     fn author_retry_requires_failed_review_of_exact_head() {
         let mut review = record(Vec::new(), BTreeMap::new());
+        review.status = ReviewStatus::Failed;
         review.error = Some("reviewer timed out".into());
         assert!(retryable_author_review(&review, "h"));
         assert!(!retryable_author_review(&review, "new"));
-        review.error = None;
+        // A review that asks a human is answered, not retried.
+        review.status = ReviewStatus::Asks;
         assert!(!retryable_author_review(&review, "h"));
-        review.error = Some("reviewer timed out".into());
         review.status = ReviewStatus::Approved;
         assert!(!retryable_author_review(&review, "h"));
     }

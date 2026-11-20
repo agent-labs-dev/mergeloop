@@ -178,6 +178,8 @@ pub enum HoldReasonView {
     Reviewing,
     /// The agent's review asks a human about what it was not sure of.
     ReviewAsks,
+    /// The agent's review failed: its author may retry it, or a human reviews the PR instead.
+    ReviewFailed,
     /// The agent sent findings back to the author, or a human asked for changes: it waits for
     /// the author.
     ReviewChanges,
@@ -232,6 +234,7 @@ impl From<&Hold> for HoldView {
             Hold::PrepFixing => HoldReasonView::PrepFixing,
             Hold::Reviewing => HoldReasonView::Reviewing,
             Hold::ReviewAsks => HoldReasonView::ReviewAsks,
+            Hold::ReviewFailed => HoldReasonView::ReviewFailed,
             Hold::ReviewChanges => HoldReasonView::ReviewChanges,
             Hold::UnresolvedThreads { .. } => HoldReasonView::UnresolvedThreads,
             Hold::Layer { .. } => unreachable!("innermost is no layer"),

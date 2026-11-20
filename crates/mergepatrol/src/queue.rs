@@ -930,19 +930,32 @@ async fn review_hold(
                         None
                     }
                 };
-                let carried = match &diff_id {
-                    Some(id) => {
+                let unreviewed =
+                    unreviewed(ctx, gh, key, number, base, head, diff_id.as_deref()).await?;
+                let carried = match &unreviewed {
+                    Unreviewed::Nothing { approved } => {
                         ctx.store
-                            .carry_unchanged(key.installation_id, &key.repo, number, head, id)
+                            .carry_review(key.installation_id, &key.repo, number, approved, head)
                             .await?
                     }
-                    None => false,
+                    _ => false,
                 };
                 if carried {
                     let why = "its changes are those of the head it approved";
                     record(ctx, key, number, "review-carried", why).await?;
                     ReviewStatus::Approved
                 } else {
+                    let since = match unreviewed {
+                        Unreviewed::After(at) => {
+                            let why = format!(
+                                "it approved the changes up to {}: only the commits pushed after it are reviewed",
+                                &at[..7.min(at.len())]
+                            );
+                            record(ctx, key, number, "review-since", &why).await?;
+                            Some(at)
+                        }
+                        _ => None,
+                    };
                     let r = ctx
                         .store
                         .start_review(
@@ -951,6 +964,7 @@ async fn review_hold(
                             number,
                             head,
                             diff_id.as_deref(),
+                            since.as_deref(),
                         )
                         .await?;
                     // Woken by the caller once the lane is saved: a PR just queued is in it then.
@@ -974,6 +988,94 @@ async fn review_hold(
         }
     }
     Ok(Hold::of_reviews(stacked, statuses).or(unresolved_hold))
+}
+
+/// What of a PR's new head the agent has yet to review.
+#[derive(Debug, PartialEq)]
+enum Unreviewed {
+    /// Nothing: it changes what the head `approved` did, as a rebase keeps them.
+    Nothing {
+        approved: String,
+    },
+    /// The commits after this one of the head, which changes what an approved head did: the
+    /// author pushed them on top, after a rebase or without one.
+    After(String),
+    All,
+}
+
+/// What of PR `number`'s new `head` the agent has yet to review, from the PR's newest finished
+/// review, once that approved. `base` is where the PR's changes start, and `diff_id` the id of
+/// `head`'s. A head whose older commits changed, as an amend, a squash or a resolved conflict
+/// does, is reviewed whole, as is one GitHub cannot say enough about.
+async fn unreviewed(
+    ctx: &Ctx,
+    gh: &dyn GitHub,
+    key: &LaneKey,
+    number: PrNumber,
+    base: &str,
+    head: &str,
+    diff_id: Option<&str>,
+) -> Result<Unreviewed> {
+    let reviews = ctx
+        .store
+        .reviews_of(key.installation_id, &key.repo, number, u32::MAX)
+        .await?;
+    // A review that has yet to finish is of a head the PR left.
+    let finished = reviews.into_iter().find(|r| {
+        !matches!(
+            r.status,
+            ReviewStatus::Pending | ReviewStatus::Running | ReviewStatus::Stale
+        )
+    });
+    let Some(approved) = finished.filter(|r| r.status == ReviewStatus::Approved) else {
+        return Ok(Unreviewed::All);
+    };
+    let Some(id) = approved.diff_id.as_deref() else {
+        return Ok(Unreviewed::All);
+    };
+    if diff_id == Some(id) {
+        return Ok(Unreviewed::Nothing {
+            approved: approved.head_sha,
+        });
+    }
+    let after = approved_within(gh, &key.repo, base, &approved.head_sha, id, head);
+    Ok(match after.await {
+        Ok(Some(at)) => Unreviewed::After(at),
+        Ok(None) => Unreviewed::All,
+        Err(e) => {
+            tracing::warn!(repo = %key.repo, pr = number, error = %format!("{e:#}"), "could not read the PR's commits");
+            Unreviewed::All
+        }
+    })
+}
+
+/// The commit of `head` whose changes are those of `approved`, whose diff id is `id`, with more
+/// commits on top of it: as many commits from `base` as `approved` has.
+async fn approved_within(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    base: &str,
+    approved: &str,
+    id: &str,
+    head: &str,
+) -> Result<Option<String>> {
+    let Some(was) = gh.commits(repo, base, approved).await? else {
+        return Ok(None);
+    };
+    let Some(now) = gh.commits(repo, base, head).await? else {
+        return Ok(None);
+    };
+    let Some(at) = was.len().checked_sub(1).and_then(|i| now.get(i)) else {
+        return Ok(None);
+    };
+    if now.len() == was.len() {
+        return Ok(None);
+    }
+    // On the approved head itself, no rebase moved it.
+    if at == approved || gh.diff_id(repo, base, at).await?.as_deref() == Some(id) {
+        return Ok(Some(at.clone()));
+    }
+    Ok(None)
 }
 
 /// Shows on GitHub that the review gate lets the PRs go on: MergeLoop dismisses the changes its

@@ -7,6 +7,7 @@ mod publish;
 mod queue;
 mod redeliver;
 mod review;
+mod slots;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +24,6 @@ use mergepatrol_github::App;
 use mergepatrol_github::setup::random_token;
 use mergepatrol_store::{BuildStore, GITHUB_APP, PgStore, Scope, Store, Vault};
 use mergepatrol_web::WebConfig;
-use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, ExecutorConfig};
@@ -179,7 +179,7 @@ async fn orchestrator() -> Result<()> {
         executor,
         proxy: proxy.clone(),
         chatgpt: Default::default(),
-        jobs: Semaphore::new(config.max_jobs),
+        jobs: slots::JobSlots::new(config.max_jobs),
         wakers: Arc::default(),
         analytics: analytics.clone(),
         prs: Default::default(),
@@ -196,7 +196,7 @@ async fn orchestrator() -> Result<()> {
         hosted_app,
         public_url: ctx.config.public_url.clone(),
         setup_token,
-        wake: ctx.wakers.clone(),
+        wake: ctx.clone(),
         repo_defaults: ctx.config.repo_defaults.clone(),
         analytics,
         billing,

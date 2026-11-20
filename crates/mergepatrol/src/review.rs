@@ -849,20 +849,54 @@ fn fitted(render: impl Fn(bool) -> String) -> String {
     }
 }
 
+/// Terminal decoration has no meaning in Markdown. Keep the text and its indentation, without
+/// color codes, cursor commands or hyperlink targets. The stored evidence stays untouched.
+fn plain_output(output: &str) -> String {
+    struct Text(String);
+
+    impl vte::Perform for Text {
+        fn print(&mut self, c: char) {
+            self.0.push(c);
+        }
+
+        fn execute(&mut self, byte: u8) {
+            if matches!(byte, b'\n' | b'\t') {
+                self.0.push(char::from(byte));
+            }
+        }
+    }
+
+    let mut text = Text(String::with_capacity(output.len()));
+    vte::Parser::new().advance(&mut text, output.as_bytes());
+    text.0
+}
+
+/// A fence longer than every backtick run in the content keeps output and patches inside it.
+fn code_block(text: &str, language: &str) -> String {
+    let longest = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat(3.max(longest + 1));
+    format!("{fence}{language}\n{text}\n{fence}")
+}
+
 /// What MergeLoop ran on `head` to show a finding, and what it printed: the author runs the same.
 /// With `patch`, the test it wrote, whole.
 fn shows_it(e: &Evidence, head: &str, patch: bool) -> String {
+    let output = plain_output(&e.output);
     let mut text = format!(
-        "**Shows it:** MergeLoop ran `{}` on `{head}` and it failed:\n\n```\n{}\n```\n\n",
+        "**Shows it:** MergeLoop ran `{}` on `{head}` and it failed:\n\n{}\n\n",
         clip(&e.command, COMMAND_CHARS),
-        clip(e.output.trim_end(), TEXT_CHARS)
+        code_block(&clip(output.trim_end(), TEXT_CHARS), "")
     );
     let files = clip(&e.files.join(", "), COMMAND_CHARS).into_owned();
     match (e.patch.is_empty(), patch) {
         (true, _) => {}
         (false, true) => text.push_str(&format!(
-            "<details><summary>With the test it wrote, in {files}</summary>\n\n```diff\n{}\n```\n\n</details>\n\n",
-            e.patch.trim_end(),
+            "<details><summary>With the test it wrote, in {files}</summary>\n\n{}\n\n</details>\n\n",
+            code_block(e.patch.trim_end(), "diff"),
         )),
         (false, false) => text.push_str(&format!(
             "With the test it wrote, in {files}, too long to show here: the PR's review in MergeLoop has it to download.\n\n"
@@ -1406,6 +1440,60 @@ mod tests {
             assert!(body.chars().count() <= BODY_CHARS);
             assert!(body.contains("too long to show here") && !body.contains("+xxx"));
             assert!(body.contains("FAILED again"));
+        }
+    }
+
+    #[test]
+    fn evidence_in_threads_and_replies_is_plain_text() {
+        let mut f = review(1, true, None).findings.remove(0);
+        let output = concat!(
+            "\u{1b}[32m- Expected\u{1b}[39m\n",
+            "\u{1b}[31m+ Received\u{1b}[39m\n\n",
+            "\u{1b}[2m  [\u{1b}[22m\n",
+            "\u{1b}[32m-   \"after edit\",\u{1b}[39m\n",
+            "\u{1b}[31m+   \"before edit\",\u{1b}[39m\n",
+            "\u{1b}[2m  ]\u{1b}[22m\n",
+            "\t\u{1b}[36m>\u{1b}[39m test.ts:179:42 → café\n",
+            "\u{1b}]8;;https://example.com\u{1b}\\test.ts\u{1b}]8;;\u{1b}\\\n"
+        );
+        f.finding.evidence.as_mut().unwrap().output = output.into();
+        for body in [thread_body(&f, "abc1234"), still_holds(&f, "def5678")] {
+            assert!(
+                body.contains(concat!(
+                    "```\n- Expected\n+ Received\n\n",
+                    "  [\n-   \"after edit\",\n+   \"before edit\",\n  ]\n",
+                    "\t> test.ts:179:42 → café\ntest.ts\n```"
+                )),
+                "{body}"
+            );
+            assert!(!body.contains('\u{1b}'), "{body}");
+            assert!(!body.contains("https://example.com"), "{body}");
+        }
+        assert_eq!(f.finding.evidence.as_ref().unwrap().output, output);
+
+        // Terminal decoration does not consume the comment's output allowance.
+        f.finding.evidence.as_mut().unwrap().output = format!(
+            "{}readable failure",
+            "\u{1b}[32m\u{1b}[0m".repeat(TEXT_CHARS)
+        );
+        assert!(thread_body(&f, "abc1234").contains("```\nreadable failure\n```"));
+    }
+
+    #[test]
+    fn evidence_backticks_cannot_close_its_code_blocks() {
+        let mut f = review(1, true, None).findings.remove(0);
+        let e = f.finding.evidence.as_mut().unwrap();
+        e.output = "Expected markdown:\n```rust\nlet x = 1;\n```".into();
+        e.patch = "+```\n+example\n+```".into();
+        for body in [thread_body(&f, "abc1234"), still_holds(&f, "def5678")] {
+            assert!(
+                body.contains("````\nExpected markdown:\n```rust\nlet x = 1;\n```\n````"),
+                "{body}"
+            );
+            assert!(
+                body.contains("````diff\n+```\n+example\n+```\n````\n\n</details>"),
+                "{body}"
+            );
         }
     }
 

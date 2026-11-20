@@ -38,7 +38,7 @@ A PR from a fork merges only as it was when the label went on: a push to it afte
 
 A stack is one item of the queue. The label on any of its PRs queues the whole stack, and the stack waits until every PR in it is ready. MergeLoop rebases every layer when the stack is behind, and merges the stack all at once: every PR, or none. When it ejects a stack, every PR in it gets `<label>:failed`.
 
-The rebase rewrites the PR branch, and a fix adds a commit to it. Before pushing more commits to a queued PR, fetch it and rebase your work onto the remote branch. A push to a queued PR makes MergeLoop start the PR over.
+The rebase rewrites the PR branch, and a fix adds a commit to it. While the PR is queued, MergeLoop brings in its base branch: leave the rebase onto the base, and any conflict with it, to MergeLoop, even when GitHub shows the PR as conflicting. Before pushing more commits to a queued PR, fetch its branch and rebase only your new commits onto that remote branch. A push to a queued PR makes MergeLoop start the PR over: its review, and any conflict it was resolving.
 
 ## Reading its status
 
@@ -85,7 +85,7 @@ A comment is `needs-human` only for one of these: what the PR should do or inclu
 1. **Wait for the review of the current head.** Poll `pull_status` or `get_agent_review` (or the MergeLoop comment) every few minutes while it is `pending` or `running`, and don't push meanwhile, so each head gets one whole review. Check the PR's review threads at the same time.
 2. **List the unresolved threads**, and match each to the ledger. A thread that opened again is `open` again, and counts as a round.
 3. **Work each `open` one** to `fixed`, `dismissed` or `needs-human`. Batch the fixes in as few commits as you can: each push gets a new review.
-4. **Push once**, if you fixed anything. Fetch and rebase onto the remote branch first.
+4. **Push once**, if you fixed anything. Fetch the PR's branch and rebase your new commits onto it first. Leave the base branch and its conflicts to MergeLoop.
 5. **Reply in each thread you worked, and resolve the `fixed` and `dismissed` ones.** Never resolve one without a reply that says why.
 6. **Update the ledger** (below).
 7. **Go back to step 1** after a push, for the new head. Stop when no thread is unresolved but the `needs-human` ones, or the PR merged or was ejected. An ejected PR: fix the cause, push, and add `<label>` again.

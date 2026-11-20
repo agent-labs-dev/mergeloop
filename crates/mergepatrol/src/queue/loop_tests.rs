@@ -1662,7 +1662,7 @@ fn ctx(store: Arc<Mem>) -> Ctx {
         }),
         proxy: Arc::new(ApiProxy::new(Upstreams::default())),
         chatgpt: Default::default(),
-        jobs: Semaphore::new(1),
+        jobs: JobSlots::new(1),
         wakers: Arc::default(),
         analytics: Analytics::default(),
         prs: Default::default(),
@@ -2896,7 +2896,7 @@ async fn only_the_sandbox_takes_a_job_slot() {
         s.checks.insert("ci".into(), CheckState::Pending);
         s.required = vec!["ci".into()];
     }));
-    run.ctx.jobs = Semaphore::new(0);
+    run.ctx.jobs = JobSlots::new(0);
     run.gh.then(|_| {});
     run.gh.then(|s| {
         s.checks.insert("ci".into(), CheckState::Passed);
@@ -5571,4 +5571,155 @@ async fn a_stack_starts_every_layer_review_before_reporting_the_first_hold() {
     assert_eq!(run.store.newest_review(1).0, "one");
     assert_eq!(run.store.newest_review(2).0, "two");
     assert_eq!(run.store.newest_review(3).0, "three");
+}
+
+/// PR 1's branch, as a job on it fetches it, and its first head.
+const PR_1: (&str, &str) = ("refs/heads/pr-1", "pr-1-v0");
+
+static LANE: std::sync::LazyLock<LaneKey> = std::sync::LazyLock::new(|| LaneKey {
+    installation_id: 1,
+    repo: repo(),
+    trunk: "main".into(),
+});
+
+#[tokio::test]
+async fn a_job_whose_pr_moved_while_it_waited_for_a_slot_never_starts() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let held = slots.take();
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async {
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    // No webhook tells of the push: the read once the job has its slot finds it.
+    let push = async {
+        tokio::task::yield_now().await;
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        drop(held);
+    };
+    let (ran, ()) = tokio::join!(job, push);
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(slots.free(), 1, "the slot went back");
+    assert_eq!(slots.watched(1, &repo(), 1), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_told_drops_a_job_waiting_for_a_slot() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let _held = slots.take();
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async { Ok(()) });
+    let push = async {
+        tokio::task::yield_now().await;
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        slots.saw(1, &repo(), 1, "pr-1-v1");
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::join!(job, push).0
+    });
+    let ran = ran.await.expect("it waits no more for the slot");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    assert_eq!(slots.watched(1, &repo(), 1), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_told_stops_a_running_job_and_frees_its_slot() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let (dropped, ended) = tokio::sync::oneshot::channel::<()>();
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async move {
+        // The sandbox, which ends when its future is dropped.
+        let _sandbox = dropped;
+        std::future::pending::<Result<()>>().await
+    });
+    let push = async {
+        tokio::task::yield_now().await;
+        assert_eq!(slots.free(), 0, "the job runs");
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        slots.saw(1, &repo(), 1, "pr-1-v1");
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::join!(job, push).0
+    });
+    let ran = ran.await.expect("the job stopped");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    assert!(ended.await.is_err(), "the sandbox was let go");
+    assert_eq!(slots.free(), 1);
+}
+
+#[tokio::test]
+async fn a_webhook_for_a_head_github_does_not_show_leaves_the_job_running() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async {
+        finished.await?;
+        Ok("done")
+    });
+    // A late delivery, of a head the PR had before.
+    let told = async {
+        tokio::task::yield_now().await;
+        slots.saw(1, &repo(), 1, "pr-1-old");
+        tokio::task::yield_now().await;
+        // Another PR's push is not this job's.
+        slots.saw(1, &repo(), 2, "pr-2-v1");
+        finish.send(()).unwrap();
+    };
+    let (ran, ()) = tokio::join!(job, told);
+    assert_eq!(ran.unwrap(), "done");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tick_that_sees_a_pushed_head_stops_the_job_on_the_old_one() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    let job = run.ctx.jobs.run(
+        &*run.gh,
+        &LANE,
+        1,
+        PR_1,
+        std::future::pending::<Result<()>>(),
+    );
+    let push = async {
+        tokio::task::yield_now().await;
+        run.gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        run.tick().await;
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::join!(job, push).0
+    });
+    let ran = ran.await.expect("the tick stopped it");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_webhook_before_github_shows_the_push_stops_the_job_on_a_later_tick() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let job = slots.run(&*gh, &LANE, 1, PR_1, std::future::pending::<Result<()>>());
+    let push = async {
+        tokio::task::yield_now().await;
+        // Told first, while GitHub still shows the old head.
+        slots.saw(1, &repo(), 1, "pr-1-v1");
+        tokio::task::yield_now().await;
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        // Each tick tells it again; it reads GitHub for that head once a minute.
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            slots.saw(1, &repo(), 1, "pr-1-v1");
+        }
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::select! {
+            ran = job => ran,
+            () = push => unreachable!(),
+        }
+    });
+    let since = Instant::now();
+    let ran = ran.await.expect("a later tick stopped it");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    let waited = since.elapsed();
+    assert!(waited >= Duration::from_secs(60), "{waited:?}");
+    assert!(waited <= Duration::from_secs(70), "{waited:?}");
 }

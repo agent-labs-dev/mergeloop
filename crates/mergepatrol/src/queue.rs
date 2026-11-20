@@ -32,7 +32,7 @@ use mergepatrol_github::{
 use mergepatrol_store::{AgentTask, Change, GITHUB_APP, LaneKey, PgStore, Scope, Store, Vault};
 use parking_lot::Mutex;
 use secrecy::ExposeSecret;
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -43,6 +43,7 @@ use crate::github::GitHub;
 use crate::job::{GAVE_UP, LEFT_CONFLICT, RETITLED};
 use crate::publish::{Publish, create_commits, create_merge, publish};
 use crate::review::REVIEW_MARKS;
+use crate::slots::{JobSlots, Outdated};
 
 const CHECKS_POLL: Duration = Duration::from_secs(15);
 /// With no required checks, how long after a publish its checks may first count as green: a
@@ -90,7 +91,7 @@ pub struct Ctx {
     pub proxy: Arc<ApiProxy>,
     pub chatgpt: ChatGpt,
     /// Sandboxed jobs running at once, across repos. A PR waiting for its checks holds none.
-    pub jobs: Semaphore,
+    pub jobs: JobSlots,
     pub wakers: Arc<Wakers>,
     pub analytics: Analytics,
     pub prs: Prs,
@@ -247,9 +248,13 @@ impl Wakers {
     }
 }
 
-impl mergepatrol_web::Wake for Wakers {
+impl mergepatrol_web::Wake for Ctx {
     fn wake(&self, installation: u64, repo: RepoName) {
-        self.get(installation, &repo).notify_one();
+        self.wakers.wake_repo(installation, &repo);
+    }
+
+    fn pushed(&self, installation: u64, repo: &RepoName, number: PrNumber, head: &str) {
+        self.jobs.saw(installation, repo, number, head);
     }
 }
 
@@ -789,6 +794,10 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.unpinned.keep_labeled(installation, repo, &snap.labeled);
     let units = units(gh, repo, &snap.labeled).await?;
     let layers: Vec<PullRequest> = units.iter().flat_map(|u| u.layers.clone()).collect();
+    for pr in &layers {
+        ctx.jobs
+            .saw(installation, repo, pr.number, &pr.head_ref_oid);
+    }
     let saved: Vec<Lane> = lanes.iter().map(|(_, lane)| lane.clone()).collect();
     let left = saved
         .iter()
@@ -3574,34 +3583,40 @@ fn clean_moves(moved: &[usize], resolved: &[usize]) -> Vec<usize> {
     clean.copied().collect()
 }
 
-/// Runs a job in the sandbox, with its output in `out`: what it told of. `Err` says why it failed.
-async fn run_sandboxed(
-    ctx: &Ctx,
-    key: &LaneKey,
-    number: PrNumber,
-    job_id: &str,
-    spec: &JobSpec,
-    out: &Path,
-    private: bool,
-) -> Result<Vec<JobEvent>> {
-    let _ = tokio::fs::remove_dir_all(out).await;
-    record(ctx, key, number, "job", job_id).await?;
-    if let Some(b) = &ctx.billing {
-        b.job(key.installation_id, private, unix_now()).await?;
+impl JobSandbox<'_> {
+    /// Runs a job in the sandbox, with its output in `out`: what it told of. `Err` says why it
+    /// failed, `Outdated` if the PR moved off the job's head first.
+    async fn run_sandboxed(
+        &self,
+        key: &LaneKey,
+        number: PrNumber,
+        job_id: &str,
+        spec: &JobSpec,
+        out: &Path,
+        private: bool,
+    ) -> Result<Vec<JobEvent>> {
+        let ctx = self.ctx;
+        let _ = tokio::fs::remove_dir_all(out).await;
+        record(ctx, key, number, "job", job_id).await?;
+        let job = async {
+            if let Some(b) = &ctx.billing {
+                b.job(key.installation_id, private, unix_now()).await?;
+            }
+            ctx.executor
+                .run(job_id, spec, out)
+                .await
+                .context("the job failed")
+        };
+        let head = (spec.head_ref.as_str(), spec.head_sha.as_str());
+        let result = ctx.jobs.run(self.gh, key, number, head, job).await?;
+        for e in &result.events {
+            record(ctx, key, number, &e.kind, &e.message).await?;
+        }
+        if let JobOutcome::Failed { reason } = result.outcome {
+            bail!("{reason}");
+        }
+        Ok(result.events)
     }
-    let _slot = ctx.jobs.acquire().await?;
-    let result = ctx
-        .executor
-        .run(job_id, spec, out)
-        .await
-        .context("the job failed")?;
-    for e in &result.events {
-        record(ctx, key, number, &e.kind, &e.message).await?;
-    }
-    if let JobOutcome::Failed { reason } = result.outcome {
-        bail!("{reason}");
-    }
-    Ok(result.events)
 }
 
 /// Publishes the commits `base..local_head` to the PR branch, if it is still at `expected_head`.
@@ -3676,7 +3691,8 @@ impl JobSandbox<'_> {
             return Ok(Event::FixFailed(why));
         }
         let fixed = async {
-            run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?;
+            self.run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                .await?;
             let _cache = ctx.caches.lock(repo).await;
             if !self.may_publish(at, unit, &heads).await? {
                 return anyhow::Ok(Err(Event::HeadMoved));
@@ -3699,6 +3715,7 @@ impl JobSandbox<'_> {
         Ok(match fixed.await {
             Ok(Ok(sha)) => Event::Fixed { head: sha },
             Ok(Err(event)) => event,
+            Err(e) if Outdated::caused(&e) => Event::HeadMoved,
             Err(e) => {
                 let reason = format!("{e:#}");
                 match proposed_title(&reason, may_retitle) {
@@ -3848,6 +3865,9 @@ impl JobSandbox<'_> {
             // Not the PR's failure: the caller runs it again, as for any error outside the PR.
             if TimedOut::caused(&e) {
                 return Err(e);
+            }
+            if Outdated::caused(&e) {
+                return Ok(Event::HeadMoved);
             }
             if conflicts == Conflicts::Leave && format!("{e:#}").starts_with(LEFT_CONFLICT) {
                 return Ok(Event::RebaseConflict);
@@ -4056,7 +4076,9 @@ impl JobSandbox<'_> {
                 true => Update::Either,
                 false => Update::Rebase,
             };
-            let ran = run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await;
+            let ran = self
+                .run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                .await;
             let events = match ran {
                 // A replay of a long history can outlast the job: a merge does not replay it.
                 Err(e) if TimedOut::caused(&e) && spec.update == Update::Either => {
@@ -4066,7 +4088,8 @@ impl JobSandbox<'_> {
                     // The timed-out job revoked its token once it fetched.
                     spec.token = gh.read_token(&key.repo).await?;
                     let job_id = format!("{job_id}-merge");
-                    run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?
+                    self.run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                        .await?
                 }
                 ran => ran?,
             };
@@ -4536,18 +4559,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_webhook_cuts_the_wait_short_even_when_it_came_first() {
-        use mergepatrol_web::Wake;
         let wakers = Wakers::default();
         let repo = RepoName::parse("o/r").unwrap();
         let hour = Duration::from_secs(3600);
 
-        wakers.wake(1, repo.clone());
+        wakers.wake_repo(1, &repo);
         let start = tokio::time::Instant::now();
         wakers.wait(1, &repo, hour).await;
         assert_eq!(start.elapsed(), Duration::ZERO);
 
         // Another repo's webhook does not count.
-        wakers.wake(1, RepoName::parse("o/other").unwrap());
+        wakers.wake_repo(1, &RepoName::parse("o/other").unwrap());
         wakers.wait(1, &repo, hour).await;
         assert_eq!(start.elapsed(), hour);
     }

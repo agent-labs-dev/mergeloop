@@ -327,7 +327,7 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
         NeedKind::Wait => format!("Nothing for you yet: {detail}. Run `{then}`."),
         NeedKind::Threads => fill(THREADS, need, status).replace("{then}", then),
         NeedKind::Changes => format!(
-            "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch and rebase onto the remote branch, push once, and reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
+            "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch the PR's branch and rebase your new commits onto it, and push once. Leave the base branch and its conflicts to MergeLoop. Reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
         ),
         NeedKind::Draft => format!(
             "#{pr} is a draft{on}. If its work is done, publish it with `gh pr ready {pr} --repo {repo}`. If not, finish it first, or tell the user it waits on them. Then run `{then}`."
@@ -336,7 +336,7 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
             "It waits on a human: {detail}. Nothing here is yours to do. Tell the user what it waits for, then run `{then}` in the background: it returns once something changes."
         ),
         NeedKind::Ejected => format!(
-            "MergeLoop ejected #{number}: {detail}. Fix the cause on its branch, then fetch, rebase onto the remote branch, and push. Then run `{then}`, which queues it again."
+            "MergeLoop ejected #{number}: {detail}. Fix the cause on its branch, then fetch the branch, rebase your new commits onto it, and push. Then run `{then}`, which queues it again."
         ),
         NeedKind::Removed => format!(
             "#{number} was taken out of the queue ({detail}), not by a failure. Don't queue it again unless the user asks you to: if they do, run `mergeloop call queue_pull {args}`. Tell the user, then run `{then}` in the background: it returns once someone queues it again."
@@ -409,7 +409,7 @@ const THREADS: &str = "Review threads{on} hold the PR: {detail}. Work each unres
 
 1. List the unresolved review threads of #{pr}: {threads}. MergeLoop's own findings, with their ids and evidence: `mergeloop call get_agent_review {args}`.
 2. Read each thread and the code it points at. Fix it, at every place its **Also at** names, or decide it doesn't apply, for a reason the code shows: a file and line, a test, a doc. Only a call on scope, product or design, access you lack, or a change outside the repo is for a human.
-3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch and rebase onto the remote branch, then push once.
+3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch the PR's branch and rebase your new commits onto it, then push once. Leave the base branch and its conflicts to MergeLoop.
 4. Reply in each thread you worked: the fix's short SHA and one line on what changed, or the reason it doesn't apply. Then resolve it: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"ID\"}) { thread { isResolved } } }'`. Resolve only after the push. Another reviewer's thread that needs a human: reply with the decision needed and who should make it, and leave it unresolved.
 5. To have MergeLoop's reviewer settle one of its findings now, rather than on the next push, reply in its thread mentioning MergeLoop's App, as the review's summary names it, with why it doesn't apply. The agent reads the code again, answers in the thread, and withdraws the finding if your reason holds.
 
@@ -735,6 +735,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_queued_prs_push_leaves_the_base_branch_to_mergeloop() {
+        for reason in [
+            HoldReasonView::ReviewChanges,
+            HoldReasonView::UnresolvedThreads,
+            HoldReasonView::ChangesRequested,
+        ] {
+            let brief = view(status(held(reason, None)), None, None, None).brief;
+            assert!(brief.contains("push once"), "{reason:?}:\n{brief}");
+            assert!(
+                brief.contains("Leave the base branch and its conflicts to MergeLoop."),
+                "{reason:?}:\n{brief}"
+            );
         }
     }
 

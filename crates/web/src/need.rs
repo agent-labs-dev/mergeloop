@@ -276,7 +276,8 @@ fn need(status: &PullStateView, exit: Option<&ExitRecord>) -> Need {
 
 /// Why a repo's queue does not run, and the one thing that runs it.
 fn off(repo: &RepoStatusView) -> String {
-    if let Some(e) = &repo.config_error {
+    // Only a queue that would run is paused by its config: an off repo's error can be stale.
+    if let (RepoStateView::Paused, Some(e)) = (repo.state, &repo.config_error) {
         return format!(
             "its config file does not parse: {e}. A PR that fixes `{REPO_CONFIG_PATH}`, merged outside the queue, runs it"
         );
@@ -540,13 +541,25 @@ mod tests {
             (
                 RepoStatusView {
                     config_error: Some("bad yaml".into()),
-                    ..base
+                    ..base.clone()
                 },
                 "does not parse: bad yaml",
             ),
+            // The file that did not parse was deleted: the error is stale.
+            (
+                RepoStatusView {
+                    has_config: false,
+                    config_error: Some("bad yaml".into()),
+                    ..base
+                },
+                "has no `.mergeloop/mergeloop.yml`",
+            ),
         ];
         for (mut repo, said) in cases {
-            repo.state = RepoStateView::Off;
+            repo.state = match repo.config_error {
+                Some(_) if repo.has_config => RepoStateView::Paused,
+                _ => RepoStateView::Off,
+            };
             let v = view(
                 PullStateView {
                     mergeloop: repo,

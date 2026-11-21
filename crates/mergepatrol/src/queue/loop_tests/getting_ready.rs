@@ -1662,7 +1662,7 @@ async fn a_push_while_a_review_waits_or_runs_drops_it_for_the_new_head() {
         let head = world.pr(1).head_ref_oid;
         let r = world
             .store
-            .start_review(1, &repo(), 1, &head, None)
+            .start_review(1, &repo(), 1, &head, None, None)
             .await
             .unwrap();
         // Waiting: other repos' jobs hold every slot. Running: the agent works until the push.

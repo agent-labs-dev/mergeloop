@@ -2,8 +2,10 @@
 //! paused, so the waits for checks take no real time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::{Future, poll_fn};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::task::Poll;
 
 use mergepatrol_billing::{Billing, FAIR_USE_PRS, StripeConfig};
 use mergepatrol_core::{
@@ -5844,12 +5846,22 @@ async fn a_webhook_before_github_shows_the_push_stops_the_job_on_a_later_tick() 
     let gh = Fake::new(|s| s.add_pr(1));
     let slots = JobSlots::new(1);
     let job = slots.run(&*gh, &LANE, 1, PR_1, std::future::pending::<Result<()>>());
+    tokio::pin!(job);
+    assert!(
+        poll_fn(|cx| Poll::Ready(job.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    // Poll through the early notification before GitHub shows the push. A yield inside
+    // select! need not poll the other branch, so it cannot establish this ordering.
+    slots.saw(1, &repo(), 1, "pr-1-v1");
+    assert!(
+        poll_fn(|cx| Poll::Ready(job.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    gh.with_mut(|s| s.push(1, "pr-1-v1"));
     let push = async {
-        tokio::task::yield_now().await;
-        // Told first, while GitHub still shows the old head.
-        slots.saw(1, &repo(), 1, "pr-1-v1");
-        tokio::task::yield_now().await;
-        gh.with_mut(|s| s.push(1, "pr-1-v1"));
         // Each tick tells it again; it reads GitHub for that head once a minute.
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;

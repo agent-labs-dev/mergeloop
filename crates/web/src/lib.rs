@@ -928,8 +928,14 @@ mod tests {
         let res = register(serde_json::json!(["http://localhost:9999/callback"])).await;
         assert_eq!(res.status(), StatusCode::CREATED);
         assert!(json_of(res).await["client_id"].is_string());
-        // A redirect off this machine could carry the code anywhere.
-        let res = register(serde_json::json!(["https://evil.example/callback"])).await;
+        // A site, over https: the consent page names it before any code goes there.
+        let res = register(serde_json::json!([
+            "https://api.nebula.gg/mcp-servers/oauth/callback"
+        ]))
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        // Plain http off this machine, where anyone on the way could read the code.
+        let res = register(serde_json::json!(["http://evil.example/callback"])).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_of(res).await["error"], "invalid_redirect_uri");
     }
@@ -974,10 +980,10 @@ mod tests {
         assert!(back.ends_with("&state=s%20t"), "{back}");
         assert!(cookies.contains(&"mp_mcp=".to_owned()), "{cookies:?}");
 
-        // A cookie planted to send the code off this machine is not followed.
+        // A cookie planted to send the code over plain http is not followed.
         use base64::Engine;
         let planted = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({ "redirect_uri": "https://evil.example/cb", "state": null, "challenge": challenge })
+            serde_json::json!({ "redirect_uri": "http://evil.example/cb", "state": null, "challenge": challenge })
                 .to_string(),
         );
         let res = authorize(format!(
@@ -1007,9 +1013,9 @@ mod tests {
             "{back}"
         );
         assert!(back.ends_with("&state=x"), "{back}");
-        // Without a loopback redirect, nowhere.
+        // Without a loopback or https redirect, nowhere.
         let res = authorize(format!(
-            "response_type=code&client_id=c&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge={challenge}&code_challenge_method=S256"
+            "response_type=code&client_id=c&redirect_uri=http%3A%2F%2Fevil.example%2Fcb&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);

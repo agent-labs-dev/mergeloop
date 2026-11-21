@@ -902,8 +902,9 @@ pub(crate) async fn login_callback(
             let json = BASE64URL.decode(v).ok()?;
             serde_json::from_slice::<McpClient>(&json).ok()
         })
-        // Anyone who can plant a cookie can plant this one: it sends the code to this machine only.
-        .filter(|client| crate::oauth::loopback(&client.redirect_uri));
+        // Anyone who can plant a cookie can plant this one: its code still waits on the consent
+        // page, which names the site it would go to.
+        .filter(|client| crate::oauth::redirect_allowed(&client.redirect_uri));
     let mut destination = "/".to_owned();
     let result = async {
         if let Some(err) = q.error {

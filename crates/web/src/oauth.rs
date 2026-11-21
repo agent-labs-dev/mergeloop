@@ -2,8 +2,9 @@
 //! server, and signs the user in with GitHub. The access token is a MergeLoop session, as the
 //! dashboard's is, so the user's GitHub token stays on the server.
 //!
-//! Clients register themselves (RFC 7591), and must redirect to a loopback address (RFC 8252):
-//! the code never leaves the user's machine. But any program on it can start a sign-in, and
+//! Clients register themselves (RFC 7591), and redirect to a loopback address (RFC 8252), where a
+//! program on the user's machine listens, or to an `https` site, such as Nebula or claude.ai,
+//! which the consent page names. Any program or site can start a sign-in, and
 //! GitHub signs a user who signed in before back in without a question. So no code goes to a
 //! client before the user says yes on the consent page, in the browser that signed in, and a yes
 //! is never remembered: any program can register under any name.
@@ -63,13 +64,13 @@ pub(crate) struct Registration {
     client_name: Option<String>,
 }
 
-/// Registers a client (RFC 7591). Nothing is kept: a client is only its loopback redirect,
-/// which `authorize` checks again, and its name, which travels in its `client_id`.
+/// Registers a client (RFC 7591). Nothing is kept: a client is only its redirect, which
+/// `authorize` checks again, and its name, which travels in its `client_id`.
 pub(crate) async fn register(Json(r): Json<Registration>) -> Response {
-    if r.redirect_uris.is_empty() || !r.redirect_uris.iter().all(|u| loopback(u)) {
+    if r.redirect_uris.is_empty() || !r.redirect_uris.iter().all(|u| redirect_allowed(u)) {
         return oauth_error(
             "invalid_redirect_uri",
-            "MergeLoop redirects only to a loopback address, such as http://127.0.0.1:<port>/callback.",
+            "MergeLoop redirects only to a loopback address, such as http://127.0.0.1:<port>/callback, or to an https URL.",
         );
     }
     if r.client_name.as_deref().is_some_and(|n| !valid_name(n)) {
@@ -110,10 +111,10 @@ pub(crate) async fn authorize(
     Query(q): Query<AuthorizeQuery>,
 ) -> Response {
     // Without a redirect to trust, the error is the browser's to show.
-    let Some(redirect_uri) = q.redirect_uri.filter(|u| loopback(u)) else {
+    let Some(redirect_uri) = q.redirect_uri.filter(|u| redirect_allowed(u)) else {
         return (
             StatusCode::BAD_REQUEST,
-            "This sign-in link has no loopback redirect_uri.",
+            "This sign-in link has no loopback or https redirect_uri.",
         )
             .into_response();
     };
@@ -129,6 +130,10 @@ pub(crate) async fn authorize(
         && auth::valid_challenge(&client.challenge)
         && client.user_code.as_deref().is_none_or(valid_user_code);
     if !valid {
+        // A bad link must not bounce the browser from mergeloop.ai to a site it names.
+        if hosted(&client.redirect_uri).is_some() {
+            return (StatusCode::BAD_REQUEST, "This sign-in link is not valid.").into_response();
+        }
         let mut url = format!(
             "{}{}error=invalid_request&error_description={}",
             client.redirect_uri,
@@ -328,35 +333,46 @@ fn internal(e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
-/// The question, in plain words. Every client redirects to a loopback address, so every client
-/// is a program on this computer.
+/// The question, in plain words: a program on this computer, or the site the code goes to, and
+/// how the user tells it is the one they started.
 fn ask_page(client: &McpClient, login: &str, request: &str) -> String {
+    let (who, guard) = match hosted(&client.redirect_uri) {
+        Some(host) => (
+            format!("The site <strong class=\"host\">{}</strong>", escape(&host)),
+            format!(
+                "<p>Allow only if you just started this sign-in yourself, on {}.</p>",
+                escape(&host)
+            ),
+        ),
+        None => (
+            "A program on this computer".to_owned(),
+            match &client.user_code {
+                Some(code) => format!(
+                    "<p class=\"code\">Code: <strong>{}</strong></p>\
+                     <p>This code must match the one your terminal shows. If it does not, or you \
+                     did not just start this sign-in, deny it.</p>",
+                    escape(code)
+                ),
+                None => "<p><strong>No code was given.</strong> <code>mergeloop login</code> \
+                         always shows one, so this is not it. Allow only if you just started this \
+                         sign-in yourself, from the program named above.</p>"
+                    .to_owned(),
+            },
+        ),
+    };
     let name = match &client.name {
         Some(name) => format!(
-            "It calls itself <strong>{}</strong>, a name any program can give itself.",
+            "It calls itself <strong>{}</strong>, a name anyone can give it.",
             escape(name)
         ),
         None => "It gave no name.".to_owned(),
     };
-    let code = match &client.user_code {
-        Some(code) => format!(
-            "<p class=\"code\">Code: <strong>{}</strong></p>\
-             <p>This code must match the one your terminal shows. If it does not, or you did not \
-             just start this sign-in, deny it.</p>",
-            escape(code)
-        ),
-        None => "<p><strong>No code was given.</strong> <code>mergeloop login</code> always \
-                 shows one, so this is not it. Allow only if you just started this sign-in \
-                 yourself, from the program named above.</p>"
-            .to_owned(),
-    };
     format!(
         "<h1>Allow this sign-in?</h1>\
-         <p>A program on this computer asks to sign in to MergeLoop as you, \
-         <strong>{login}</strong>. {name}</p>\
+         <p>{who} asks to sign in to MergeLoop as you, <strong>{login}</strong>. {name}</p>\
          <p>If you allow it, it acts as you in MergeLoop: it can do anything you can do there, \
          in every workspace you can reach, until it goes 30 days without using the sign-in.</p>\
-         {code}\
+         {guard}\
          <form method=\"post\" action=\"/oauth/consent\">\
          <input type=\"hidden\" name=\"request\" value=\"{request}\">\
          <button name=\"decision\" value=\"deny\">Deny</button> \
@@ -396,6 +412,7 @@ fn page(status: StatusCode, body: &str) -> Response {
 const STYLE: &str = "body{font:16px/1.5 system-ui,sans-serif;margin:0;padding:16px;\
     background:#fff;color:#111}main{max-width:32rem;margin:10vh auto}\
     .code strong{font:600 1.5rem ui-monospace,monospace;letter-spacing:.1em}\
+    .host{font-family:ui-monospace,monospace}\
     button{font:inherit;padding:.5rem 1.25rem;margin-right:.5rem}\
     @media (prefers-color-scheme:dark){body{background:#111;color:#eee}}";
 
@@ -419,6 +436,26 @@ fn valid_user_code(code: &str) -> bool {
 fn oauth_error(error: &str, description: &str) -> Response {
     let body = json!({ "error": error, "error_description": description });
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
+/// Where a client may have its code sent: a program on this machine, or a site.
+pub(crate) fn redirect_allowed(uri: &str) -> bool {
+    loopback(uri) || hosted(uri).is_some()
+}
+
+/// The host of an `https` redirect, which the consent page names. None with a fragment, which
+/// would hide the code from the site, or with user info, which would hide the host from the user.
+pub(crate) fn hosted(uri: &str) -> Option<String> {
+    if uri.contains('#') {
+        return None;
+    }
+    let uri = uri.parse::<Uri>().ok()?;
+    let authority = uri.authority()?;
+    if uri.scheme_str() != Some("https") || authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host();
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// `http` to this machine: what a native app listens on. No fragment, which would hide the
@@ -449,5 +486,25 @@ mod tests {
         assert!(!loopback("https://claude.ai/api/mcp/auth_callback"));
         assert!(!loopback("/callback"));
         assert!(!loopback("http://127.0.0.1:9/cb#x"));
+    }
+
+    #[test]
+    fn redirects_to_a_site_over_https() {
+        assert_eq!(
+            hosted("https://claude.ai/api/mcp/auth_callback").as_deref(),
+            Some("claude.ai")
+        );
+        assert_eq!(
+            hosted("https://API.Nebula.gg:443/mcp-servers/oauth/callback?x=1").as_deref(),
+            Some("api.nebula.gg")
+        );
+        assert_eq!(hosted("http://evil.example/cb"), None);
+        assert_eq!(hosted("https://nebula.gg@evil.example/cb"), None);
+        assert_eq!(hosted("https://evil.example/cb#x"), None);
+        assert_eq!(hosted("/callback"), None);
+        assert_eq!(hosted("javascript:alert(1)"), None);
+        assert!(redirect_allowed("http://127.0.0.1:9/cb"));
+        assert!(redirect_allowed("https://claude.ai/api/mcp/auth_callback"));
+        assert!(!redirect_allowed("http://evil.example/cb"));
     }
 }

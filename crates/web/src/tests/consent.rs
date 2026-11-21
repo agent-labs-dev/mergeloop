@@ -5,7 +5,9 @@ use axum::http::HeaderMap;
 
 use super::*;
 
-const REDIRECT: &str = "http%3A%2F%2F127.0.0.1%3A9999%2Fcallback";
+const REDIRECT: &str = "http://127.0.0.1:9999/callback";
+/// Where Nebula's MCP connector has its code sent.
+const SITE: &str = "https://api.nebula.gg/mcp-servers/oauth/callback";
 
 /// GitHub, as far as a sign-in reaches it: Ana signs in, and can access installation 1.
 async fn github() -> GitHub {
@@ -36,7 +38,19 @@ struct SignIn {
 impl SignIn {
     /// Registers a client called `name`, and signs in with `extra` added to its authorize request.
     async fn start(router: &Router, name: &str, extra: &str) -> SignIn {
-        let body = serde_json::json!({ "client_name": name, "redirect_uris": ["http://127.0.0.1:9999/callback"] });
+        SignIn::start_at(router, name, REDIRECT, extra).await
+    }
+
+    /// As `start`, for a client that has its code sent to `redirect_uri`, registered as
+    /// Nebula's MCP connector registers: it asks for a refresh token too, which it does without.
+    async fn start_at(router: &Router, name: &str, redirect_uri: &str, extra: &str) -> SignIn {
+        let body = serde_json::json!({
+            "client_name": name,
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        });
         let req = Request::post("/oauth/register")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
@@ -45,8 +59,9 @@ impl SignIn {
         let client_id = registered["client_id"].as_str().unwrap();
         let pkce = Pkce::new();
         let req = Request::get(format!(
-            "/oauth/authorize?response_type=code&client_id={}&redirect_uri={REDIRECT}&state=s%20t&code_challenge={}&code_challenge_method=S256{extra}",
+            "/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&state=s%20t&code_challenge={}&code_challenge_method=S256{extra}",
             auth::percent_encode(client_id),
+            auth::percent_encode(redirect_uri),
             pkce.challenge
         ))
         .body(Body::empty())
@@ -185,7 +200,8 @@ async fn the_page_shows_the_code_the_sign_in_carries(pool: PgPool) {
 
     // A code that is not one, back to the client before GitHub.
     let req = Request::get(format!(
-        "/oauth/authorize?response_type=code&client_id=c&redirect_uri={REDIRECT}&state=x&code_challenge={}&code_challenge_method=S256&user_code=%3Cb%3E",
+        "/oauth/authorize?response_type=code&client_id=c&redirect_uri={}&state=x&code_challenge={}&code_challenge_method=S256&user_code=%3Cb%3E",
+        auth::percent_encode(REDIRECT),
         Pkce::new().challenge
     ))
     .body(Body::empty())
@@ -255,4 +271,62 @@ async fn a_denied_sign_in_reaches_the_client_as_an_error(pool: PgPool) {
     assert!(back.ends_with("&state=s%20t"), "{back}");
     // The session it would have handed over is gone.
     assert_eq!(sessions().await, before - 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_site_signs_in_as_nebula_does(pool: PgPool) {
+    let (router, _) = with_github(pool, github().await).await;
+    // Nebula names the MCP resource, and the scopes it found, which are none.
+    let extra = "&resource=http%3A%2F%2Flocalhost%3A8080%2Fmcp&scope=";
+    let sign_in = SignIn::start_at(&router, "Nebula", SITE, extra).await;
+    assert!(
+        sign_in.page.starts_with("/oauth/consent?request="),
+        "{}",
+        sign_in.page
+    );
+
+    // The page names the site the code goes to, and no terminal code.
+    let (status, _, page) = sign_in.page_as(&sign_in.cookies).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains("The site <strong class=\"host\">api.nebula.gg</strong>"),
+        "{page}"
+    );
+    assert!(page.contains("Nebula"), "{page}");
+    assert!(!page.contains("A program on this computer"), "{page}");
+    assert!(!page.contains("No code was given"), "{page}");
+
+    let (back, _) = redirect(&sign_in.answer("allow").await);
+    assert!(back.starts_with(&format!("{SITE}?code=")), "{back}");
+    assert!(back.ends_with("&state=s%20t"), "{back}");
+
+    // Nebula's exchange carries its client, redirect and resource too.
+    let req = Request::post("/oauth/token")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "grant_type=authorization_code&code={}&code_verifier={}&client_id=x&redirect_uri={}&resource=http%3A%2F%2Flocalhost%3A8080%2Fmcp",
+            query_param(&back, "code"),
+            sign_in.pkce.verifier,
+            auth::percent_encode(SITE),
+        )))
+        .unwrap();
+    let token = json_of(send(&router, req).await).await;
+    let token = token["access_token"].as_str().unwrap().to_owned();
+    let req = Request::get("/api/session")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let session = json_of(send(&router, req).await).await;
+    assert_eq!(session["user"]["login"], "ana");
+
+    // A bad link to a site is answered here: mergeloop.ai bounces no browser to a site.
+    let req = Request::get(format!(
+        "/oauth/authorize?response_type=code&client_id=c&redirect_uri={}&state=x",
+        auth::percent_encode("https://evil.example/cb")
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let res = send(&router, req).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.headers().get("location").is_none());
 }

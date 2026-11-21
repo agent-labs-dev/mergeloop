@@ -309,9 +309,9 @@ An MCP client that supports OAuth signs in with GitHub in the browser, as the da
 claude mcp add --transport http mergeloop https://mergeloop.ai/mcp
 ```
 
-The client gets a MergeLoop session, and the GitHub token stays on the server. MergeLoop sends the sign-in back only to a loopback address, where native clients such as Claude Code, Codex and Cursor listen.
+The client gets a MergeLoop session, and the GitHub token stays on the server. MergeLoop sends the sign-in back to a loopback address, where native clients such as Claude Code, Codex and Cursor listen, or to an `https` URL, for a hosted client such as Nebula or claude.ai. It refuses plain `http` anywhere but this machine.
 
-Before the client gets anything, MergeLoop asks you on a page of its own: which program asks (the name it registered with, which any program can choose), what allowing it gives it (it acts as you in MergeLoop, until it goes 30 days unused), and the code the sign-in carries, if any. **Allow** sends the client its sign-in; **Deny** sends it an error. Only that page, in the browser that signed in with GitHub, can answer, once, within 5 minutes. MergeLoop never remembers a yes: any program on your machine could register under the same name.
+Before the client gets anything, MergeLoop asks you on a page of its own: which program asks (the name it registered with, which any program can choose), or for a hosted client the site the sign-in goes to, what allowing it gives it (it acts as you in MergeLoop, until it goes 30 days unused), and the code the sign-in carries, if any. **Allow** sends the client its sign-in; **Deny** sends it an error. Only that page, in the browser that signed in with GitHub, can answer, once, within 5 minutes. MergeLoop never remembers a yes: any program on your machine could register under the same name.
 
 An agent without a browser, such as one in CI, passes a GitHub token instead: one from `gh auth token`, a personal access token, or a workflow's `GITHUB_TOKEN`. A fine-grained token also needs write access to issues or pull requests. MergeLoop never stores the token. It remembers its hash, in memory for 5 minutes, so calls in a row do not each ask GitHub again.
 

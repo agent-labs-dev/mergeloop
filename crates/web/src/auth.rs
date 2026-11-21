@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -25,10 +25,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use mergepatrol_analytics::WorkspaceInfo;
 use mergepatrol_core::RepoName;
+use mergepatrol_github::AppCredentials;
+pub(crate) use mergepatrol_github::percent_encode;
 use mergepatrol_github::setup::{self, Pkce, random_token};
 use mergepatrol_github::setup::{Revoked, UserInstallation, UserToken};
-use mergepatrol_github::{App, AppCredentials};
 use mergepatrol_store::{GITHUB_APP, LoginCode, Scope, Sealed, Session, SessionKind, Workspace};
+use parking_lot::Mutex;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -148,6 +150,8 @@ pub struct ManifestForm {
 
 /// A signed-in user, and the installations they could access when they signed in.
 pub(crate) struct SignedIn {
+    /// Their GitHub login.
+    login: String,
     installations: Vec<u64>,
     token_hash: String,
     /// Their GitHub token, sealed. `None` for a session from before sessions kept it.
@@ -155,6 +159,41 @@ pub(crate) struct SignedIn {
 }
 
 impl SignedIn {
+    pub(crate) fn login(&self) -> &str {
+        &self.login
+    }
+
+    /// Whether GitHub says the user may push to `repo`, as it said within `SEEN_FOR`.
+    pub(crate) async fn may_push(
+        &self,
+        state: &AppState,
+        repo: &RepoName,
+    ) -> Result<bool, ApiError> {
+        let token = self.github_token(state)?;
+        let key = (hash(&token), repo.clone());
+        if state.seen.writers.get(&key).is_some() {
+            return Ok(true);
+        }
+        match state
+            .github
+            .as_user(&token)?
+            .can_write(&repo.to_string())
+            .await
+        {
+            // Only a yes is kept: one just given push access need not wait.
+            Ok(true) => state.seen.writers.put(key, ()),
+            Ok(false) => return Ok(false),
+            Err(e) if e.is::<Revoked>() => {
+                return Err(ApiError::Status(
+                    StatusCode::UNAUTHORIZED,
+                    "Sign in again first.".into(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(true)
+    }
+
     /// Refuses workspaces the user cannot access.
     pub(crate) fn workspace(&self, installation_id: u64) -> Result<u64, ApiError> {
         if self.installations.contains(&installation_id) {
@@ -248,10 +287,16 @@ impl FromRequestParts<AppState> for SignedIn {
 fn signed_in(session: Session, token_hash: String) -> Option<SignedIn> {
     match session {
         Session {
-            kind: SessionKind::User { installations, .. },
+            kind:
+                SessionKind::User {
+                    login,
+                    installations,
+                    ..
+                },
             github,
             ..
         } => Some(SignedIn {
+            login,
             installations,
             token_hash,
             github,
@@ -329,7 +374,12 @@ impl Caller {
         // Only a yes is kept: one just made admin need not wait.
         let admin = match state.seen.admins.get(&key) {
             Some(admin) => admin,
-            None => match setup::can_admin(token, &repo.to_string()).await {
+            None => match state
+                .github
+                .as_user(token)?
+                .can_admin(&repo.to_string())
+                .await
+            {
                 Ok(admin) => admin,
                 Err(e) if e.is::<Revoked>() => return Err(token_refused()),
                 Err(e) => return Err(e.into()),
@@ -374,7 +424,12 @@ impl Caller {
         let token = self.github_token(state)?;
         let key = (hash(&token), repo.clone());
         if state.seen.reads.get(&key).is_none() {
-            match setup::can_read(&token, &repo.to_string()).await {
+            match state
+                .github
+                .as_user(&token)?
+                .can_read(&repo.to_string())
+                .await
+            {
                 Ok(true) => state.seen.reads.put(key, ()),
                 Ok(false) => return Err(no_repo(repo)),
                 Err(e) if e.is::<Revoked>() => return Err(token_refused()),
@@ -448,7 +503,7 @@ async fn token_works(state: &AppState, token: &str) -> Result<bool, ApiError> {
     if state.seen.tokens.get(&key).is_some() {
         return Ok(true);
     }
-    if !setup::token_works(token).await? {
+    if !state.github.as_user(token)?.token_works().await? {
         return Ok(false);
     }
     state.seen.tokens.put(key, ());
@@ -475,7 +530,7 @@ async fn installation_of(
     if let Some(id) = state.seen.installations.get(repo) {
         return Ok(id);
     }
-    let app = App::from_credentials(creds)?;
+    let app = state.github.app(creds)?;
     let id = app.installation_for(repo).await?.map(|gh| gh.id);
     state.seen.installations.put(repo.clone(), id);
     Ok(id)
@@ -499,6 +554,10 @@ pub(crate) struct Seen {
     installations: Recent<RepoName, Option<u64>>,
     /// Whether each token's user administers a repo.
     admins: Recent<(String, RepoName), bool>,
+    /// The repos each token's user may push to.
+    writers: Recent<(String, RepoName), ()>,
+    /// The account ID of each login.
+    pub(crate) user_ids: Recent<String, u64>,
 }
 
 #[cfg(test)]
@@ -522,7 +581,7 @@ impl Seen {
     }
 }
 
-struct Recent<K, V>(Mutex<HashMap<K, (Instant, V)>>);
+pub(crate) struct Recent<K, V>(Mutex<HashMap<K, (Instant, V)>>);
 
 impl<K, V> Default for Recent<K, V> {
     fn default() -> Self {
@@ -531,15 +590,15 @@ impl<K, V> Default for Recent<K, V> {
 }
 
 impl<K: Eq + Hash, V: Clone> Recent<K, V> {
-    fn get(&self, key: &K) -> Option<V> {
-        let map = self.0.lock().unwrap();
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
+        let map = self.0.lock();
         map.get(key)
             .filter(|(at, _)| at.elapsed() < SEEN_FOR)
             .map(|(_, v)| v.clone())
     }
 
-    fn put(&self, key: K, value: V) {
-        let mut map = self.0.lock().unwrap();
+    pub(crate) fn put(&self, key: K, value: V) {
+        let mut map = self.0.lock();
         map.retain(|_, (at, _)| at.elapsed() < SEEN_FOR);
         map.insert(key, (Instant::now(), value));
     }
@@ -615,7 +674,7 @@ pub(crate) async fn unlock(
     State(state): State<AppState>,
     Json(body): Json<Unlock>,
 ) -> Result<Response, ApiError> {
-    let expected = state.setup_token.lock().unwrap().clone();
+    let expected = state.setup_token.lock().clone();
     let Some(expected) = expected else {
         return Err(ApiError::Status(
             StatusCode::CONFLICT,
@@ -723,7 +782,7 @@ pub(crate) async fn manifest_callback(
             .vault
             .set(Scope::Instance, GITHUB_APP, &serde_json::to_string(&creds)?)
             .await?;
-        *state.setup_token.lock().unwrap() = None;
+        *state.setup_token.lock() = None;
         tracing::info!(app = %creds.slug, "GitHub App created");
         Ok(creds.install_url())
     }
@@ -771,6 +830,12 @@ pub(crate) struct McpClient {
     pub redirect_uri: String,
     pub state: Option<String>,
     pub challenge: String,
+    /// The name it registered with, for the consent page.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The code its terminal shows, for the consent page.
+    #[serde(default)]
+    pub user_code: Option<String>,
 }
 
 /// Signs in with GitHub for the MCP client, which gets a one-time code for the session.
@@ -837,8 +902,9 @@ pub(crate) async fn login_callback(
             let json = BASE64URL.decode(v).ok()?;
             serde_json::from_slice::<McpClient>(&json).ok()
         })
-        // Anyone who can plant a cookie can plant this one: it sends the code to this machine only.
-        .filter(|client| crate::oauth::loopback(&client.redirect_uri));
+        // Anyone who can plant a cookie can plant this one: its code still waits on the consent
+        // page, which names the site it would go to.
+        .filter(|client| crate::oauth::redirect_allowed(&client.redirect_uri));
     let mut destination = "/".to_owned();
     let result = async {
         if let Some(err) = q.error {
@@ -858,10 +924,13 @@ pub(crate) async fn login_callback(
             .app_credentials()
             .await?
             .ok_or_else(|| anyhow::anyhow!("no GitHub App yet"))?;
-        let user_token =
-            setup::exchange_code(&creds, &code, &callback_url(&state), verifier).await?;
-        let user = setup::user(&user_token.access_token).await?;
-        let installations = setup::user_installations(&user_token.access_token).await?;
+        let user_token = state
+            .github
+            .exchange_code(&creds, &code, &callback_url(&state), verifier)
+            .await?;
+        let as_user = state.github.as_user(&user_token.access_token)?;
+        let user = as_user.user().await?;
+        let installations = as_user.installations().await?;
         save_workspaces(&state, &installations).await?;
         destination = install_destination(&headers, &installations);
         tracing::info!(login = %user.login, workspaces = installations.len(), "signed in");
@@ -880,7 +949,7 @@ pub(crate) async fn login_callback(
         let token = create_session(
             &state,
             SessionKind::User {
-                login: user.login,
+                login: user.login.clone(),
                 avatar_url: user.avatar_url,
                 installations: installations.iter().map(|i| i.id).collect(),
             },
@@ -888,28 +957,41 @@ pub(crate) async fn login_callback(
             USER_SESSION,
         )
         .await?;
-        match &mcp {
-            Some(client) => login_code(&state, &token, &client.challenge).await,
-            None => Ok(token),
-        }
+        Ok((token, user.login))
     }
     .await;
     let clear_oauth = cookie(&state, OAUTH_COOKIE, "", Duration::ZERO);
     if let Some(client) = mcp {
-        return (
-            AppendHeaders([
-                (header::SET_COOKIE, clear_oauth),
-                (
-                    header::SET_COOKIE,
-                    cookie(&state, MCP_COOKIE, "", Duration::ZERO),
-                ),
-            ]),
-            Redirect::to(&mcp_redirect(&client, result)),
-        )
-            .into_response();
+        let clear_mcp = cookie(&state, MCP_COOKIE, "", Duration::ZERO);
+        // The client gets nothing until the user says yes on the consent page.
+        let asked = match result {
+            Ok((token, login)) => {
+                crate::oauth::ask(&state, &headers, &client, &token, &login).await
+            }
+            Err(e) => Err(e),
+        };
+        return match asked {
+            Ok((consent, page)) => (
+                AppendHeaders([
+                    (header::SET_COOKIE, clear_oauth),
+                    (header::SET_COOKIE, clear_mcp),
+                    (header::SET_COOKIE, consent),
+                ]),
+                Redirect::to(&page),
+            )
+                .into_response(),
+            Err(e) => (
+                AppendHeaders([
+                    (header::SET_COOKIE, clear_oauth),
+                    (header::SET_COOKIE, clear_mcp),
+                ]),
+                Redirect::to(&mcp_redirect(&client, Err(e))),
+            )
+                .into_response(),
+        };
     }
     match result {
-        Ok(token) => (
+        Ok((token, _)) => (
             AppendHeaders([
                 (
                     header::SET_COOKIE,
@@ -939,7 +1021,7 @@ fn install_destination(headers: &HeaderMap, installations: &[UserInstallation]) 
 }
 
 /// Back to the MCP client, with the one-time code or OAuth's error, and its `state`.
-fn mcp_redirect(client: &McpClient, result: anyhow::Result<String>) -> String {
+pub(crate) fn mcp_redirect(client: &McpClient, result: anyhow::Result<String>) -> String {
     let mut query = match result {
         Ok(code) => format!("code={code}"),
         Err(e) => {
@@ -962,7 +1044,11 @@ fn mcp_redirect(client: &McpClient, result: anyhow::Result<String>) -> String {
 }
 
 /// Seals the new session's token under a one-time code for an MCP client.
-async fn login_code(state: &AppState, token: &str, challenge: &str) -> anyhow::Result<String> {
+pub(crate) async fn login_code(
+    state: &AppState,
+    token: &str,
+    challenge: &str,
+) -> anyhow::Result<String> {
     let code = random_token(32);
     let code_hash = hash(&code);
     let login = LoginCode {
@@ -1117,7 +1203,11 @@ async fn recheck(
         checked.github = Some(state.vault.seal(&name, &serde_json::to_string(&token)?)?);
         state.store.update_session(token_hash, &checked).await?;
     }
-    let installations = setup::user_installations(&token.access_token).await?;
+    let installations = state
+        .github
+        .as_user(&token.access_token)?
+        .installations()
+        .await?;
     save_workspaces(state, &installations).await?;
     checked.kind = SessionKind::User {
         login: login.clone(),
@@ -1161,7 +1251,7 @@ fn code_secret(code_hash: &str) -> String {
     format!("login-code/{code_hash}")
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -1205,7 +1295,7 @@ async fn create_session(
     Ok(token)
 }
 
-fn cookie(state: &AppState, name: &str, value: &str, max_age: Duration) -> String {
+pub(crate) fn cookie(state: &AppState, name: &str, value: &str, max_age: Duration) -> String {
     let secure = if state.secure_cookies() {
         "; Secure"
     } else {
@@ -1217,7 +1307,7 @@ fn cookie(state: &AppState, name: &str, value: &str, max_age: Duration) -> Strin
     )
 }
 
-fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -1249,17 +1339,6 @@ fn error_redirect(error: &str) -> Response {
     tracing::warn!(%error, "sign-in or setup failed");
     let url = percent_encode(error);
     Redirect::to(&format!("/?error={url}")).into_response()
-}
-
-pub(crate) fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 #[cfg(test)]

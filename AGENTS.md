@@ -1,6 +1,18 @@
 # MergeLoop
 
-See `CONTRIBUTING.md` for how to build, test, and open a PR.
+A merge queue for GitHub, with an agent on conflicts, review and failed checks. `CONTRIBUTING.md` says how to build,
+test and open a PR.
+
+## Gate
+
+`scripts/gate` runs rustfmt, clippy and the dashboard's biome check; `scripts/gate --changed` lints only the crates and
+the dashboard that the branch changed. `cargo test --workspace` needs the Postgres from `compose.dev.yml`, so CI runs it.
+
+## The `mergeloop` agent skill
+
+`crates/web/src/skill.md` is the one source of the skill MergeLoop installs in other repos. `.agents/skills/mergeloop/SKILL.md`
+and `.claude/skills/mergeloop/SKILL.md` are byte-identical copies, and a test in `crates/web/src/api.rs` fails when they
+drift: change all three together. Other repos install it as `README.md` says under "Install the agent skill by hand".
 
 ## Agents can do what the dashboard does
 
@@ -14,3 +26,7 @@ The dashboard does nothing but call the JSON API under `/api`. Every route is in
 ## Changes users see go in the changelog
 
 A PR whose change MergeLoop's users can see or feel adds an entry to `content/changelog/`, with a picture from the PR's screenshots when there is one to show. `content/changelog/README.md` says when and how.
+
+## Standards
+
+- `repo-standards`: the RS-* requirements every cjber and agent-labs-dev repo meets; its `audit.py` checks this repo.

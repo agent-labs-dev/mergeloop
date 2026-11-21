@@ -19,3 +19,6 @@ zeroize = "1.9.1"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

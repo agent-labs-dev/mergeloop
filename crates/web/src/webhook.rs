@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use hmac::{Hmac, KeyInit, Mac};
 use mergepatrol_analytics::{Analytics, WorkspaceInfo};
-use mergepatrol_core::{ConfigPath, RepoName};
+use mergepatrol_core::{ConfigPath, PrNumber, RepoName};
 use mergepatrol_store::{BRANCH_RULES, Change};
 use serde_json::Value;
 use sha2::Sha256;
@@ -20,6 +20,10 @@ pub(crate) const MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Implemented by the queue.
 pub trait Wake: Send + Sync {
     fn wake(&self, installation: u64, repo: RepoName);
+
+    /// PR `number` was pushed to, and is at `head` now: its jobs for another head stop, once
+    /// GitHub shows it moved.
+    fn pushed(&self, installation: u64, repo: &RepoName, number: PrNumber, head: &str);
 }
 
 pub(crate) async fn receive(
@@ -60,6 +64,12 @@ pub(crate) async fn receive(
         .and_then(RepoName::parse);
     if let (Some(installation), Some(repo)) = (installation, repo) {
         tracing::debug!(event, installation, %repo, "webhook");
+        // Issues are the build lane's, and nothing the queue reads.
+        if event == Some("issues") {
+            return crate::builds::heard(&state, installation, &repo, &payload)
+                .await
+                .map(|()| StatusCode::NO_CONTENT);
+        }
         let mut stored = Ok(());
         if event == Some("push")
             && let Some(has) = config_after_push(&payload)
@@ -89,12 +99,26 @@ pub(crate) async fn receive(
             // about the PR reads them all again.
             tracing::warn!(installation, %repo, error = %format!("{e:#}"), "could not act on a reply to the agent's review");
         }
+        if event == Some("pull_request")
+            && let Some((number, head)) = pushed(&payload)
+        {
+            state.wake.pushed(installation, &repo, number, head);
+        }
         // The queue reads the rest from GitHub, so it wakes even when the write failed. The
         // error still goes back, so the delivery shows as failed on GitHub, to send again.
         state.wake.wake(installation, repo);
         stored?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The PR and its new head, of a `pull_request` delivery for a push to it.
+fn pushed(payload: &Value) -> Option<(PrNumber, &str)> {
+    if payload["action"] != "synchronize" {
+        return None;
+    }
+    let pr = &payload["pull_request"];
+    Some((pr["number"].as_u64()?, pr["head"]["sha"].as_str()?))
 }
 
 /// The App was installed or uninstalled, for analytics.

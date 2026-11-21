@@ -6,3 +6,13 @@ members = ["crates/*"]
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/agent-labs-dev/mergepatrol"
+
+# The Rust style we adopted from Google's guide. CONTRIBUTING.md says what we left out and why.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+enum_glob_use = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"
+wildcard_imports = "warn"

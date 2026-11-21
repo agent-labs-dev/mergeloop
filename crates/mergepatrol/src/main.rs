@@ -7,6 +7,7 @@ mod publish;
 mod queue;
 mod redeliver;
 mod review;
+mod slots;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +22,8 @@ use mergepatrol_executor::sandbox::{Kube, START_PORT, SandboxLaunch};
 use mergepatrol_executor::{DockerExecutor, Executor, LocalExecutor};
 use mergepatrol_github::App;
 use mergepatrol_github::setup::random_token;
-use mergepatrol_store::{GITHUB_APP, PgStore, Scope, Store, Vault};
+use mergepatrol_store::{BuildStore, GITHUB_APP, PgStore, Scope, Store, Vault};
 use mergepatrol_web::WebConfig;
-use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, ExecutorConfig};
@@ -72,12 +72,13 @@ async fn orchestrator() -> Result<()> {
 
     let pg = Arc::new(PgStore::connect(&config.database_url).await?);
     let store: Arc<dyn Store> = pg.clone();
+    let builds: Arc<dyn BuildStore> = pg.clone();
     let vault = Arc::new(Vault::new(store.clone(), &config.secret_key)?);
     let rotated = vault.rotate().await?;
     if rotated > 0 {
         tracing::info!(
             rotated,
-            "re-encrypted secrets with the first MERGEPATROL_SECRET_KEY: the others can go"
+            "re-encrypted the stored secrets with the first MERGEPATROL_SECRET_KEY: keep the others until nothing that started with them is still running, as Rotate the secret key in the README says"
         );
     }
 
@@ -122,6 +123,7 @@ async fn orchestrator() -> Result<()> {
             tracing::warn!("jobs run as local processes, without a sandbox");
             Arc::new(LocalExecutor {
                 program: std::env::current_exe().context("find the mergepatrol binary")?,
+                args: Vec::new(),
                 timeout: JOB_TIMEOUT,
             })
         }
@@ -177,7 +179,7 @@ async fn orchestrator() -> Result<()> {
         executor,
         proxy: proxy.clone(),
         chatgpt: Default::default(),
-        jobs: Semaphore::new(config.max_jobs),
+        jobs: slots::JobSlots::new(config.max_jobs),
         wakers: Arc::default(),
         analytics: analytics.clone(),
         prs: Default::default(),
@@ -194,7 +196,7 @@ async fn orchestrator() -> Result<()> {
         hosted_app,
         public_url: ctx.config.public_url.clone(),
         setup_token,
-        wake: ctx.wakers.clone(),
+        wake: ctx.clone(),
         repo_defaults: ctx.config.repo_defaults.clone(),
         analytics,
         billing,
@@ -211,7 +213,7 @@ async fn orchestrator() -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "dashboard");
-    let app = mergepatrol_web::router(store, vault, web)
+    let app = mergepatrol_web::router(store, builds, vault, web)
         .merge(mailbox.router())
         .merge(proxy.router());
     axum::serve(listener, app)

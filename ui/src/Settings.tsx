@@ -1,17 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { capture } from "./analytics";
 import {
   deleteApiKey,
   deleteChatGptLogin,
   fetchBilling,
+  fetchBuildSettings,
   fetchRepos,
   fetchSettings,
   freeSeat,
   openPortal,
   pollChatGptLogin,
   setApiKey,
+  setBuildSettings,
   startChatGptLogin,
   startCheckout,
 } from "./api";
@@ -27,7 +29,17 @@ import { type Drafts, DraftsTray, RepoDefaults } from "./RepoSettings";
 import { DifferingRepos, RepoDetail, RepoRail } from "./Repos";
 import { ReviewSettings } from "./ReviewSettings";
 import { UpdateRepos } from "./UpdateRepos";
-import { danger, ErrorText, field, primary, Section, Status, secondary, timeAgo } from "./ui";
+import {
+  danger,
+  ErrorText,
+  field,
+  primary,
+  Section,
+  Status,
+  secondary,
+  Toggle,
+  timeAgo,
+} from "./ui";
 
 const link =
   "text-fg-2 underline decoration-line-strong underline-offset-2 hover:text-fg hover:decoration-fg";
@@ -160,6 +172,7 @@ function Workspace({
       </Section>
       <RepoDefaults workspace={workspace} />
       <ReviewSettings workspace={workspace} />
+      <BuildLane workspace={workspace} />
       {queuing.length > 0 && (
         <Section
           id="repos"
@@ -173,6 +186,60 @@ function Workspace({
         </Section>
       )}
     </div>
+  );
+}
+
+/** The build lane's switch. It saves as it flips: there is nothing else to set. */
+function BuildLane({ workspace }: { workspace: number }) {
+  const queryClient = useQueryClient();
+  const { account } = useParams({ from: "/$account/settings" });
+  const settings = useQuery({
+    queryKey: ["build-settings", workspace],
+    queryFn: () => fetchBuildSettings(workspace),
+  });
+  const save = useMutation({
+    mutationFn: (enabled: boolean) => setBuildSettings(workspace, { enabled }),
+    onSuccess: (data) => {
+      capture("build lane settings saved", { enabled: data.enabled });
+      queryClient.setQueryData(["build-settings", workspace], data);
+      return queryClient.invalidateQueries({ queryKey: ["builds", workspace] });
+    },
+  });
+  if (!settings.data) return null;
+  const on = save.isPending ? save.variables : settings.data.enabled;
+  return (
+    <Section
+      id="builds"
+      title="Build lane"
+      sub="Your developers' machines build issues labeled for MergeLoop into PRs, as the App, and land them through the queue. Each runs the coding agent they already use."
+      aside={<Toggle on={on} onChange={(on) => save.mutate(on)} label="Build lane" />}
+    >
+      <div className={`rounded-lg border border-line bg-surface p-4 ${on ? "" : "opacity-60"}`}>
+        <p>
+          {on ? (
+            <>
+              <span className="font-medium">On.</span> A developer who may push to a repo builds its
+              labeled issues with{" "}
+              <code className="rounded bg-sunken px-1 text-xs">mergeloop login</code> once, then{" "}
+              <code className="rounded bg-sunken px-1 text-xs">mergeloop daemon</code>.{" "}
+              <Link to="/$account/builds" params={{ account }} className={link}>
+                See the builds
+              </Link>
+              .
+            </>
+          ) : (
+            <>
+              <span className="font-medium">Off.</span> No daemon gets a new task, and the lane's
+              calls are refused. A daemon stops a build when it next hears from MergeLoop, which can
+              take up to 5 minutes, and throws away the build's work it has not pushed. The build's
+              record is kept: once the lane is on again, it is a task again and built anew, or, when
+              it has a PR, landed again. A PR already open stays in the queue and can still merge.
+            </>
+          )}
+        </p>
+        <ErrorText error={save.error} />
+      </div>
+    </Section>
   );
 }
 

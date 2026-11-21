@@ -639,10 +639,10 @@ mod tests {
         let repo = RepoName::parse("o/r").unwrap();
         let checks = gh.checks(&repo, "abc").await.unwrap();
         assert_eq!(checks.workflows_running, None);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
         assert!(gh.workflows_running(&repo, "abc").await.unwrap());
         assert_eq!(
-            requests.lock().unwrap()[2],
+            requests.lock()[2],
             "GET /repos/o/r/actions/runs?head_sha=abc&per_page=100&page=1 HTTP/1.1"
         );
     }
@@ -761,7 +761,7 @@ mod tests {
             )
         );
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/r/commits/abc/check-runs?filter=latest&per_page=100&page=1 HTTP/1.1",
                 "GET /repos/o/r/commits/abc/check-runs?filter=latest&per_page=100&page=2 HTTP/1.1",
@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(names, ["Integration Tests", "Integration Tests / shard-2"]);
         assert!(failures[1].details.contains("FAIL auth.test.ts"));
         assert_eq!(
-            requests.lock().unwrap()[2..4],
+            requests.lock()[2..4],
             [
                 "GET /repos/o/r/actions/jobs/1/logs HTTP/1.1",
                 "GET /repos/o/r/actions/jobs/3/logs HTTP/1.1",
@@ -874,7 +874,7 @@ mod tests {
 
         gh.rerun_failed_jobs(&repo, 1).await.unwrap();
         assert_eq!(
-            requests.lock().unwrap()[3],
+            requests.lock()[3],
             "POST /repos/o/r/actions/runs/1/rerun-failed-jobs HTTP/1.1"
         );
         let refused = gh.rerun_failed_jobs(&repo, 1).await.unwrap_err();

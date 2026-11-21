@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +14,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 
@@ -70,7 +71,7 @@ impl Mailbox {
     ) -> Result<(Closed, oneshot::Receiver<()>)> {
         let token = random_token();
         let (tx, rx) = oneshot::channel();
-        self.slots.lock().unwrap().insert(
+        self.slots.lock().insert(
             token.clone(),
             Slot {
                 spec: Some(serde_json::to_vec(spec)?),
@@ -91,7 +92,7 @@ impl Mailbox {
     /// Where the job's next `bytes` go, if they fit under the limit: they count as received from
     /// here on.
     fn receive(&self, token: &str, bytes: usize) -> Result<PathBuf, StatusCode> {
-        let mut slots = self.slots.lock().unwrap();
+        let mut slots = self.slots.lock();
         let slot = slots.get_mut(token).ok_or(StatusCode::NOT_FOUND)?;
         let received = slot.received + bytes as u64;
         if received > self.limit {
@@ -110,7 +111,7 @@ struct Closed {
 
 impl Drop for Closed {
     fn drop(&mut self) {
-        self.mailbox.slots.lock().unwrap().remove(&self.token);
+        self.mailbox.slots.lock().remove(&self.token);
     }
 }
 
@@ -118,7 +119,7 @@ async fn spec(
     State(mb): State<Arc<Mailbox>>,
     UrlPath(token): UrlPath<String>,
 ) -> Result<Vec<u8>, StatusCode> {
-    let mut slots = mb.slots.lock().unwrap();
+    let mut slots = mb.slots.lock();
     slots
         .get_mut(&token)
         .and_then(|s| s.spec.take())
@@ -156,12 +157,7 @@ async fn append(
 }
 
 async fn done(State(mb): State<Arc<Mailbox>>, UrlPath(token): UrlPath<String>) -> StatusCode {
-    let tx = mb
-        .slots
-        .lock()
-        .unwrap()
-        .get_mut(&token)
-        .and_then(|s| s.done.take());
+    let tx = mb.slots.lock().get_mut(&token).and_then(|s| s.done.take());
     match tx {
         Some(tx) => {
             let _ = tx.send(());
@@ -381,7 +377,7 @@ mod tests {
 
     impl Drop for Task {
         fn drop(&mut self) {
-            *self.1.lock().unwrap() = true;
+            *self.1.lock() = true;
         }
     }
 
@@ -416,11 +412,8 @@ mod tests {
             b"0123456789"
         );
         assert_eq!(std::fs::read(out.path().join(REVIEW_FILE)).unwrap(), b"{}");
-        assert!(
-            ex.mailbox.slots.lock().unwrap().is_empty(),
-            "the link is closed"
-        );
-        assert!(*freed.lock().unwrap(), "the job's machine is freed");
+        assert!(ex.mailbox.slots.lock().is_empty(), "the link is closed");
+        assert!(*freed.lock(), "the job's machine is freed");
     }
 
     #[tokio::test]
@@ -483,6 +476,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(*freed.lock().unwrap());
+        assert!(*freed.lock());
     }
 }

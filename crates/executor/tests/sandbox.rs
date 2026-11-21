@@ -7,6 +7,8 @@
 //! The job rebases fork PR #3 of the public agent-labs-dev/mergepatrol-fork-lab, which merges
 //! cleanly, so it needs no model API.
 
+#![cfg(test)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

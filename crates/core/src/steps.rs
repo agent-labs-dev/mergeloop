@@ -74,7 +74,7 @@ pub fn step_times(events: &[(f64, &str)]) -> StepTimes {
     let mut since = 0.0;
     for &(at, kind) in events {
         if let Some(step) = current {
-            *times.get_mut(&step).expect("every step is present") += at - since;
+            *times.entry(step).or_default() += at - since;
         }
         since = at;
         current = Step::begun_by(kind).or(current);

@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::AsUser;
+
 const API: &str = "https://api.github.com";
+/// GitHub's site, where a user signs in.
+pub(crate) const WEB: &str = "https://github.com";
 
 /// What GitHub returns when it creates the App. Stored encrypted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,8 +36,9 @@ impl AppCredentials {
 }
 
 /// The webhook events that wake a repo's queue: its PRs, reviews, checks, and trunk moves. And
-/// what people say on a PR, where the agent's review is answered.
-pub const WEBHOOK_EVENTS: [&str; 13] = [
+/// what people say on a PR, where the agent's review is answered, and the issues labeled for the
+/// build lane.
+pub const WEBHOOK_EVENTS: [&str; 14] = [
     "pull_request",
     "pull_request_review",
     "pull_request_review_comment",
@@ -51,6 +56,8 @@ pub const WEBHOOK_EVENTS: [&str; 13] = [
     "repository_ruleset",
     // The repo's settings: the merge methods it allows.
     "repository",
+    // Issues labeled for the build lane: its tasks.
+    "issues",
 ];
 
 /// The App that MergeLoop needs. GitHub only delivers webhooks to a public URL, so on
@@ -141,6 +148,10 @@ pub async fn convert_manifest(code: &str) -> Result<AppCredentials> {
 }
 
 /// A random URL-safe string with `bytes` bytes of entropy.
+///
+/// # Panics
+///
+/// If the OS has no random source. No token can be made safely without one.
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("the OS has no random source");
@@ -224,14 +235,16 @@ impl std::fmt::Display for Revoked {
 
 impl std::error::Error for Revoked {}
 
-/// Trades the code from the OAuth callback for a user token.
-pub async fn exchange_code(
+/// Trades the code from the OAuth callback for a user token, at `web` (GitHub's site).
+pub(crate) async fn exchange_code(
+    web: &str,
     app: &AppCredentials,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<UserToken> {
     let res = token_request(
+        web,
         app,
         &[
             ("code", code),
@@ -252,6 +265,7 @@ pub async fn exchange_code(
 /// A new user token for an expired one.
 pub async fn refresh_user_token(app: &AppCredentials, refresh_token: &str) -> Result<UserToken> {
     let res = token_request(
+        WEB,
         app,
         &[
             ("grant_type", "refresh_token"),
@@ -269,14 +283,14 @@ pub async fn refresh_user_token(app: &AppCredentials, refresh_token: &str) -> Re
     }
 }
 
-async fn token_request(app: &AppCredentials, params: &[(&str, &str)]) -> Result<Value> {
+async fn token_request(web: &str, app: &AppCredentials, params: &[(&str, &str)]) -> Result<Value> {
     let mut form = vec![
         ("client_id", app.client_id.as_str()),
         ("client_secret", app.client_secret.as_str()),
     ];
     form.extend_from_slice(params);
     Ok(client()?
-        .post("https://github.com/login/oauth/access_token")
+        .post(format!("{web}/login/oauth/access_token"))
         .header("accept", "application/json")
         .form(&form)
         .send()
@@ -309,14 +323,6 @@ pub struct GithubUser {
     pub avatar_url: String,
 }
 
-pub async fn user(token: &str) -> Result<GithubUser> {
-    Ok(user_get(token, "/user")
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
 /// An installation of the App that a signed-in user can access.
 #[derive(Clone, Debug)]
 pub struct UserInstallation {
@@ -324,37 +330,6 @@ pub struct UserInstallation {
     pub account: String,
     pub account_type: String,
     pub avatar_url: String,
-}
-
-/// The installations of this App that the user can access: their workspaces.
-pub async fn user_installations(token: &str) -> Result<Vec<UserInstallation>> {
-    let mut all = Vec::new();
-    for page in 1.. {
-        let res: Value = user_get(
-            token,
-            &format!("/user/installations?per_page=100&page={page}"),
-        )
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-        let batch = res["installations"].as_array().cloned().unwrap_or_default();
-        all.extend(batch.iter().filter_map(|i| {
-            Some(UserInstallation {
-                id: i["id"].as_u64()?,
-                account: i["account"]["login"].as_str()?.to_owned(),
-                account_type: i["account"]["type"].as_str().unwrap_or("User").to_owned(),
-                avatar_url: i["account"]["avatar_url"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            })
-        }));
-        if batch.len() < 100 {
-            break;
-        }
-    }
-    Ok(all)
 }
 
 /// The repos of installation `id` that the user can read: those they own, collaborate on, or
@@ -383,18 +358,40 @@ pub async fn user_installation_repos(token: &str, id: u64) -> Result<Vec<String>
     Ok(all)
 }
 
-/// A 401 is `Revoked`: GitHub no longer takes the token.
+/// A 401 is `Revoked`: GitHub no longer takes the token. A used up rate limit is `RateLimited`.
 async fn user_get(token: &str, path: &str) -> Result<reqwest::Response> {
-    let res = client()?
-        .get(format!("{API}{path}"))
+    get_as(&client()?, format!("{API}{path}"), token).await
+}
+
+/// As [`user_get`], with any client at any URL. The timeout is this call's, not the client's:
+/// a question about a token waits no longer on `AsUser`'s client than on [`client`]'s.
+async fn get_as(http: &reqwest::Client, url: String, token: &str) -> Result<reqwest::Response> {
+    let res = http
+        .get(url)
+        .timeout(TIMEOUT)
         .bearer_auth(token)
         .header("accept", "application/vnd.github+json")
         .send()
         .await?;
-    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(Revoked.into());
+    match res.status() {
+        reqwest::StatusCode::UNAUTHORIZED => Err(Revoked.into()),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            Err(refusal(res).await)
+        }
+        _ => Ok(res),
     }
-    Ok(res)
+}
+
+/// A 403 or 429's error: `RateLimited` when it says the token's rate limit is used up, told at
+/// once rather than waited out, so the caller hears why and when to ask again. Else GitHub's
+/// own words.
+async fn refusal(res: reqwest::Response) -> anyhow::Error {
+    let (status, headers) = (res.status(), res.headers().clone());
+    let body = res.text().await.unwrap_or_default();
+    match crate::app::rate_limited(status, &headers, &body) {
+        Some(limited) => limited.into(),
+        None => anyhow::anyhow!("GitHub answered {status}: {body}"),
+    }
 }
 
 /// GitHub refused the user's change: they lack the access it needs.
@@ -408,28 +405,6 @@ impl std::fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
-
-/// Adds labels to a PR as the user, so GitHub checks that they may: it takes triage access.
-/// `Refused` when they lack it.
-pub async fn add_labels_as(token: &str, repo: &str, number: u64, labels: &[&str]) -> Result<()> {
-    let url = format!("{API}/repos/{repo}/issues/{number}/labels");
-    let req = client()?.post(url).json(&json!({ "labels": labels }));
-    user_write(token, req).await?.error_for_status()?;
-    Ok(())
-}
-
-/// Removes a label from a PR as the user. A label the PR does not have is no error.
-pub async fn remove_label_as(token: &str, repo: &str, number: u64, label: &str) -> Result<()> {
-    let mut url = Url::parse(&format!("{API}/repos/{repo}/issues/{number}/labels"))?;
-    url.path_segments_mut()
-        .map_err(|()| anyhow::anyhow!("not a base URL"))?
-        .push(label);
-    let res = user_write(token, client()?.delete(url)).await?;
-    if res.status() != reqwest::StatusCode::NOT_FOUND {
-        res.error_for_status()?;
-    }
-    Ok(())
-}
 
 /// What a review says of a PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,52 +433,120 @@ pub struct LineComment<'a> {
     pub body: String,
 }
 
-/// Whether GitHub takes the token, of any kind: `/rate_limit` answers every token, and costs
-/// none of its rate limit.
-pub async fn token_works(token: &str) -> Result<bool> {
-    match user_get(token, "/rate_limit").await {
-        Ok(res) => {
-            res.error_for_status()?;
-            Ok(true)
+/// What GitHub says of a user's token.
+impl AsUser {
+    /// A 401 is `Revoked`: GitHub no longer takes the token. A used up rate limit is
+    /// `RateLimited`.
+    async fn get(&self, path: &str) -> Result<reqwest::Response> {
+        get_as(&self.http, format!("{}{path}", self.api), &self.token).await
+    }
+
+    /// The token's user.
+    pub async fn user(&self) -> Result<GithubUser> {
+        Ok(self.get("/user").await?.error_for_status()?.json().await?)
+    }
+
+    /// The installations of this App that the user can access: their workspaces.
+    pub async fn installations(&self) -> Result<Vec<UserInstallation>> {
+        let mut all = Vec::new();
+        for page in 1.. {
+            let res: Value = self
+                .get(&format!("/user/installations?per_page=100&page={page}"))
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let batch = res["installations"].as_array().cloned().unwrap_or_default();
+            all.extend(batch.iter().filter_map(|i| {
+                Some(UserInstallation {
+                    id: i["id"].as_u64()?,
+                    account: i["account"]["login"].as_str()?.to_owned(),
+                    account_type: i["account"]["type"].as_str().unwrap_or("User").to_owned(),
+                    avatar_url: i["account"]["avatar_url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+            }));
+            if batch.len() < 100 {
+                break;
+            }
         }
-        Err(e) if e.is::<Revoked>() => Ok(false),
-        Err(e) => Err(e),
+        Ok(all)
+    }
+
+    /// Whether GitHub takes the token, of any kind: `/rate_limit` answers every token, and
+    /// costs none of its rate limit.
+    pub async fn token_works(&self) -> Result<bool> {
+        match self.get("/rate_limit").await {
+            Ok(res) => {
+                res.error_for_status()?;
+                Ok(true)
+            }
+            Err(e) if e.is::<Revoked>() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether the token can read `repo`. GitHub answers 404 for a private repo it cannot.
+    /// `Revoked` when GitHub does not take the token.
+    pub async fn can_read(&self, repo: &str) -> Result<bool> {
+        let res = self.get(&format!("/repos/{repo}")).await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        res.error_for_status()?;
+        Ok(true)
+    }
+
+    /// Whether the token's user may push to the repo. An App's installation token, as a
+    /// workflow's `GITHUB_TOKEN` is, names no user: no.
+    pub async fn can_write(&self, repo: &str) -> Result<bool> {
+        self.has_permission(repo, "push").await
+    }
+
+    /// Whether the token's user administers the repo. An App's installation token names no
+    /// user: no.
+    pub async fn can_admin(&self, repo: &str) -> Result<bool> {
+        self.has_permission(repo, "admin").await
+    }
+
+    /// Adds labels to a PR as the user, so GitHub checks that they may: it takes triage access.
+    /// `Refused` when they lack it.
+    pub async fn add_labels(&self, repo: &str, number: u64, labels: &[&str]) -> Result<()> {
+        let url = format!("{}/repos/{repo}/issues/{number}/labels", self.api);
+        let req = self.http.post(url).timeout(TIMEOUT);
+        user_write(&self.token, req.json(&json!({ "labels": labels })))
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Removes a label from a PR as the user. A label the PR does not have is no error.
+    pub async fn remove_label(&self, repo: &str, number: u64, label: &str) -> Result<()> {
+        let mut url = Url::parse(&format!("{}/repos/{repo}/issues/{number}/labels", self.api))?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("not a base URL"))?
+            .push(label);
+        let res = user_write(&self.token, self.http.delete(url).timeout(TIMEOUT)).await?;
+        if res.status() != reqwest::StatusCode::NOT_FOUND {
+            res.error_for_status()?;
+        }
+        Ok(())
+    }
+
+    /// Whether GitHub gives the token's user `permission` on the repo, as `/repos/{repo}` says.
+    async fn has_permission(&self, repo: &str, permission: &str) -> Result<bool> {
+        let res = self.get(&format!("/repos/{repo}")).await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let repo: Value = res.error_for_status()?.json().await?;
+        Ok(repo["permissions"][permission] == true)
     }
 }
 
-/// Whether the token can read `repo`. GitHub answers 404 for a private repo it cannot.
-/// `Revoked` when GitHub does not take the token.
-pub async fn can_read(token: &str, repo: &str) -> Result<bool> {
-    let res = user_get(token, &format!("/repos/{repo}")).await?;
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
-    }
-    res.error_for_status()?;
-    Ok(true)
-}
-
-/// Whether the token's user may push to the repo. An App's installation token, as a workflow's
-/// `GITHUB_TOKEN` is, names no user: no.
-pub async fn can_write(token: &str, repo: &str) -> Result<bool> {
-    has_permission(token, repo, "push").await
-}
-
-/// Whether the token's user administers the repo. An App's installation token names no user: no.
-pub async fn can_admin(token: &str, repo: &str) -> Result<bool> {
-    has_permission(token, repo, "admin").await
-}
-
-/// Whether GitHub gives the token's user `permission` on the repo, as `/repos/{repo}` says.
-async fn has_permission(token: &str, repo: &str, permission: &str) -> Result<bool> {
-    let res = user_get(token, &format!("/repos/{repo}")).await?;
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
-    }
-    let repo: Value = res.error_for_status()?.json().await?;
-    Ok(repo["permissions"][permission] == true)
-}
-
-/// A 401 is `Revoked`, a 403 `Refused`.
+/// A 401 is `Revoked`, a used up rate limit `RateLimited`, any other 403 `Refused`.
 async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     let res = req
         .bearer_auth(token)
@@ -512,20 +555,32 @@ async fn user_write(token: &str, req: reqwest::RequestBuilder) -> Result<reqwest
         .await?;
     match res.status() {
         reqwest::StatusCode::UNAUTHORIZED => Err(Revoked.into()),
-        reqwest::StatusCode::FORBIDDEN => Err(Refused.into()),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            let e = refusal(res).await;
+            Err(if e.is::<crate::RateLimited>() {
+                e
+            } else {
+                Refused.into()
+            })
+        }
         _ => Ok(res),
     }
 }
 
+/// How long a call with a user's token may take.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(concat!("mergeloop/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
+        .timeout(TIMEOUT)
         .build()?)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -591,5 +646,75 @@ mod tests {
     #[test]
     fn pkce_challenge_is_43_chars() {
         assert_eq!(Pkce::new().challenge.len(), 43);
+    }
+
+    #[tokio::test]
+    async fn a_token_may_push_where_github_says_its_user_may() {
+        let github = crate::fake::github(|call| match (call.token, call.path) {
+            ("ghp_dev", "/repos/o/r") => (200, r#"{"permissions":{"push":true}}"#.into()),
+            ("ghp_guest", "/repos/o/r") => (200, r#"{"permissions":{"push":false}}"#.into()),
+            ("ghp_dev", "/user") => (200, r#"{"login":"ana","avatar_url":""}"#.into()),
+            _ => (404, "{}".into()),
+        })
+        .await;
+        let may = |token: &str, repo: &str| {
+            let user = github.as_user(token).unwrap();
+            let repo = repo.to_owned();
+            async move { user.can_write(&repo).await.unwrap() }
+        };
+        assert!(may("ghp_dev", "o/r").await);
+        assert!(!may("ghp_guest", "o/r").await);
+        assert!(!may("ghp_dev", "o/private").await);
+        let user = github.as_user("ghp_dev").unwrap().user().await.unwrap();
+        assert_eq!(user.login, "ana");
+    }
+
+    #[tokio::test]
+    async fn a_used_up_rate_limit_is_rate_limited_at_once_not_waited_out() {
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let headers: &'static str = Box::leak(
+            format!("x-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}\r\n").into_boxed_str(),
+        );
+        let limited = (
+            403,
+            headers,
+            r#"{"message":"API rate limit exceeded for user ID 1."}"#,
+        );
+        let (user, requests) = crate::fake::as_user(vec![limited]).await;
+        let e = user.can_read("o/r").await.unwrap_err();
+        let limited = e.downcast_ref::<crate::RateLimited>().unwrap();
+        assert!(limited.remaining() > Duration::from_secs(590));
+        assert!(e.to_string().contains("resets at"), "{e}");
+        assert_eq!(requests.lock().len(), 1);
+
+        let secondary = (403, "", "You have exceeded a secondary rate limit.");
+        let (user, _) = crate::fake::as_user(vec![secondary]).await;
+        let e = user.add_labels("o/r", 1, &["x"]).await.unwrap_err();
+        assert!(e.is::<crate::RateLimited>(), "{e}");
+    }
+
+    #[tokio::test]
+    async fn any_other_403_is_no_rate_limit() {
+        let (user, _) = crate::fake::as_user(vec![(403, "", r#"{"message":"Forbidden"}"#)]).await;
+        let e = user.can_read("o/r").await.unwrap_err();
+        assert!(!e.is::<crate::RateLimited>(), "{e}");
+        let (user, _) = crate::fake::as_user(vec![(403, "", r#"{"message":"Forbidden"}"#)]).await;
+        let e = user.add_labels("o/r", 1, &["x"]).await.unwrap_err();
+        assert!(e.is::<Refused>(), "{e}");
+    }
+
+    #[test]
+    fn a_rate_limit_says_when_it_resets() {
+        let limited = crate::RateLimited {
+            until: UNIX_EPOCH + Duration::from_secs(1_794_159_000),
+        };
+        assert!(
+            limited.to_string().contains("resets at 17:30:00Z"),
+            "{limited}"
+        );
     }
 }

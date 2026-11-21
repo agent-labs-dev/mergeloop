@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use mergepatrol_core::StepTimes;
+use mergepatrol_core::{PrNumber, StepTimes};
 use serde_json::{Value, json};
 
 pub const WORKSPACE: &str = "workspace";
@@ -26,6 +26,17 @@ pub struct WorkspaceInfo<'a> {
     pub installation_id: u64,
     pub account: &'a str,
     pub account_type: &'a str,
+}
+
+/// The queued PR a queue event is about.
+pub struct QueuedPr {
+    pub installation_id: u64,
+    /// `owner/name`.
+    pub repo: String,
+    pub trunk: String,
+    pub number: PrNumber,
+    /// Its author's GitHub login: none for a deleted account, or an App.
+    pub author: Option<String>,
 }
 
 impl Analytics {
@@ -70,39 +81,14 @@ impl Analytics {
 
     /// A queue event, such as `merged` or `ejected`, as `pr <kind>`. It counts for the PR's
     /// author, by GitHub login, whether or not they ever signed in.
-    pub fn queue_event(
-        &self,
-        installation_id: u64,
-        repo: &str,
-        trunk: &str,
-        pr: u64,
-        kind: &str,
-        author: Option<&str>,
-    ) {
-        self.send(vec![queue_event(
-            installation_id,
-            repo,
-            trunk,
-            pr,
-            kind,
-            author,
-        )]);
+    pub fn queue_event(&self, pr: &QueuedPr, kind: &str) {
+        self.send(vec![queue_event(pr, kind)]);
     }
 
     /// A PR left the queue, as `pr <outcome>`: a queue event, with the seconds it spent in the
     /// queue and in each step, and the kind of reason it was ejected.
-    #[allow(clippy::too_many_arguments)]
-    pub fn queue_exit(
-        &self,
-        installation_id: u64,
-        repo: &str,
-        trunk: &str,
-        pr: u64,
-        outcome: &str,
-        author: Option<&str>,
-        exit: &Exit,
-    ) {
-        let mut event = queue_event(installation_id, repo, trunk, pr, outcome, author);
+    pub fn queue_exit(&self, pr: &QueuedPr, outcome: &str, exit: &Exit) {
+        let mut event = queue_event(pr, outcome);
         exit.set(&mut event["properties"]);
         self.send(vec![event]);
     }
@@ -185,28 +171,21 @@ impl Exit<'_> {
 
 /// PostHog attaches `$groups` only to an event with a person, so an author-less one (a deleted
 /// account, or an App) counts for no workspace.
-fn queue_event(
-    installation_id: u64,
-    repo: &str,
-    trunk: &str,
-    pr: u64,
-    kind: &str,
-    author: Option<&str>,
-) -> Value {
-    let workspace = installation_id.to_string();
+fn queue_event(pr: &QueuedPr, kind: &str) -> Value {
+    let workspace = pr.installation_id.to_string();
     let mut properties = json!({
-        "repo": repo,
-        "trunk": trunk,
-        "pr": pr,
+        "repo": pr.repo,
+        "trunk": pr.trunk,
+        "pr": pr.number,
         "$groups": { WORKSPACE: &workspace },
         // The server's location, not the person's.
         "$geoip_disable": true,
     });
-    let distinct_id = match author {
+    let distinct_id = match &pr.author {
         Some(login) => {
             // `$set_once`: a signed-in user's own profile wins.
             properties["$set_once"] = json!({ "login": login, "name": login });
-            login.to_owned()
+            login.clone()
         }
         None => {
             properties["$process_person_profile"] = json!(false);
@@ -220,17 +199,28 @@ fn queue_event(
 mod tests {
     use super::*;
 
+    /// PR 2 into `main` of `o/r`, in installation `installation_id`.
+    fn queued(installation_id: u64, author: Option<&str>) -> QueuedPr {
+        QueuedPr {
+            installation_id,
+            repo: "o/r".into(),
+            trunk: "main".into(),
+            number: 2,
+            author: author.map(str::to_owned),
+        }
+    }
+
     #[tokio::test]
     async fn without_a_key_it_is_off() {
         let analytics = Analytics::new(None, "https://us.i.posthog.com");
         assert!(analytics.browser().is_none());
         // Nothing to send to, and nothing spawned.
-        analytics.queue_event(1, "o/r", "main", 2, "merged", Some("ann"));
+        analytics.queue_event(&queued(1, Some("ann")), "merged");
     }
 
     #[test]
     fn a_queue_event_counts_for_its_author_and_workspace() {
-        let event = queue_event(7, "o/r", "main", 2, "merged", Some("ann"));
+        let event = queue_event(&queued(7, Some("ann")), "merged");
         assert_eq!(event["event"], "pr merged");
         assert_eq!(event["distinct_id"], "ann");
         let props = &event["properties"];
@@ -241,7 +231,7 @@ mod tests {
 
     #[test]
     fn without_an_author_a_queue_event_has_no_person() {
-        let event = queue_event(7, "o/r", "main", 2, "merged", None);
+        let event = queue_event(&queued(7, None), "merged");
         assert_eq!(event["distinct_id"], "workspace:7");
         assert_eq!(event["properties"]["$process_person_profile"], false);
     }
@@ -250,7 +240,7 @@ mod tests {
     fn an_exit_has_its_time_in_the_queue_and_its_reason() {
         use mergepatrol_core::Step;
         let steps = StepTimes::from([(Step::Waiting, 60.0), (Step::Checks, 30.0)]);
-        let mut event = queue_event(7, "o/r", "main", 2, "ejected", Some("ann"));
+        let mut event = queue_event(&queued(7, Some("ann")), "ejected");
         let exit = Exit {
             steps: Some(&steps),
             reason: Some("checks-failed"),
@@ -265,7 +255,7 @@ mod tests {
 
     #[test]
     fn an_exit_before_joining_has_no_time() {
-        let mut event = queue_event(7, "o/r", "main", 2, "dequeued", Some("ann"));
+        let mut event = queue_event(&queued(7, Some("ann")), "dequeued");
         Exit {
             steps: None,
             reason: None,

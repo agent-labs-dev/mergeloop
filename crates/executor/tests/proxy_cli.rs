@@ -1,6 +1,8 @@
 //! Runs the real agent CLIs against the proxy, with a stub for the model API. Needs `claude` and
 //! `codex` on PATH: `cargo test -p mergepatrol-executor --test proxy_cli -- --ignored`.
 
+#![cfg(test)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

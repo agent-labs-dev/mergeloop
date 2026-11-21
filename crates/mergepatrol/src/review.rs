@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mergepatrol_core::{
-    Answered, Depth, Evidence, FINDING_MARKS as MARKS, Finding, Judged, Lean, PrNumber,
-    REPLY_MARKS, RepoName, RepoSettings, ReviewSettings, ReviewStatus, SentBack, TITLE_CHARS,
-    Verdict, Verification, clip, finding_title, review_status, settled_by, thread_title as norm,
+    Answered, Evidence, FINDING_MARKS as MARKS, Finding, Judged, Lean, PrNumber, REPLY_MARKS,
+    RepoName, RepoSettings, ReviewSettings, ReviewStatus, SentBack, TITLE_CHARS, Verdict,
+    Verification, clip, finding_title, review_status, settled_by, thread_title as norm,
 };
 use mergepatrol_executor::protocol::{
     ANSWER_FILE, JobOutcome, JobSpec, REVIEW_FILE, ReviewOutput, Task,
@@ -19,12 +19,13 @@ use mergepatrol_executor::protocol::{
 use mergepatrol_github::setup::Verdict as ReviewVerdict;
 use mergepatrol_github::{App, CodeOwners, Installation, PullRequest, ReviewThread, ThreadComment};
 use mergepatrol_resolver::withdraws;
-use mergepatrol_store::{LaneKey, ReviewDone, ReviewRecord};
+use mergepatrol_store::{LaneKey, ReviewDone, ReviewRecord, ReviewStore};
 use mergepatrol_web::merge_requested;
 use tokio::task::JoinSet;
 
 use crate::github::GitHub;
-use crate::queue::{Alive, Ctx, app_credentials, job_spec, record, unix_now};
+use crate::queue::{Alive, Commits, Ctx, app_credentials, job_spec, record, unix_now};
+use crate::slots::Outdated;
 
 /// Reviews running at once, across workspaces. Each also takes one of the sandbox's job slots.
 const REVIEWS_AT_ONCE: usize = 4;
@@ -142,43 +143,169 @@ fn lane_key(r: &ReviewRecord, pr: &PullRequest) -> LaneKey {
     }
 }
 
+/// A review of a PR's head, and what it runs with: the PR as GitHub had it when it started, its
+/// lane, the repo's settings, and the workspace's bars over them.
+pub(crate) struct Reviewing<'a> {
+    gh: &'a Installation,
+    key: LaneKey,
+    pr: &'a PullRequest,
+    record: &'a ReviewRecord,
+    settings: &'a RepoSettings,
+    bars: &'a ReviewSettings,
+}
+
+impl<'a> Reviewing<'a> {
+    pub(crate) fn new(
+        gh: &'a Installation,
+        pr: &'a PullRequest,
+        record: &'a ReviewRecord,
+        settings: &'a RepoSettings,
+        bars: &'a ReviewSettings,
+    ) -> Self {
+        Self {
+            gh,
+            key: lane_key(record, pr),
+            pr,
+            record,
+            settings,
+            bars,
+        }
+    }
+}
+
 async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
-    let (gh, pr) = pull(ctx, &r).await?;
+    let (gh, pr) = match pull(ctx, &r).await {
+        Ok(value) => value,
+        Err(error) => {
+            retry_setup(ctx, &r, &error).await?;
+            return Err(error);
+        }
+    };
     // A fork PR's head is its pull ref's, which its GraphQL lags behind: no run, so no check.
     if !pr.is_cross_repository && pr.head_ref_oid != r.head_sha {
         // A newer head has its own review, which the next tick starts.
         return ctx.store.stale_review(r.id, r.claim).await;
     }
-    let key = lane_key(&r, &pr);
-    let settings = settings(ctx, &gh, &r.repo).await?;
+    let settings = match settings(ctx, &gh, &r.repo).await {
+        Ok(value) => value,
+        Err(error) => {
+            retry_setup(ctx, &r, &error).await?;
+            return Err(error);
+        }
+    };
     // Only a PR told to merge gets the agent's review: no label, or no place in the lane, and the
     // review is dropped rather than run. Nothing is run and nothing is posted.
-    if !merge_requested(ctx.store.as_ref(), &gh, &r.repo, &pr, &settings.label).await? {
+    let requested =
+        match merge_requested(ctx.store.as_ref(), &gh, &r.repo, &pr, &settings.label).await {
+            Ok(value) => value,
+            Err(error) => {
+                retry_setup(ctx, &r, &error).await?;
+                return Err(error);
+            }
+        };
+    if !requested {
         return ctx.store.stale_review(r.id, r.claim).await;
     }
-    let workspace = ctx
-        .store
-        .review_settings(r.installation_id)
-        .await?
-        .unwrap_or_default();
-    let bars = workspace.with(&settings.review);
-
-    let found = match pr.is_cross_repository {
-        // A fork's code is not trusted: no agent reads it, as none rebases or fixes it.
-        true => Err("The agent does not review PRs from forks.".to_owned()),
-        false => run_review(ctx, &gh, &key, &pr, (&settings, bars.depth), &r).await,
-    };
-    let output = match found {
-        Ok(output) => Ok(output),
-        Err(why) if r.attempts + 1 < ATTEMPTS && !why.starts_with(NO_KEY) => {
-            ctx.store
-                .retry_review(r.id, r.claim, &why, RETRY_AFTER)
-                .await?;
-            return Ok(());
+    let workspace = match ctx.store.review_settings(r.installation_id).await {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            retry_setup(ctx, &r, &error).await?;
+            return Err(error);
         }
-        Err(why) => Err(why),
     };
-    conclude(ctx, &gh, &key, &pr, &r, &settings, &bars, output).await
+    let bars = workspace.with(&settings.review);
+    Reviewing::new(&gh, &pr, &r, &settings, &bars)
+        .review(ctx)
+        .await
+}
+
+impl Reviewing<'_> {
+    /// Has the agent review the PR, and ends the review: runs it again later on an error outside
+    /// the PR, and drops it if the PR was pushed to before the agent was done.
+    pub(crate) async fn review(&self, ctx: &Ctx) -> Result<()> {
+        let r = self.record;
+        let found = match self.pr.is_cross_repository {
+            // A fork's code is not trusted: no agent reads it, as none rebases or fixes it.
+            true => Err("The agent does not review PRs from forks.".to_owned()),
+            false => match self.run(ctx).await {
+                // The new head gets a review of its own.
+                Err(e) if Outdated::caused(&e) => {
+                    return ctx.store.stale_review(r.id, r.claim).await;
+                }
+                found => found.map_err(|e| format!("{e:#}")),
+            },
+        };
+        let output = match found {
+            Ok(output) => Ok(output),
+            Err(why) if r.attempts + 1 < ATTEMPTS && !why.starts_with(NO_KEY) => {
+                ctx.store
+                    .retry_review(r.id, r.claim, &why, RETRY_AFTER)
+                    .await?;
+                return Ok(());
+            }
+            Err(why) => Err(why),
+        };
+        recover_conclusion(ctx.store.as_ref(), r, self.conclude(ctx, output).await).await
+    }
+}
+
+async fn recover_conclusion(
+    store: &dyn ReviewStore,
+    review: &ReviewRecord,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            retry_after_error(
+                store,
+                review,
+                &error,
+                "The automatic review could not complete after the retry limit.",
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+async fn retry_setup(ctx: &Ctx, review: &ReviewRecord, error: &anyhow::Error) -> Result<()> {
+    retry_after_error(
+        ctx.store.as_ref(),
+        review,
+        error,
+        "The automatic review could not start after the retry limit.",
+    )
+    .await
+}
+
+async fn retry_after_error(
+    store: &dyn ReviewStore,
+    review: &ReviewRecord,
+    error: &anyhow::Error,
+    summary: &str,
+) -> Result<()> {
+    let error = format!("{error:#}");
+    if review.attempts + 1 < ATTEMPTS && !error.starts_with(NO_KEY) {
+        store
+            .retry_review(review.id, review.claim, &error, RETRY_AFTER)
+            .await?;
+    } else {
+        store
+            .finish_review(
+                review.id,
+                review.claim,
+                &ReviewDone {
+                    status: ReviewStatus::Asks,
+                    error: Some(error.clone()),
+                    summary: summary.into(),
+                    findings: Vec::new(),
+                    asked: Vec::new(),
+                },
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 /// The PR as GitHub has it now, if it is still the one the review is of: the head it reviewed,
@@ -249,38 +376,44 @@ fn below(pr: &PullRequest) -> Option<String> {
     (pr.base_ref_name != pr.merges_into()).then(|| pr.base_ref_name.clone())
 }
 
-/// Runs the review in the sandbox. `Err` says why the agent could not review.
-async fn run_review(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-    (settings, depth): (&RepoSettings, Depth),
-    r: &ReviewRecord,
-) -> std::result::Result<ReviewOutput, String> {
-    let Earlier {
-        answered,
-        sent_back,
-        reviewed,
-    } = earlier(ctx, gh, r).await.map_err(|e| format!("{e:#}"))?;
-    let job_id = format!(
-        "{}-{}-{}-review-{}",
-        r.repo.owner,
-        r.repo.name,
-        r.number,
-        &r.head_sha[..8]
-    );
-    let ran = async {
+impl Reviewing<'_> {
+    /// Runs the review in the sandbox. `Err` says why the agent could not review, or is
+    /// `Outdated`.
+    async fn run(&self, ctx: &Ctx) -> Result<ReviewOutput> {
+        let Self {
+            gh,
+            ref key,
+            pr,
+            record: r,
+            settings,
+            bars,
+        } = *self;
+        let Earlier {
+            answered,
+            sent_back,
+            reviewed,
+        } = earlier(ctx, gh, r).await?;
+        let job_id = format!(
+            "{}-{}-{}-review-{}",
+            r.repo.owner,
+            r.repo.name,
+            r.number,
+            &r.head_sha[..8]
+        );
         let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
         let task = Task::Review {
             answered,
             sent_back,
             since: r.since_head.clone(),
             reviewed,
-            depth,
+            depth: bars.depth,
         };
-        let (mut spec, granted) =
-            job_spec(ctx, gh, key, pr, settings, &r.head_sha, &trunk, None, task).await?;
+        let commits = Commits {
+            head: &r.head_sha,
+            onto: &trunk,
+            below: None,
+        };
+        let (mut spec, granted) = job_spec(ctx, gh, key, pr, settings, commits, task).await?;
         spec.base_ref = below(pr);
         if granted.is_none() {
             bail!(
@@ -292,13 +425,12 @@ async fn run_review(
         let text = tokio::fs::read(out.join(REVIEW_FILE))
             .await
             .context("the job wrote no review")?;
-        anyhow::Ok(serde_json::from_slice::<ReviewOutput>(&text)?)
-    };
-    ran.await.map_err(|e| format!("{e:#}"))
+        Ok(serde_json::from_slice::<ReviewOutput>(&text)?)
+    }
 }
 
 /// Runs a job in the sandbox, on one of its slots: the directory its output is in. Hosted, it
-/// counts as the queue's jobs do.
+/// counts as the queue's jobs do. `Outdated` if the PR moved off the job's head first.
 async fn run_job(
     ctx: &Ctx,
     gh: &Installation,
@@ -308,18 +440,21 @@ async fn run_job(
     job_id: &str,
     spec: &JobSpec,
 ) -> Result<std::path::PathBuf> {
-    if let Some(b) = &ctx.billing {
-        let private = GitHub::snapshot(gh, &key.repo, &settings.labels())
-            .await?
-            .private;
-        b.job(key.installation_id, private, unix_now()).await?;
-    }
     let out = ctx.config.data_dir.join("jobs").join(job_id);
     let _ = tokio::fs::remove_dir_all(&out).await;
-    let result = {
-        let _slot = ctx.jobs.acquire().await?;
-        ctx.executor.run(job_id, spec, &out).await?
+    let job = async {
+        if let Some(b) = &ctx.billing {
+            let private = GitHub::snapshot(gh, &key.repo, &settings.labels())
+                .await?
+                .private;
+            b.job(key.installation_id, private, unix_now()).await?;
+        }
+        ctx.executor.run(job_id, spec, &out).await
     };
+    let result = ctx
+        .jobs
+        .run(gh, key, number, (&spec.head_ref, &spec.head_sha), job)
+        .await?;
     for e in &result.events {
         record(ctx, key, number, &e.kind, &e.message).await?;
     }
@@ -388,33 +523,37 @@ fn rounds_spent(earlier: &[ReviewRecord]) -> bool {
             .all(|e| e.answered_by.is_none() && e.findings.iter().any(|j| j.sent_back))
 }
 
-/// Ends the review: approved when it holds nothing, sent back to the author when it found what
-/// they should fix, else it asks the people who own the code in question. `Err` is why the
-/// agent could not review: a human reviews the whole PR. Then posts it on GitHub.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn conclude(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    pr: &PullRequest,
-    r: &ReviewRecord,
-    settings: &RepoSettings,
-    bars: &ReviewSettings,
-    output: std::result::Result<ReviewOutput, String>,
-) -> Result<()> {
-    // The PR may have moved while the agent ran: then the review posts nothing and the PR ends no
-    // hold. It is dropped, for a review of a later head to take its place.
-    let Some(now) = as_reviewed(ctx, gh, key, r, settings).await? else {
-        return ctx.store.stale_review(r.id, r.claim).await;
-    };
-    let done = judge(ctx, gh, pr, r, bars, output).await?;
-    if !ctx.store.finish_review(r.id, r.claim, &done).await? {
-        return Ok(());
+impl Reviewing<'_> {
+    /// Ends the review: approved when it holds nothing, sent back to the author when it found
+    /// what they should fix, else it asks the people who own the code in question. `Err` is why
+    /// the agent could not review: a human reviews the whole PR. Then posts it on GitHub.
+    pub(crate) async fn conclude(
+        &self,
+        ctx: &Ctx,
+        output: std::result::Result<ReviewOutput, String>,
+    ) -> Result<()> {
+        let Self {
+            gh,
+            ref key,
+            pr,
+            record: r,
+            settings,
+            bars,
+        } = *self;
+        // The PR may have moved while the agent ran: then the review posts nothing and the PR ends no
+        // hold. It is dropped, for a review of a later head to take its place.
+        let Some(now) = as_reviewed(ctx, gh, key, r, settings).await? else {
+            return ctx.store.stale_review(r.id, r.claim).await;
+        };
+        let done = judge(ctx, gh, pr, r, bars, output).await?;
+        if !ctx.store.finish_review(r.id, r.claim, &done).await? {
+            return Ok(());
+        }
+        settle_earlier(ctx, r, &done).await?;
+        let (kind, message) = ended(&done);
+        record(ctx, key, r.number, kind, &message).await?;
+        publish(ctx, gh, key, &now, r, &done).await
     }
-    settle_earlier(ctx, r, &done).await?;
-    let (kind, message) = ended(&done);
-    record(ctx, key, r.number, kind, &message).await?;
-    publish(ctx, gh, key, &now, r, &done).await
 }
 
 /// What the review holds the PR for, and who it asks: what the agent found, judged by the
@@ -722,20 +861,54 @@ fn fitted(render: impl Fn(bool) -> String) -> String {
     }
 }
 
+/// Terminal decoration has no meaning in Markdown. Keep the text and its indentation, without
+/// color codes, cursor commands or hyperlink targets. The stored evidence stays untouched.
+fn plain_output(output: &str) -> String {
+    struct Text(String);
+
+    impl vte::Perform for Text {
+        fn print(&mut self, c: char) {
+            self.0.push(c);
+        }
+
+        fn execute(&mut self, byte: u8) {
+            if matches!(byte, b'\n' | b'\t') {
+                self.0.push(char::from(byte));
+            }
+        }
+    }
+
+    let mut text = Text(String::with_capacity(output.len()));
+    vte::Parser::new().advance(&mut text, output.as_bytes());
+    text.0
+}
+
+/// A fence longer than every backtick run in the content keeps output and patches inside it.
+fn code_block(text: &str, language: &str) -> String {
+    let longest = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat(3.max(longest + 1));
+    format!("{fence}{language}\n{text}\n{fence}")
+}
+
 /// What MergeLoop ran on `head` to show a finding, and what it printed: the author runs the same.
 /// With `patch`, the test it wrote, whole.
 fn shows_it(e: &Evidence, head: &str, patch: bool) -> String {
+    let output = plain_output(&e.output);
     let mut text = format!(
-        "**Shows it:** MergeLoop ran `{}` on `{head}` and it failed:\n\n```\n{}\n```\n\n",
+        "**Shows it:** MergeLoop ran `{}` on `{head}` and it failed:\n\n{}\n\n",
         clip(&e.command, COMMAND_CHARS),
-        clip(e.output.trim_end(), TEXT_CHARS)
+        code_block(&clip(output.trim_end(), TEXT_CHARS), "")
     );
     let files = clip(&e.files.join(", "), COMMAND_CHARS).into_owned();
     match (e.patch.is_empty(), patch) {
         (true, _) => {}
         (false, true) => text.push_str(&format!(
-            "<details><summary>With the test it wrote, in {files}</summary>\n\n```diff\n{}\n```\n\n</details>\n\n",
-            e.patch.trim_end(),
+            "<details><summary>With the test it wrote, in {files}</summary>\n\n{}\n\n</details>\n\n",
+            code_block(e.patch.trim_end(), "diff"),
         )),
         (false, false) => text.push_str(&format!(
             "With the test it wrote, in {files}, too long to show here: the PR's review in MergeLoop has it to download.\n\n"
@@ -973,18 +1146,12 @@ async fn question(ctx: &Ctx, r: ReviewRecord, q: mergepatrol_core::Question) -> 
             question: q.question.clone(),
             sent_back,
         };
-        let (mut spec, granted) = job_spec(
-            ctx,
-            &gh,
-            &key,
-            &pr,
-            &settings,
-            &r.head_sha,
-            &trunk,
-            None,
-            task,
-        )
-        .await?;
+        let commits = Commits {
+            head: &r.head_sha,
+            onto: &trunk,
+            below: None,
+        };
+        let (mut spec, granted) = job_spec(ctx, &gh, &key, &pr, &settings, commits, task).await?;
         spec.base_ref = below(&pr);
         if granted.is_none() {
             bail!("{NO_KEY} in the workspace's settings: the agent cannot answer.");
@@ -1147,6 +1314,60 @@ mod tests {
         }
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn unpersistable_review_output_retries_then_becomes_an_explicit_error(
+        pool: sqlx::PgPool,
+    ) {
+        let store = mergepatrol_store::PgStore::migrate(pool.clone())
+            .await
+            .unwrap();
+        let repo = RepoName::parse("o/r").unwrap();
+        let started = store
+            .start_review(1, &repo, 7, "head", None, None)
+            .await
+            .unwrap();
+        let mut finding = review(1, true, None).findings.remove(0);
+        finding.finding.evidence.as_mut().unwrap().output = "before\0after".into();
+        let done = ReviewDone {
+            status: ReviewStatus::Changes,
+            error: None,
+            summary: "Review completed".into(),
+            findings: vec![finding],
+            asked: Vec::new(),
+        };
+        for attempt in 0..ATTEMPTS {
+            let claimed = store.claim_review(STALE).await.unwrap().unwrap();
+            assert_eq!(claimed.attempts, attempt);
+            let failed = store
+                .finish_review(claimed.id, claimed.claim, &done)
+                .await
+                .unwrap_err();
+            assert!(format!("{failed:#}").contains("unsupported Unicode escape"));
+            assert!(
+                recover_conclusion(&store, &claimed, Err(failed))
+                    .await
+                    .is_err()
+            );
+            let saved = store.review(started.id).await.unwrap().unwrap();
+            if attempt + 1 < ATTEMPTS {
+                assert_eq!(saved.status, ReviewStatus::Pending);
+                sqlx::query(
+                    "UPDATE agent_reviews SET retry_at = now() - interval '1 second' WHERE id = $1",
+                )
+                .bind(started.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            } else {
+                assert_eq!(saved.status, ReviewStatus::Asks);
+                assert!(saved.error.unwrap().contains("unsupported Unicode escape"));
+                assert!(saved.summary.contains("could not complete"));
+                assert!(saved.findings.is_empty());
+                assert!(store.claim_review(STALE).await.unwrap().is_none());
+            }
+        }
+    }
+
     #[test]
     fn a_findings_thread_carries_its_title_for_the_next_review_to_find() {
         let mut f = review(1, true, None).findings.remove(0);
@@ -1234,6 +1455,60 @@ mod tests {
             assert!(body.chars().count() <= BODY_CHARS);
             assert!(body.contains("too long to show here") && !body.contains("+xxx"));
             assert!(body.contains("FAILED again"));
+        }
+    }
+
+    #[test]
+    fn evidence_in_threads_and_replies_is_plain_text() {
+        let mut f = review(1, true, None).findings.remove(0);
+        let output = concat!(
+            "\u{1b}[32m- Expected\u{1b}[39m\n",
+            "\u{1b}[31m+ Received\u{1b}[39m\n\n",
+            "\u{1b}[2m  [\u{1b}[22m\n",
+            "\u{1b}[32m-   \"after edit\",\u{1b}[39m\n",
+            "\u{1b}[31m+   \"before edit\",\u{1b}[39m\n",
+            "\u{1b}[2m  ]\u{1b}[22m\n",
+            "\t\u{1b}[36m>\u{1b}[39m test.ts:179:42 → café\n",
+            "\u{1b}]8;;https://example.com\u{1b}\\test.ts\u{1b}]8;;\u{1b}\\\n"
+        );
+        f.finding.evidence.as_mut().unwrap().output = output.into();
+        for body in [thread_body(&f, "abc1234"), still_holds(&f, "def5678")] {
+            assert!(
+                body.contains(concat!(
+                    "```\n- Expected\n+ Received\n\n",
+                    "  [\n-   \"after edit\",\n+   \"before edit\",\n  ]\n",
+                    "\t> test.ts:179:42 → café\ntest.ts\n```"
+                )),
+                "{body}"
+            );
+            assert!(!body.contains('\u{1b}'), "{body}");
+            assert!(!body.contains("https://example.com"), "{body}");
+        }
+        assert_eq!(f.finding.evidence.as_ref().unwrap().output, output);
+
+        // Terminal decoration does not consume the comment's output allowance.
+        f.finding.evidence.as_mut().unwrap().output = format!(
+            "{}readable failure",
+            "\u{1b}[32m\u{1b}[0m".repeat(TEXT_CHARS)
+        );
+        assert!(thread_body(&f, "abc1234").contains("```\nreadable failure\n```"));
+    }
+
+    #[test]
+    fn evidence_backticks_cannot_close_its_code_blocks() {
+        let mut f = review(1, true, None).findings.remove(0);
+        let e = f.finding.evidence.as_mut().unwrap();
+        e.output = "Expected markdown:\n```rust\nlet x = 1;\n```".into();
+        e.patch = "+```\n+example\n+```".into();
+        for body in [thread_body(&f, "abc1234"), still_holds(&f, "def5678")] {
+            assert!(
+                body.contains("````\nExpected markdown:\n```rust\nlet x = 1;\n```\n````"),
+                "{body}"
+            );
+            assert!(
+                body.contains("````diff\n+```\n+example\n+```\n````\n\n</details>"),
+                "{body}"
+            );
         }
     }
 

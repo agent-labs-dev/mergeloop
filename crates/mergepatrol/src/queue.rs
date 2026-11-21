@@ -10,13 +10,13 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
-use mergepatrol_analytics::{Analytics, Exit};
+use mergepatrol_analytics::{Analytics, Exit, QueuedPr};
 use mergepatrol_billing::Billing;
 use mergepatrol_core::{
     BatchStep, BuiltBatch, CHECKS_MISSING_FOR, CHECKS_TIMEOUT, Candidate, CheckFailure, ConfigPath,
-    EjectReason, EntryState, Event, Hold, Job, Lane, LaneChange, LayerHead, PendingMerge, Phase,
-    PrNumber, PrSummary, RECHECK_MESSAGE, RepoName, RepoSettings, ReviewSettings, ReviewStatus,
-    SpendTask, Transition, body_closing_commit_issues,
+    EjectReason, EntryState, Event, Hold, Job, Lane, LaneChange, LayerHead, PendingMerge, Person,
+    Phase, PrNumber, PrSummary, RECHECK_MESSAGE, RepoName, RepoSettings, ReviewSettings,
+    ReviewStatus, SpendTask, Transition, body_closing_commit_issues,
 };
 use mergepatrol_executor::protocol::{
     ApiAccess, BUNDLE_FILE, JobEvent, JobOutcome, JobSpec, MAX_BUNDLE_BYTES, ResolverSpec, Task,
@@ -30,8 +30,9 @@ use mergepatrol_github::{
     PullRequest, RateLimited, RepoSnapshot,
 };
 use mergepatrol_store::{AgentTask, Change, GITHUB_APP, LaneKey, PgStore, Scope, Store, Vault};
+use parking_lot::Mutex;
 use secrecy::ExposeSecret;
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -42,6 +43,7 @@ use crate::github::GitHub;
 use crate::job::{GAVE_UP, LEFT_CONFLICT, RETITLED};
 use crate::publish::{Publish, create_commits, create_merge, publish};
 use crate::review::REVIEW_MARKS;
+use crate::slots::{JobSlots, Outdated};
 
 const CHECKS_POLL: Duration = Duration::from_secs(15);
 /// With no required checks, how long after a publish its checks may first count as green: a
@@ -89,7 +91,7 @@ pub struct Ctx {
     pub proxy: Arc<ApiProxy>,
     pub chatgpt: ChatGpt,
     /// Sandboxed jobs running at once, across repos. A PR waiting for its checks holds none.
-    pub jobs: Semaphore,
+    pub jobs: JobSlots,
     pub wakers: Arc<Wakers>,
     pub analytics: Analytics,
     pub prs: Prs,
@@ -107,24 +109,24 @@ pub struct Ctx {
 
 /// Fork PRs waiting for their pin: the `labeled` webhook, or for their pull ref to show it.
 #[derive(Default)]
-pub struct Unpinned(std::sync::Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
+pub struct Unpinned(Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
 
 impl Unpinned {
     /// How long ago the queue first saw the PR without its pin.
     fn waited(&self, key: &LaneKey, number: PrNumber) -> Duration {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         let k = (key.installation_id, key.repo.clone(), number);
         map.entry(k).or_insert_with(Instant::now).elapsed()
     }
 
     fn forget(&self, key: &LaneKey, number: PrNumber) {
         let k = (key.installation_id, key.repo.clone(), number);
-        self.0.lock().unwrap().remove(&k);
+        self.0.lock().remove(&k);
     }
 
     /// Forgets the repo's PRs that lost the label: a new labeling waits afresh.
     fn keep_labeled(&self, installation: u64, repo: &RepoName, labeled: &[PullRequest]) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.retain(|(i, r, number), _| {
             *i != installation || r != repo || labeled.iter().any(|pr| pr.number == *number)
         });
@@ -133,18 +135,18 @@ impl Unpinned {
 
 /// Since when each PR's job has failed on every try, on errors outside the job.
 #[derive(Default)]
-pub struct JobErrors(std::sync::Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
+pub struct JobErrors(Mutex<HashMap<(u64, RepoName, PrNumber), Instant>>);
 
 impl JobErrors {
     /// How long the PR's job has failed, this time included.
     fn failed(&self, key: &LaneKey, number: PrNumber) -> Duration {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         let key = (key.installation_id, key.repo.clone(), number);
         map.entry(key).or_insert_with(Instant::now).elapsed()
     }
 
     fn clear(&self, key: &LaneKey, number: PrNumber) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.remove(&(key.installation_id, key.repo.clone(), number));
     }
 }
@@ -152,22 +154,29 @@ impl JobErrors {
 /// Each PR in a repo's queue as of its last tick: whose queue events they are, and what the
 /// history keeps of it once it leaves.
 #[derive(Default)]
-pub struct Prs(std::sync::Mutex<HashMap<(u64, RepoName), HashMap<PrNumber, PrSummary>>>);
+pub struct Prs(Mutex<HashMap<(u64, RepoName), HashMap<PrNumber, PrSummary>>>);
 
 impl Prs {
     /// The PRs of the repo's lanes before they sync, so a PR that just left is still here, and
     /// the labeled PRs, so one that just joined is.
-    fn update(&self, installation: u64, repo: &RepoName, lanes: &[Lane], labeled: &[PullRequest]) {
+    fn update(
+        &self,
+        installation: u64,
+        repo: &RepoName,
+        lanes: &[Lane],
+        labeled: &[PullRequest],
+        builders: &Builders,
+    ) {
         let left = lanes.iter().flat_map(|lane| &lane.entries);
-        let left = left.map(|e| (e.number, e.summary.clone()));
-        let labeled = labeled.iter().map(|pr| (pr.number, pr.summary()));
+        let left = left.map(|e| (e.number, builders.saved(e.number, e.summary.clone())));
+        let labeled = labeled.iter().map(|pr| (pr.number, builders.summary(pr)));
         let prs = left.chain(labeled).collect();
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.insert((installation, repo.clone()), prs);
     }
 
     fn get(&self, key: &LaneKey, number: PrNumber) -> Option<PrSummary> {
-        let map = self.0.lock().unwrap();
+        let map = self.0.lock();
         map.get(&(key.installation_id, key.repo.clone()))?
             .get(&number)
             .cloned()
@@ -180,13 +189,49 @@ impl Prs {
     }
 }
 
+/// The developers behind the repo's PRs that the build lane opened, by PR. The App opens a built
+/// PR, so GitHub has the App's bot as its author: for seats and history it is the PR of the
+/// developer who holds its build when the count is made.
+#[derive(Default)]
+struct Builders(HashMap<PrNumber, String>);
+
+impl Builders {
+    /// Those behind `prs`, the PRs this tick looks at.
+    async fn read(ctx: &Ctx, installation: u64, repo: &RepoName, prs: &[PrNumber]) -> Result<Self> {
+        let builders = ctx.store.builders(installation, repo, prs).await?;
+        Ok(Self(builders.into_iter().collect()))
+    }
+
+    /// What the dashboard and the history show of `pr`: a PR the lane built is its developer's.
+    fn summary(&self, pr: &PullRequest) -> PrSummary {
+        let summary = pr.summary();
+        match summary.author.as_ref().is_some_and(|a| a.bot) {
+            true => self.saved(pr.number, summary),
+            false => summary,
+        }
+    }
+
+    /// `summary` of PR `number` as an earlier tick kept it, for whoever holds its build now.
+    /// GitHub's author is not at hand for a PR that left: a build has only a PR the App opened.
+    fn saved(&self, number: PrNumber, mut summary: PrSummary) -> PrSummary {
+        if let Some(login) = self.0.get(&number) {
+            summary.author = Some(Person {
+                login: login.clone(),
+                avatar_url: format!("https://github.com/{login}.png"),
+                bot: false,
+            });
+        }
+        summary
+    }
+}
+
 /// Webhooks wake a repo's queue before its poll is due. Polling still runs, in case one is lost.
 #[derive(Default)]
-pub struct Wakers(std::sync::Mutex<HashMap<(u64, RepoName), Arc<Notify>>>);
+pub struct Wakers(Mutex<HashMap<(u64, RepoName), Arc<Notify>>>);
 
 impl Wakers {
     fn get(&self, installation: u64, repo: &RepoName) -> Arc<Notify> {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.entry((installation, repo.clone())).or_default().clone()
     }
 
@@ -203,9 +248,13 @@ impl Wakers {
     }
 }
 
-impl mergepatrol_web::Wake for Wakers {
+impl mergepatrol_web::Wake for Ctx {
     fn wake(&self, installation: u64, repo: RepoName) {
-        self.get(installation, &repo).notify_one();
+        self.wakers.wake_repo(installation, &repo);
+    }
+
+    fn pushed(&self, installation: u64, repo: &RepoName, number: PrNumber, head: &str) {
+        self.jobs.saw(installation, repo, number, head);
     }
 }
 
@@ -514,7 +563,11 @@ async fn run_repo(ctx: Arc<Ctx>, gh: Installation, repo: RepoName) {
         gh.clone(),
         repo.clone(),
     )));
-    let sandbox = JobSandbox { ctx: &ctx, gh: &gh };
+    let sandbox = JobSandbox {
+        ctx: &ctx,
+        gh: &gh,
+        runs: Runs::InLane,
+    };
     let cached = Cached {
         gh: &gh,
         reader: Reader {
@@ -627,6 +680,7 @@ struct RepoRead {
     /// The repo's lanes as saved, each with its trunk.
     lanes: Vec<(String, Lane)>,
     gate: Option<mergepatrol_billing::Hold>,
+    builders: Builders,
 }
 
 impl RepoRead {
@@ -699,6 +753,37 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.store.set_config_error(installation, repo, None).await?;
     let labels = settings.labels();
     let snap = gh.snapshot(repo, &labels).await?;
+    // Only an ejection caused by required checks records retry intent. Keeping
+    // the failed label is required: removing it is an explicit opt-out.
+    for pr in &snap.failed {
+        if pr.has_label(&labels.trigger) || pr.is_cross_repository || pr.hold_reason().is_some() {
+            continue;
+        }
+        let marker = format!("retry-checks:{}", labels.failed);
+        let Some(failed_head) = ctx
+            .store
+            .label_head(installation, repo, pr.number, &marker)
+            .await?
+        else {
+            continue;
+        };
+        if failed_head.is_empty() || failed_head == pr.head_ref_oid {
+            continue;
+        }
+        let rules = gh.branch_rules(repo, &pr.base_ref_name).await?;
+        let checks = gh.checks(repo, &pr.head_ref_oid).await?;
+        if checks.by_name.is_empty() || checks.verdict(&rules.checks).0 != CheckState::Passed {
+            continue;
+        }
+        gh.add_label(repo, pr.number, &labels.trigger).await?;
+        gh.remove_label(repo, pr.number, &labels.failed).await?;
+        gh.sticky_comment(
+            repo,
+            pr.number,
+            "The new head passes the required checks. Queued again after the check failure.",
+        )
+        .await?;
+    }
     // So people find the labels in GitHub's picker, not only in the docs.
     for spec in labels.specs() {
         if snap.missing_labels.iter().any(|m| m == spec.name) {
@@ -709,8 +794,19 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.unpinned.keep_labeled(installation, repo, &snap.labeled);
     let units = units(gh, repo, &snap.labeled).await?;
     let layers: Vec<PullRequest> = units.iter().flat_map(|u| u.layers.clone()).collect();
+    for pr in &layers {
+        ctx.jobs
+            .saw(installation, repo, pr.number, &pr.head_ref_oid);
+    }
     let saved: Vec<Lane> = lanes.iter().map(|(_, lane)| lane.clone()).collect();
-    ctx.prs.update(installation, repo, &saved, &layers);
+    let left = saved
+        .iter()
+        .flat_map(|lane| &lane.entries)
+        .map(|e| e.number);
+    let seen: Vec<PrNumber> = left.chain(layers.iter().map(|pr| pr.number)).collect();
+    let builders = Builders::read(ctx, installation, repo, &seen).await?;
+    ctx.prs
+        .update(installation, repo, &saved, &layers, &builders);
     let gate = match &ctx.billing {
         Some(b) => {
             b.gate(installation, &repo.owner, snap.private, unix_now())
@@ -757,6 +853,7 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
         units,
         lanes,
         gate,
+        builders,
     }))
 }
 
@@ -772,12 +869,12 @@ fn no_queue(base: &str, default_branch: &str, settings: &RepoSettings) -> Hold {
 
 /// One lock per repo's git cache.
 #[derive(Default)]
-pub struct Caches(std::sync::Mutex<HashMap<RepoName, Arc<tokio::sync::Mutex<()>>>>);
+pub struct Caches(Mutex<HashMap<RepoName, Arc<tokio::sync::Mutex<()>>>>);
 
 impl Caches {
     async fn lock(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
-            let mut locks = self.0.lock().unwrap();
+            let mut locks = self.0.lock();
             locks.entry(repo.clone()).or_default().clone()
         };
         lock.lock_owned().await
@@ -800,6 +897,8 @@ async fn review_hold(
     if !review.enabled {
         return Ok(None);
     }
+    let mut statuses = Vec::with_capacity(heads.len());
+    let mut unresolved_hold = None;
     for (i, &(number, head, unresolved)) in heads.iter().enumerate() {
         let latest = ctx
             .store
@@ -840,19 +939,32 @@ async fn review_hold(
                         None
                     }
                 };
-                let carried = match &diff_id {
-                    Some(id) => {
+                let unreviewed =
+                    unreviewed(ctx, gh, key, number, base, head, diff_id.as_deref()).await?;
+                let carried = match &unreviewed {
+                    Unreviewed::Nothing { approved } => {
                         ctx.store
-                            .carry_unchanged(key.installation_id, &key.repo, number, head, id)
+                            .carry_review(key.installation_id, &key.repo, number, approved, head)
                             .await?
                     }
-                    None => false,
+                    _ => false,
                 };
                 if carried {
                     let why = "its changes are those of the head it approved";
                     record(ctx, key, number, "review-carried", why).await?;
                     ReviewStatus::Approved
                 } else {
+                    let since = match unreviewed {
+                        Unreviewed::After(at) => {
+                            let why = format!(
+                                "it approved the changes up to {}: only the commits pushed after it are reviewed",
+                                &at[..7.min(at.len())]
+                            );
+                            record(ctx, key, number, "review-since", &why).await?;
+                            Some(at)
+                        }
+                        _ => None,
+                    };
                     let r = ctx
                         .store
                         .start_review(
@@ -861,6 +973,7 @@ async fn review_hold(
                             number,
                             head,
                             diff_id.as_deref(),
+                            since.as_deref(),
                         )
                         .await?;
                     // Woken by the caller once the lane is saved: a PR just queued is in it then.
@@ -869,19 +982,107 @@ async fn review_hold(
                 }
             }
         };
-        if let Some(hold) = Hold::of_reviews(stacked, [(number, status)]) {
-            return Ok(Some(hold));
-        }
+        statuses.push((number, status));
         if review.require_resolved && unresolved > 0 {
             let hold = Hold::UnresolvedThreads { count: unresolved };
-            return Ok(Some(match stacked {
-                true => Hold::Layer {
-                    number,
-                    hold: Box::new(hold),
-                },
-                false => hold,
-            }));
+            if unresolved_hold.is_none() {
+                unresolved_hold = Some(match stacked {
+                    true => Hold::Layer {
+                        number,
+                        hold: Box::new(hold),
+                    },
+                    false => hold,
+                });
+            }
         }
+    }
+    Ok(Hold::of_reviews(stacked, statuses).or(unresolved_hold))
+}
+
+/// What of a PR's new head the agent has yet to review.
+#[derive(Debug, PartialEq)]
+enum Unreviewed {
+    /// Nothing: it changes what the head `approved` did, as a rebase keeps them.
+    Nothing {
+        approved: String,
+    },
+    /// The commits after this one of the head, which changes what an approved head did: the
+    /// author pushed them on top, after a rebase or without one.
+    After(String),
+    All,
+}
+
+/// What of PR `number`'s new `head` the agent has yet to review, from the PR's newest finished
+/// review, once that approved. `base` is where the PR's changes start, and `diff_id` the id of
+/// `head`'s. A head whose older commits changed, as an amend, a squash or a resolved conflict
+/// does, is reviewed whole, as is one GitHub cannot say enough about.
+async fn unreviewed(
+    ctx: &Ctx,
+    gh: &dyn GitHub,
+    key: &LaneKey,
+    number: PrNumber,
+    base: &str,
+    head: &str,
+    diff_id: Option<&str>,
+) -> Result<Unreviewed> {
+    let reviews = ctx
+        .store
+        .reviews_of(key.installation_id, &key.repo, number, u32::MAX)
+        .await?;
+    // A review that has yet to finish is of a head the PR left.
+    let finished = reviews.into_iter().find(|r| {
+        !matches!(
+            r.status,
+            ReviewStatus::Pending | ReviewStatus::Running | ReviewStatus::Stale
+        )
+    });
+    let Some(approved) = finished.filter(|r| r.status == ReviewStatus::Approved) else {
+        return Ok(Unreviewed::All);
+    };
+    let Some(id) = approved.diff_id.as_deref() else {
+        return Ok(Unreviewed::All);
+    };
+    if diff_id == Some(id) {
+        return Ok(Unreviewed::Nothing {
+            approved: approved.head_sha,
+        });
+    }
+    let after = approved_within(gh, &key.repo, base, &approved.head_sha, id, head);
+    Ok(match after.await {
+        Ok(Some(at)) => Unreviewed::After(at),
+        Ok(None) => Unreviewed::All,
+        Err(e) => {
+            tracing::warn!(repo = %key.repo, pr = number, error = %format!("{e:#}"), "could not read the PR's commits");
+            Unreviewed::All
+        }
+    })
+}
+
+/// The commit of `head` whose changes are those of `approved`, whose diff id is `id`, with more
+/// commits on top of it: as many commits from `base` as `approved` has.
+async fn approved_within(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    base: &str,
+    approved: &str,
+    id: &str,
+    head: &str,
+) -> Result<Option<String>> {
+    let Some(was) = gh.commits(repo, base, approved).await? else {
+        return Ok(None);
+    };
+    let Some(now) = gh.commits(repo, base, head).await? else {
+        return Ok(None);
+    };
+    let Some(at) = was.len().checked_sub(1).and_then(|i| now.get(i)) else {
+        return Ok(None);
+    };
+    if now.len() == was.len() {
+        return Ok(None);
+    }
+    // On the approved head itself, no rebase moved it.
+    if at == approved || gh.diff_id(repo, base, at).await?.as_deref() == Some(id) {
+        return Ok(Some(at.clone()));
     }
     Ok(None)
 }
@@ -991,14 +1192,19 @@ async fn tick_lane(
         repo: repo.clone(),
         trunk: trunk.to_owned(),
     };
+    let at = LaneRead {
+        key: &key,
+        snap: &snap,
+        settings: &settings,
+    };
     let mut lane = read.lane(trunk);
     if let Some(merge) = lane.merging.clone() {
         let number = merge.number;
-        if resume_merge(ctx, &settings, gh, &key, &snap, &mut lane, &units, merge).await? {
+        if resume_merge(ctx, gh, at, &mut lane, &units, merge).await? {
             units.retain(|u| u.number != number);
         }
     }
-    sync_lane(ctx, gh, read, &snap, &key, &mut lane, &units, &[]).await?;
+    sync_lane(ctx, gh, read, at, &mut lane, &units, &[]).await?;
 
     // Jobs run inside the tick, so a job still active here was cut short by a restart. A single
     // PR runs again. A batch picks up where it was, unless what it tests changed: then it is
@@ -1042,17 +1248,7 @@ async fn tick_lane(
     lane.activate(number);
     ctx.store.save_lane(&key, &lane).await?;
 
-    let job = run_job(
-        ctx,
-        &settings,
-        &read.review,
-        gh,
-        sandbox,
-        &key,
-        &snap,
-        &mut lane,
-        &unit,
-    );
+    let job = run_job(ctx, gh, sandbox, at, &read.review, &mut lane, &unit);
     let outcome = match job.await {
         Ok(o) => o,
         // Not the PR's fault, and likely to pass: it stays active, so the next tick runs it again.
@@ -1130,7 +1326,12 @@ async fn sync_while_running(
             // or the next sync would find them and say nothing of them.
             let running = lane.active();
             let mut synced = lane.clone();
-            sync_lane(ctx, gh, &read, &snap, key, &mut synced, &units, &running).await?;
+            let at = LaneRead {
+                key,
+                snap: &snap,
+                settings: &read.settings,
+            };
+            sync_lane(ctx, gh, &read, at, &mut synced, &units, &running).await?;
             *lane = synced;
             continue;
         }
@@ -1143,7 +1344,12 @@ async fn sync_while_running(
             trunk: trunk.clone(),
             ..key.clone()
         };
-        sync_lane(ctx, gh, &read, &snap, &other_key, &mut other, &units, &[]).await?;
+        let at = LaneRead {
+            key: &other_key,
+            snap: &snap,
+            settings: &read.settings,
+        };
+        sync_lane(ctx, gh, &read, at, &mut other, &units, &[]).await?;
     }
     Ok(())
 }
@@ -1151,21 +1357,23 @@ async fn sync_while_running(
 /// Makes the lane match `units`, the labeled PRs and stacks that merge into its trunk: each
 /// joins, waits, goes on hold or leaves, with an event and a comment, and the lane is saved. The
 /// entries of `running`, a job's that is under way, stay as they are.
-#[allow(clippy::too_many_arguments)]
 async fn sync_lane(
     ctx: &Ctx,
     gh: &dyn GitHub,
     read: &RepoRead,
-    snap: &RepoSnapshot,
-    key: &LaneKey,
+    at: LaneRead<'_>,
     lane: &mut Lane,
     units: &[Unit],
     running: &[PrNumber],
 ) -> Result<()> {
+    let LaneRead {
+        key,
+        snap,
+        settings,
+    } = at;
     let installation = key.installation_id;
     let repo = &key.repo;
     let trunk = key.trunk.as_str();
-    let settings = &read.settings;
     let gate = read.gate.clone();
     let labels = settings.labels();
     let units: Vec<&Unit> = units
@@ -1269,11 +1477,11 @@ async fn sync_lane(
                     true => unit
                         .layers
                         .iter()
-                        .map(|pr| (pr.number, pr.summary()).into())
+                        .map(|pr| (pr.number, read.builders.summary(pr)).into())
                         .collect(),
                     false => Vec::new(),
                 },
-                ..unit.layers[0].summary()
+                ..read.builders.summary(&unit.layers[0])
             },
             layers: if unit.stacked { unit.prs() } else { Vec::new() },
             pin,
@@ -1315,7 +1523,8 @@ async fn sync_lane(
             LaneChange::Enqueued(n) => {
                 if let Some(b) = &ctx.billing {
                     let unit = units.iter().find(|u| u.number == n);
-                    let authors = unit.map(|u| u.authors()).unwrap_or_default();
+                    let authors = unit.map(|u| u.authors(&read.builders));
+                    let authors = authors.unwrap_or_default();
                     b.queued(installation, snap.private, &authors, unix_now())
                         .await?;
                 }
@@ -1387,8 +1596,9 @@ async fn sync_lane(
         }
         if !joined.is_empty() {
             record_all(ctx, key, &joined, "enqueued", "added to the queue").await?;
-            let covered = comments.iter().any(|(n, _)| *n == e.number);
-            if let Some(comment) = standing(&e.state, gate.as_ref()).filter(|_| !covered) {
+            // A stack entry's standing comment covers its existing layers, but newly joined
+            // layers may still show a stale pre-stack comment. Refresh those layers directly.
+            if let Some(comment) = standing(&e.state, gate.as_ref()) {
                 joined_comments.push((joined, comment));
             }
         }
@@ -1448,12 +1658,13 @@ impl Unit {
         self.layers.iter().any(|pr| pr.has_label(label))
     }
 
-    /// The people who opened its PRs: no App, nor a deleted account.
-    fn authors(&self) -> Vec<String> {
+    /// The people whose PRs it has: who opened them, or the developer behind a PR the lane
+    /// built. No App, nor a deleted account.
+    fn authors(&self, builders: &Builders) -> Vec<String> {
         let mut authors: Vec<String> = self
             .layers
             .iter()
-            .filter_map(|pr| pr.summary().author)
+            .filter_map(|pr| builders.summary(pr).author)
             .filter(|a| !a.bot)
             .map(|a| a.login)
             .collect();
@@ -1909,7 +2120,8 @@ async fn finish(
     lane.merging = None;
     match outcome {
         Outcome::Merged(sha) => {
-            merged(ctx, settings, gh, key, lane, unit.number, &prs, &sha).await?
+            lane.remove(unit.number);
+            merged(ctx, settings, gh, key, &prs, &sha).await?
         }
         Outcome::Ejected(reason) => {
             lane.eject(unit.number);
@@ -1953,19 +2165,15 @@ async fn finish(
 }
 
 /// The entry `number` merged as `sha`, with its PRs `prs`.
-#[allow(clippy::too_many_arguments)]
 async fn merged(
     ctx: &Ctx,
     settings: &RepoSettings,
     gh: &dyn GitHub,
     key: &LaneKey,
-    lane: &mut Lane,
-    number: PrNumber,
     prs: &[PrNumber],
     sha: &str,
 ) -> Result<()> {
     let repo = &key.repo;
-    lane.remove(number);
     exit_once(ctx, key, prs, "merged", sha).await?;
     let labels = settings.labels();
     comment_all(gh, repo, prs, &format!("Merged as {sha}.")).await?;
@@ -2041,22 +2249,25 @@ async fn carry_layer(
 /// Sees through the merge a restart cut short, and whether it merged. Asked again while it is
 /// still open, GitHub waits for the merge pending, or merges it as the job would have. Otherwise
 /// it merged, or it left the queue unmerged.
-#[allow(clippy::too_many_arguments)]
 async fn resume_merge(
     ctx: &Ctx,
-    settings: &RepoSettings,
     gh: &dyn GitHub,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
+    at: LaneRead<'_>,
     lane: &mut Lane,
     units: &[Unit],
     merge: PendingMerge,
 ) -> Result<bool> {
+    let LaneRead {
+        key,
+        snap,
+        settings,
+    } = at;
     let repo = &key.repo;
     let open = units.iter().any(|u| {
         u.number == merge.number
             && u.top().number == merge.top
             && u.top().head_ref_oid == merge.head
+            && u.prs() == merge.prs
             && u.hold_reason().is_none()
     });
     let sha = if open {
@@ -2065,11 +2276,34 @@ async fn resume_merge(
             MergeOutcome::Rejected(_) => None,
         }
     } else {
-        gh.merged_as(repo, merge.top, &merge.head).await?
+        // A stack can change while this process is down. Confirm each recorded layer instead of
+        // treating the old list as the result of the merge. A removed layer must not receive a
+        // merged exit or comment just because the recorded top PR merged.
+        let mut merged_prs = Vec::with_capacity(merge.prs.len());
+        let mut top_sha = None;
+        for pr in &merge.prs {
+            let current = gh.pull_request(repo, *pr).await?;
+            if let Some(pr_sha) = gh.merged_as(repo, *pr, &current.head_ref_oid).await? {
+                if *pr == merge.top {
+                    top_sha = Some(pr_sha);
+                }
+                merged_prs.push(*pr);
+            }
+        }
+        if let Some(sha) = top_sha {
+            // Preserve the actual set for the reporting call below.
+            lane.merging = None;
+            lane.remove(merge.number);
+            merged(ctx, settings, gh, key, &merged_prs, &sha).await?;
+            ctx.store.save_lane(key, lane).await?;
+            return Ok(true);
+        }
+        None
     };
     lane.merging = None;
     if let Some(sha) = &sha {
-        merged(ctx, settings, gh, key, lane, merge.number, &merge.prs, sha).await?;
+        lane.remove(merge.number);
+        merged(ctx, settings, gh, key, &merge.prs, sha).await?;
     }
     ctx.store.save_lane(key, lane).await?;
     Ok(sha.is_some())
@@ -2683,15 +2917,19 @@ pub(crate) async fn record(
     kind: &str,
     message: &str,
 ) -> Result<()> {
-    ctx.analytics.queue_event(
-        key.installation_id,
-        &key.repo.to_string(),
-        &key.trunk,
-        number,
-        kind,
-        ctx.prs.author(key, number).as_deref(),
-    );
+    ctx.analytics.queue_event(&queued(ctx, key, number), kind);
     log(ctx, key, number, kind, message).await
+}
+
+/// The PR a queue event is about, for analytics.
+fn queued(ctx: &Ctx, key: &LaneKey, number: PrNumber) -> QueuedPr {
+    QueuedPr {
+        installation_id: key.installation_id,
+        repo: key.repo.to_string(),
+        trunk: key.trunk.clone(),
+        number,
+        author: ctx.prs.author(key, number),
+    }
 }
 
 /// A queue event, shown on the dashboard and logged but not counted.
@@ -2717,18 +2955,12 @@ async fn exit(
         .store
         .record_exit(key, number, outcome, detail, &summary)
         .await?;
-    ctx.analytics.queue_exit(
-        key.installation_id,
-        &key.repo.to_string(),
-        &key.trunk,
-        number,
-        outcome,
-        ctx.prs.author(key, number).as_deref(),
-        &Exit {
-            steps: steps.as_ref(),
-            reason,
-        },
-    );
+    let exit = Exit {
+        steps: steps.as_ref(),
+        reason,
+    };
+    ctx.analytics
+        .queue_exit(&queued(ctx, key, number), outcome, &exit);
     Ok(())
 }
 
@@ -2760,6 +2992,17 @@ async fn eject(
     let labels = settings.labels();
     let comment = format!("{why}\n\nAdd `{}` again to retry.", labels.trigger);
     for n in prs {
+        if reason != "checks-failed" {
+            ctx.store
+                .set_label_head(
+                    key.installation_id,
+                    &key.repo,
+                    *n,
+                    &format!("retry-checks:{}", labels.failed),
+                    "",
+                )
+                .await?;
+        }
         gh.remove_label(&key.repo, *n, &labels.trigger).await?;
         gh.add_label(&key.repo, *n, &labels.failed).await?;
         gh.sticky_comment(&key.repo, *n, &comment).await?;
@@ -2768,18 +3011,20 @@ async fn eject(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_job(
     ctx: &Ctx,
-    settings: &RepoSettings,
-    review: &ReviewSettings,
     gh: &dyn GitHub,
     sandbox: &dyn Sandbox,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
+    at: LaneRead<'_>,
+    review: &ReviewSettings,
     lane: &mut Lane,
     unit: &Unit,
 ) -> Result<Outcome> {
+    let LaneRead {
+        key,
+        snap,
+        settings,
+    } = at;
     let repo = &key.repo;
     let prs = unit.prs();
     // No agent fixes a fork PR: its code could read the agent's key.
@@ -2859,7 +3104,7 @@ async fn run_job(
                 record_all(ctx, key, &prs, "rebasing", &format!("onto {}", key.trunk)).await?;
                 let comment = format!("Rebasing onto `{}`.", key.trunk);
                 comment_all(gh, repo, &prs, &comment).await?;
-                let event = sandbox.rebase(key, snap, &now, settings, agent).await?;
+                let event = sandbox.rebase(at, &now, Conflicts::when(agent)).await?;
                 if event == Event::RebaseConflict {
                     ctx.prep
                         .conflicted(key, unit.number, &now.top().head_ref_oid);
@@ -2986,7 +3231,7 @@ async fn run_job(
                 };
                 let failures = gh.check_failures(repo, head, failed).await?;
                 let event = sandbox
-                    .fix(key, snap, &now, failing, settings, head, below, &failures)
+                    .fix(at, &now, failing, head, below, &failures)
                     .await?;
                 published_at = Instant::now();
                 if let Event::Fixed { head } = &event {
@@ -3023,9 +3268,7 @@ async fn run_job(
                     "The agent found nothing to fix in the code for {what}. Running the checks again."
                 );
                 comment_all(gh, repo, &prs, &comment).await?;
-                let event = sandbox
-                    .recheck(key, snap, &now, failing, settings, &heads[failing])
-                    .await?;
+                let event = sandbox.recheck(at, &now, failing, &heads[failing]).await?;
                 published_at = Instant::now();
                 if let Event::Fixed { head } = &event {
                     heads = now.branch_heads(gh, repo).await?;
@@ -3088,9 +3331,53 @@ async fn run_job(
         job = match job.step(event) {
             Transition::Continue(j) => j,
             Transition::Merged => unreachable!("merges return above"),
-            Transition::Ejected(r) => return Ok(Outcome::Ejected(r)),
+            Transition::Ejected(r) => {
+                if matches!(r, EjectReason::ChecksFailed { .. }) {
+                    let marker = format!("retry-checks:{}", settings.labels().failed);
+                    for (pr, head) in now.layers.iter().zip(&heads) {
+                        ctx.store
+                            .set_label_head(key.installation_id, repo, pr.number, &marker, head)
+                            .await?;
+                    }
+                }
+                return Ok(Outcome::Ejected(r));
+            }
             Transition::Held(r) => return Ok(Outcome::Held(r)),
         };
+    }
+}
+
+/// What a tick read of one lane: its key, the repo as GitHub had it for the lane, and the
+/// repo's settings.
+#[derive(Clone, Copy)]
+struct LaneRead<'a> {
+    key: &'a LaneKey,
+    snap: &'a RepoSnapshot,
+    settings: &'a RepoSettings,
+}
+
+/// Where a job that changes a unit's branches runs: in the lane, which sees the unit leave or
+/// move, or beside it while the unit gets ready, where nothing watches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Runs {
+    InLane,
+    BesideLane,
+}
+
+/// What a rebase does on a conflict: has the agent resolve it, or stops there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Conflicts {
+    Resolve,
+    Leave,
+}
+
+impl Conflicts {
+    /// `Resolve` where the `agent` may run.
+    fn when(agent: bool) -> Self {
+        match agent {
+            true => Conflicts::Resolve,
+            false => Conflicts::Leave,
+        }
     }
 }
 
@@ -3099,26 +3386,16 @@ async fn run_job(
 trait Sandbox: Send + Sync {
     /// Rebases the unit onto the trunk, a stack layer by layer: `Event::Rebased` with the new
     /// head of the top layer, or why it could not.
-    async fn rebase(
-        &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
-        unit: &Unit,
-        settings: &RepoSettings,
-        agent: bool,
-    ) -> Result<Event>;
+    async fn rebase(&self, at: LaneRead<'_>, unit: &Unit, conflicts: Conflicts) -> Result<Event>;
 
     /// Commits a fix for `failures` on top of `head`, the head of `unit.layers[layer]`, which
     /// sits on `base`. A stack's layers above it are rebased onto the fix. `Event::Fixed` with
     /// the new head of the top layer, or why it could not.
-    #[allow(clippy::too_many_arguments)]
     async fn fix(
         &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
+        at: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        settings: &RepoSettings,
         head: &str,
         base: &str,
         failures: &[CheckFailure],
@@ -3128,11 +3405,9 @@ trait Sandbox: Send + Sync {
     /// with the new head of the top layer.
     async fn recheck(
         &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
+        at: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        settings: &RepoSettings,
         head: &str,
     ) -> Result<Event>;
 }
@@ -3142,6 +3417,7 @@ trait Sandbox: Send + Sync {
 struct JobSandbox<'a> {
     ctx: &'a Ctx,
     gh: &'a Installation,
+    runs: Runs,
 }
 
 impl JobSandbox<'_> {
@@ -3158,98 +3434,49 @@ impl JobSandbox<'_> {
     }
 
     /// The layers above `layer` onto what `event` published on it, if it did.
-    #[allow(clippy::too_many_arguments)]
     async fn restack(
         &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
+        at: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        settings: &RepoSettings,
         event: Event,
-        beside_lane: bool,
     ) -> Result<Event> {
         if !matches!(event, Event::Fixed { .. }) || layer + 1 == unit.layers.len() {
             return Ok(event);
         }
         // The layers above the fix go onto it.
-        Ok(
-            match rebase_and_publish(
-                self.ctx,
-                self.gh,
-                key,
-                snap,
-                unit,
-                layer + 1,
-                settings,
-                true,
-                beside_lane,
-            )
-            .await?
-            {
-                Event::Rebased { head, .. } => Event::Fixed { head },
-                Event::RebaseFailed(r) => Event::FixFailed(format!("restacking after it: {r}")),
-                event => event,
-            },
-        )
+        let restacked = self
+            .rebase_and_publish(at, unit, layer + 1, Conflicts::Resolve)
+            .await?;
+        Ok(match restacked {
+            Event::Rebased { head, .. } => Event::Fixed { head },
+            Event::RebaseFailed(r) => Event::FixFailed(format!("restacking after it: {r}")),
+            event => event,
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn fix_and_restack(
-        &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
-        unit: &Unit,
-        layer: usize,
-        settings: &RepoSettings,
-        head: &str,
-        base: &str,
-        task: Task,
-        beside_lane: bool,
-    ) -> Result<Event> {
-        let fixed = fix_and_publish(
-            self.ctx,
-            self.gh,
-            key,
-            snap,
-            unit,
-            layer,
-            settings,
-            head,
-            base,
-            task,
-            beside_lane,
-        )
-        .await?;
-        self.restack(key, snap, unit, layer, settings, fixed, beside_lane)
-            .await
+    /// Whether a job that found the unit's branches at `heads` may publish: in the lane, which
+    /// sees the unit leave or move, always; beside it, while the unit is as the job found it.
+    async fn may_publish(&self, at: LaneRead<'_>, unit: &Unit, heads: &[String]) -> Result<bool> {
+        Ok(match self.runs {
+            Runs::InLane => true,
+            Runs::BesideLane => still_queued(self.gh, at.key, at.settings, unit, heads).await?,
+        })
     }
 }
 
 #[async_trait]
 impl Sandbox for JobSandbox<'_> {
-    async fn rebase(
-        &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
-        unit: &Unit,
-        settings: &RepoSettings,
-        agent: bool,
-    ) -> Result<Event> {
-        let event = rebase_and_publish(
-            self.ctx, self.gh, key, snap, unit, 0, settings, agent, false,
-        )
-        .await;
-        self.published(key, event).await
+    async fn rebase(&self, at: LaneRead<'_>, unit: &Unit, conflicts: Conflicts) -> Result<Event> {
+        let event = self.rebase_and_publish(at, unit, 0, conflicts).await;
+        self.published(at.key, event).await
     }
 
     async fn fix(
         &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
+        at: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        settings: &RepoSettings,
         head: &str,
         base: &str,
         failures: &[CheckFailure],
@@ -3257,41 +3484,46 @@ impl Sandbox for JobSandbox<'_> {
         let task = Task::FixChecks {
             failures: failures.to_vec(),
         };
-        let event = self
-            .fix_and_restack(key, snap, unit, layer, settings, head, base, task, false)
-            .await;
-        self.published(key, event).await
+        let event = async {
+            let fixed = self.fix_and_publish(at, unit, layer, head, base, task);
+            self.restack(at, unit, layer, fixed.await?).await
+        }
+        .await;
+        self.published(at.key, event).await
     }
 
     async fn recheck(
         &self,
-        key: &LaneKey,
-        snap: &RepoSnapshot,
+        at: LaneRead<'_>,
         unit: &Unit,
         layer: usize,
-        settings: &RepoSettings,
         head: &str,
     ) -> Result<Event> {
         let event = async {
-            let pushed = push_recheck(self.ctx, self.gh, key, snap, &unit.layers[layer], head);
-            let pushed = pushed.await?;
-            self.restack(key, snap, unit, layer, settings, pushed, false)
-                .await
+            let pr = &unit.layers[layer];
+            let pushed = push_recheck(self.ctx, self.gh, at.key, at.snap, pr, head);
+            self.restack(at, unit, layer, pushed.await?).await
         }
         .await;
-        self.published(key, event).await
+        self.published(at.key, event).await
     }
 }
 
-/// The repo's object cache, with the trunk and each layer's branch fetched: the layers' heads,
-/// bottom to top, and the trunk's.
+/// The repo's object cache, with the trunk and each layer's branch fetched.
+struct Fetched {
+    cache: std::path::PathBuf,
+    /// The layers' heads, bottom to top.
+    heads: Vec<String>,
+    trunk: String,
+}
+
 async fn fetch_layers(
     ctx: &Ctx,
     gh: &Installation,
     git: &Git,
     key: &LaneKey,
     layers: &[PullRequest],
-) -> Result<(std::path::PathBuf, Vec<String>, String)> {
+) -> Result<Fetched> {
     let repo = &key.repo;
     let cache = cache_path(&ctx.config.data_dir, &repo.owner, &repo.name);
     git.ensure_cache(&cache, &clone_url(repo)).await?;
@@ -3312,7 +3544,11 @@ async fn fetch_layers(
         );
     }
     let trunk = git.rev_parse(&cache, &trunk_ref).await?;
-    Ok((cache, heads, trunk))
+    Ok(Fetched {
+        cache,
+        heads,
+        trunk,
+    })
 }
 
 /// The full ref of a PR's head in the repo: its branch, or for a fork PR, its pull ref.
@@ -3329,25 +3565,33 @@ fn clone_url(repo: &RepoName) -> String {
 
 /// Where a job on a stack layer starts from: the layer below's branch, which holds what it goes
 /// onto, and the commit the layer's own changes start from. `None` for a PR or a stack's bottom.
+#[derive(Clone, Copy)]
 pub(crate) struct Below<'a> {
     branch: &'a str,
     upstream: &'a str,
 }
 
-/// The spec of a job on the PR at `head`, which sits on, or goes onto, `onto`. Its model API
-/// token works until the `Granted` is dropped: keep it for as long as the job runs.
-#[allow(clippy::too_many_arguments)]
+/// What a job on a PR works from: its `head`, which sits on, or goes onto, `onto`, and on a
+/// stack layer above the bottom, the layer `below`.
+#[derive(Clone, Copy)]
+pub(crate) struct Commits<'a> {
+    pub(crate) head: &'a str,
+    pub(crate) onto: &'a str,
+    pub(crate) below: Option<Below<'a>>,
+}
+
+/// The spec of a job on `pr`. Its model API token works until the `Granted` is dropped: keep it
+/// for as long as the job runs.
 pub(crate) async fn job_spec(
     ctx: &Ctx,
     gh: &Installation,
     key: &LaneKey,
     pr: &PullRequest,
     settings: &RepoSettings,
-    head: &str,
-    onto: &str,
-    below: Option<Below<'_>>,
+    commits: Commits<'_>,
     task: Task,
 ) -> Result<(JobSpec, Option<Granted>)> {
+    let Commits { head, onto, below } = commits;
     let agent = &settings.agent;
     let (provider, model) = agent.model(task.spend_task());
     // A fork PR's job gets no agent: without access, a conflict fails the job.
@@ -3441,159 +3685,152 @@ fn clean_moves(moved: &[usize], resolved: &[usize]) -> Vec<usize> {
     clean.copied().collect()
 }
 
-/// Runs a job in the sandbox, with its output in `out`: what it told of. `Err` says why it failed.
-async fn run_sandboxed(
-    ctx: &Ctx,
-    key: &LaneKey,
-    number: PrNumber,
-    job_id: &str,
-    spec: &JobSpec,
-    out: &Path,
-    private: bool,
-) -> Result<Vec<JobEvent>> {
-    let _ = tokio::fs::remove_dir_all(out).await;
-    record(ctx, key, number, "job", job_id).await?;
-    if let Some(b) = &ctx.billing {
-        b.job(key.installation_id, private, unix_now()).await?;
+impl JobSandbox<'_> {
+    /// Runs a job in the sandbox, with its output in `out`: what it told of. `Err` says why it
+    /// failed, `Outdated` if the PR moved off the job's head first.
+    async fn run_sandboxed(
+        &self,
+        key: &LaneKey,
+        number: PrNumber,
+        job_id: &str,
+        spec: &JobSpec,
+        out: &Path,
+        private: bool,
+    ) -> Result<Vec<JobEvent>> {
+        let ctx = self.ctx;
+        let _ = tokio::fs::remove_dir_all(out).await;
+        record(ctx, key, number, "job", job_id).await?;
+        let job = async {
+            if let Some(b) = &ctx.billing {
+                b.job(key.installation_id, private, unix_now()).await?;
+            }
+            ctx.executor
+                .run(job_id, spec, out)
+                .await
+                .context("the job failed")
+        };
+        let head = (spec.head_ref.as_str(), spec.head_sha.as_str());
+        let result = ctx.jobs.run(self.gh, key, number, head, job).await?;
+        for e in &result.events {
+            record(ctx, key, number, &e.kind, &e.message).await?;
+        }
+        if let JobOutcome::Failed { reason } = result.outcome {
+            bail!("{reason}");
+        }
+        Ok(result.events)
     }
-    let _slot = ctx.jobs.acquire().await?;
-    let result = ctx
-        .executor
-        .run(job_id, spec, out)
-        .await
-        .context("the job failed")?;
-    for e in &result.events {
-        record(ctx, key, number, &e.kind, &e.message).await?;
-    }
-    if let JobOutcome::Failed { reason } = result.outcome {
-        bail!("{reason}");
-    }
-    Ok(result.events)
 }
 
-/// Publishes the commits `base..local_head` to the PR branch, if it is still at `head`.
-#[allow(clippy::too_many_arguments)]
+/// Publishes the commits `base..local_head` to the PR branch, if it is still at `expected_head`.
 async fn publish_to_pr(
     gh: &Installation,
     git: &Git,
     cache: &Path,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
-    pr: &PullRequest,
-    head: &str,
-    base: &str,
-    local_head: &str,
+    p: Publish<'_>,
 ) -> Result<std::result::Result<String, Event>> {
-    let published = publish(
-        gh,
-        git,
-        cache,
-        Publish {
-            repo: &key.repo,
-            repo_id: &snap.id,
-            branch: &pr.head_ref_name,
-            expected_head: head,
-            base,
-            local_head,
-        },
-    )
-    .await;
-    match published {
+    let (repo, branch, head) = (p.repo, p.branch, p.expected_head);
+    match publish(gh, git, cache, p).await {
         Ok(sha) => Ok(Ok(sha)),
         // `updateRefs` refuses when the branch moved: the author pushed while the job ran.
-        Err(_) if gh.branch_sha(&key.repo, &pr.head_ref_name).await? != head => {
-            Ok(Err(Event::HeadMoved))
-        }
+        Err(_) if gh.branch_sha(repo, branch).await? != head => Ok(Err(Event::HeadMoved)),
         Err(e) => bail!("publishing failed: {e:#}"),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fix_and_publish(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
-    unit: &Unit,
-    layer: usize,
-    settings: &RepoSettings,
-    head: &str,
-    base: &str,
-    task: Task,
-    beside_lane: bool,
-) -> Result<Event> {
-    let repo = &key.repo;
-    let git = Git;
-    let pr = &unit.layers[layer];
-    let (cache, heads) = {
-        let _cache = ctx.caches.lock(repo).await;
-        let (cache, fetched, _) = fetch_layers(ctx, gh, &git, key, &unit.layers).await?;
-        if fetched[layer] != head {
-            return Ok(Event::HeadMoved);
-        }
-        (cache, fetched)
-    };
-    let job_id = format!(
-        "{}-{}-{}-fix-{}",
-        repo.owner,
-        repo.name,
-        pr.number,
-        &head[..8]
-    );
-    let out = ctx.config.data_dir.join("jobs").join(&job_id);
-    let below = (layer > 0).then(|| Below {
-        branch: &unit.layers[layer - 1].head_ref_name,
-        upstream: base,
-    });
-    // Only a fix of failed checks may propose a title: the job's word for it is not enough.
-    let may_retitle = matches!(task, Task::FixChecks { .. });
-    let (spec, granted) = job_spec(ctx, gh, key, pr, settings, head, base, below, task).await?;
-    if granted.is_none() {
-        let provider = spec.resolver.provider.name();
-        let mut why = format!("the workspace has no {provider} API key for the agent");
-        if let Some(url) = &spec.resolver.settings_url {
-            why.push_str(&format!(": add one in the dashboard's settings, {url}"));
-        }
-        return Ok(Event::FixFailed(why));
-    }
-    let fixed = async {
-        run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?;
-        let _cache = ctx.caches.lock(repo).await;
-        if beside_lane && !still_queued(gh, key, settings, unit, &heads).await? {
-            return anyhow::Ok(Err(Event::HeadMoved));
-        }
-        let local_head = check_fix_output(&git, &cache, &out, pr.number, head).await?;
-        let published =
-            publish_to_pr(gh, &git, &cache, key, snap, pr, head, head, &local_head).await?;
-        if let Ok(sha) = &published {
-            review_change(ctx, key, pr.number, head, sha).await?;
-        }
-        anyhow::Ok(published)
-    };
-    Ok(match fixed.await {
-        Ok(Ok(sha)) => Event::Fixed { head: sha },
-        Ok(Err(event)) => event,
-        Err(e) => {
-            let reason = format!("{e:#}");
-            match proposed_title(&reason, may_retitle) {
-                Some(title) => retitle(
-                    ctx,
-                    gh,
-                    key,
-                    settings,
-                    unit,
-                    layer,
-                    &heads,
-                    title,
-                    beside_lane,
-                )
-                .await
-                .unwrap_or_else(|e| Event::FixFailed(format!("{e:#}"))),
-                None if reason.starts_with(GAVE_UP) => Event::FixGaveUp(reason),
-                None => Event::FixFailed(reason),
+impl JobSandbox<'_> {
+    async fn fix_and_publish(
+        &self,
+        at: LaneRead<'_>,
+        unit: &Unit,
+        layer: usize,
+        head: &str,
+        base: &str,
+        task: Task,
+    ) -> Result<Event> {
+        let (ctx, gh) = (self.ctx, self.gh);
+        let LaneRead {
+            key,
+            snap,
+            settings,
+        } = at;
+        let repo = &key.repo;
+        let git = Git;
+        let pr = &unit.layers[layer];
+        let Fetched { cache, heads, .. } = {
+            let _cache = ctx.caches.lock(repo).await;
+            let fetched = fetch_layers(ctx, gh, &git, key, &unit.layers).await?;
+            if fetched.heads[layer] != head {
+                return Ok(Event::HeadMoved);
             }
+            fetched
+        };
+        let job_id = format!(
+            "{}-{}-{}-fix-{}",
+            repo.owner,
+            repo.name,
+            pr.number,
+            &head[..8]
+        );
+        let out = ctx.config.data_dir.join("jobs").join(&job_id);
+        let below = (layer > 0).then(|| Below {
+            branch: &unit.layers[layer - 1].head_ref_name,
+            upstream: base,
+        });
+        // Only a fix of failed checks may propose a title: the job's word for it is not enough.
+        let may_retitle = matches!(task, Task::FixChecks { .. });
+        let commits = Commits {
+            head,
+            onto: base,
+            below,
+        };
+        let (spec, granted) = job_spec(ctx, gh, key, pr, settings, commits, task).await?;
+        if granted.is_none() {
+            let provider = spec.resolver.provider.name();
+            let mut why = format!("the workspace has no {provider} API key for the agent");
+            if let Some(url) = &spec.resolver.settings_url {
+                why.push_str(&format!(": add one in the dashboard's settings, {url}"));
+            }
+            return Ok(Event::FixFailed(why));
         }
-    })
+        let fixed = async {
+            self.run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                .await?;
+            let _cache = ctx.caches.lock(repo).await;
+            if !self.may_publish(at, unit, &heads).await? {
+                return anyhow::Ok(Err(Event::HeadMoved));
+            }
+            let local_head = check_fix_output(&git, &cache, &out, pr.number, head).await?;
+            let publish = Publish {
+                repo,
+                repo_id: &snap.id,
+                branch: &pr.head_ref_name,
+                expected_head: head,
+                base: head,
+                local_head: &local_head,
+            };
+            let published = publish_to_pr(gh, &git, &cache, publish).await?;
+            if let Ok(sha) = &published {
+                review_change(ctx, key, pr.number, head, sha).await?;
+            }
+            anyhow::Ok(published)
+        };
+        Ok(match fixed.await {
+            Ok(Ok(sha)) => Event::Fixed { head: sha },
+            Ok(Err(event)) => event,
+            Err(e) if Outdated::caused(&e) => Event::HeadMoved,
+            Err(e) => {
+                let reason = format!("{e:#}");
+                match proposed_title(&reason, may_retitle) {
+                    Some(title) => self
+                        .retitle(at, unit, layer, &heads, title)
+                        .await
+                        .unwrap_or_else(|e| Event::FixFailed(format!("{e:#}"))),
+                    None if reason.starts_with(GAVE_UP) => Event::FixGaveUp(reason),
+                    None => Event::FixFailed(reason),
+                }
+            }
+        })
+    }
 }
 
 /// The title a job's failure `reason` proposes, if the job's task may propose one.
@@ -3611,32 +3848,30 @@ fn valid_title(title: &str) -> bool {
         && !title.contains(char::is_control)
 }
 
-/// Sets the title a fix's job proposed. A check reads it only on a new run, which is for the
-/// caller to start.
-#[allow(clippy::too_many_arguments)]
-async fn retitle(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    settings: &RepoSettings,
-    unit: &Unit,
-    layer: usize,
-    heads: &[String],
-    title: &str,
-    beside_lane: bool,
-) -> Result<Event> {
-    let pr = &unit.layers[layer];
-    if !valid_title(title) {
-        return Ok(Event::FixFailed(format!(
-            "the agent proposed a title GitHub would not take: {title}"
-        )));
+impl JobSandbox<'_> {
+    /// Sets the title a fix's job proposed. A check reads it only on a new run, which is for the
+    /// caller to start.
+    async fn retitle(
+        &self,
+        at: LaneRead<'_>,
+        unit: &Unit,
+        layer: usize,
+        heads: &[String],
+        title: &str,
+    ) -> Result<Event> {
+        let pr = &unit.layers[layer];
+        if !valid_title(title) {
+            return Ok(Event::FixFailed(format!(
+                "the agent proposed a title GitHub would not take: {title}"
+            )));
+        }
+        if !self.may_publish(at, unit, heads).await? {
+            return Ok(Event::HeadMoved);
+        }
+        self.gh.set_title(&at.key.repo, pr.number, title).await?;
+        record(self.ctx, at.key, pr.number, "retitled", title).await?;
+        Ok(Event::Retitled)
     }
-    if beside_lane && !still_queued(gh, key, settings, unit, heads).await? {
-        return Ok(Event::HeadMoved);
-    }
-    gh.set_title(&key.repo, pr.number, title).await?;
-    record(ctx, key, pr.number, "retitled", title).await?;
-    Ok(Event::Retitled)
 }
 
 /// Whether `unit` is as a job beside the lane found it, its branches at `heads`, and still queued:
@@ -3682,143 +3917,141 @@ async fn push_recheck(
     Ok(Event::Fixed { head: sha })
 }
 
-/// Rebases the unit's layers from `from` up and publishes them: the bottom onto the trunk, each
-/// other onto the layer below it as rebased. A layer already on what it goes onto is left as it
-/// is.
-///
-/// The layers' branches move together, in one atomic update at the end. Until then a rebased
-/// layer is on a branch of its own, for the next layer's job to fetch. So a restart, or an
-/// author's push, never leaves a layer rebased under one that is not: each layer's own commits
-/// still start at the layer below, as it is on GitHub. Without `agent`, a conflict stops it.
-#[allow(clippy::too_many_arguments)]
-async fn rebase_and_publish(
-    ctx: &Ctx,
-    gh: &Installation,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
-    unit: &Unit,
-    from: usize,
-    settings: &RepoSettings,
-    agent: bool,
-    beside_lane: bool,
-) -> Result<Event> {
-    let git = Git;
-    let (cache, heads, trunk) = {
-        let _cache = ctx.caches.lock(&key.repo).await;
-        fetch_layers(ctx, gh, &git, key, &unit.layers).await?
-    };
-    // A fork's author may have pushed since the queue checked the head against its pin.
-    if unit.fork() && heads[0] != unit.top().head_ref_oid {
-        return Ok(Event::HeadMoved);
-    }
-    let mut rebased: Vec<String> = heads[..from].to_vec();
-    let mut moved: Vec<usize> = Vec::new();
-    let mut resolved: Vec<usize> = Vec::new();
-    let mut merged: Vec<usize> = Vec::new();
-    let result = rebase_layers(
-        ctx,
-        gh,
-        &git,
-        &cache,
-        key,
-        snap,
-        unit,
-        settings,
-        agent,
-        &heads,
-        &trunk,
-        &mut rebased,
-        (&mut moved, &mut resolved, &mut merged),
-    )
-    .await;
-    for i in &moved {
-        gh.delete_branch(&key.repo, &restack_branch(&unit.layers[*i]))
-            .await?;
-    }
-    if let Err(e) = result {
-        // Not the PR's failure: the caller runs it again, as for any error outside the PR.
-        if TimedOut::caused(&e) {
-            return Err(e);
-        }
-        if !agent && format!("{e:#}").starts_with(LEFT_CONFLICT) {
-            return Ok(Event::RebaseConflict);
-        }
-        let failed = rebased.len();
-        return Ok(Event::RebaseFailed(match (unit.stacked, unit.fork()) {
-            (true, _) => format!("#{}: {e:#}", unit.layers[failed].number),
-            (false, true) => format!(
-                "{e:#}. MergeLoop runs no agent on a PR from a fork, so rebase it onto `{}` yourself",
-                key.trunk
-            ),
-            (false, false) => format!("{e:#}"),
-        }));
-    }
-    if unit.fork() {
-        let pr = unit.top();
-        if moved.is_empty() {
-            return Ok(Event::Rebased {
-                head: heads[0].clone(),
-                base: trunk,
-            });
-        }
-        let _cache = ctx.caches.lock(&key.repo).await;
-        let event =
-            publish_to_fork(gh, &git, &cache, key, pr, &heads[0], &rebased[0], trunk).await?;
-        if matches!(event, Event::Rebased { .. }) {
-            carry_reviews(ctx, key, &[(pr.number, &heads[0], &rebased[0])]).await?;
-        }
-        return Ok(event);
-    }
-
-    if beside_lane && !still_queued(gh, key, settings, unit, &heads).await? {
-        return Ok(Event::HeadMoved);
-    }
-    // Every layer, so that the update also fails if an author pushed to one left as it is: a
-    // layer's update to the head it has is its lease. Only a replay needs a force-push.
-    let moves: Vec<BranchMove> = unit
-        .layers
-        .iter()
-        .zip(heads.iter().zip(&rebased))
-        .enumerate()
-        .map(|(i, (pr, (before, after)))| BranchMove {
-            branch: &pr.head_ref_name,
-            before,
-            after,
-            force: moved.contains(&i) && !merged.contains(&i),
-        })
-        .collect();
-    if !moved.is_empty()
-        && let Err(e) = gh.update_branches(&snap.id, &moves).await
-    {
-        // `updateRefs` refuses when a branch moved: an author pushed while the jobs ran.
-        if unit.branch_heads(gh, &key.repo).await? != heads {
+impl JobSandbox<'_> {
+    /// Rebases the unit's layers from `from` up and publishes them: the bottom onto the trunk, each
+    /// other onto the layer below it as rebased. A layer already on what it goes onto is left as it
+    /// is.
+    ///
+    /// The layers' branches move together, in one atomic update at the end. Until then a rebased
+    /// layer is on a branch of its own, for the next layer's job to fetch. So a restart, or an
+    /// author's push, never leaves a layer rebased under one that is not: each layer's own commits
+    /// still start at the layer below, as it is on GitHub. Without `Conflicts::Resolve`, a conflict
+    /// stops it.
+    async fn rebase_and_publish(
+        &self,
+        at: LaneRead<'_>,
+        unit: &Unit,
+        from: usize,
+        conflicts: Conflicts,
+    ) -> Result<Event> {
+        let (ctx, gh) = (self.ctx, self.gh);
+        let LaneRead { key, snap, .. } = at;
+        let git = Git;
+        let fetched = {
+            let _cache = ctx.caches.lock(&key.repo).await;
+            fetch_layers(ctx, gh, &git, key, &unit.layers).await?
+        };
+        let Fetched { heads, trunk, .. } = &fetched;
+        // A fork's author may have pushed since the queue checked the head against its pin.
+        if unit.fork() && heads[0] != unit.top().head_ref_oid {
             return Ok(Event::HeadMoved);
         }
-        bail!("publishing failed: {e:#}");
+        let mut done = RebaseProgress {
+            rebased: heads[..from].to_vec(),
+            ..RebaseProgress::default()
+        };
+        let result = self
+            .rebase_layers(at, unit, &fetched, conflicts, &mut done)
+            .await;
+        let RebaseProgress {
+            mut rebased,
+            moved,
+            resolved,
+            merged,
+        } = done;
+        for i in &moved {
+            gh.delete_branch(&key.repo, &restack_branch(&unit.layers[*i]))
+                .await?;
+        }
+        if let Err(e) = result {
+            // Not the PR's failure: the caller runs it again, as for any error outside the PR.
+            if TimedOut::caused(&e) {
+                return Err(e);
+            }
+            if Outdated::caused(&e) {
+                return Ok(Event::HeadMoved);
+            }
+            if conflicts == Conflicts::Leave && format!("{e:#}").starts_with(LEFT_CONFLICT) {
+                return Ok(Event::RebaseConflict);
+            }
+            let failed = rebased.len();
+            return Ok(Event::RebaseFailed(match (unit.stacked, unit.fork()) {
+                (true, _) => format!("#{}: {e:#}", unit.layers[failed].number),
+                (false, true) => format!(
+                    "{e:#}. MergeLoop runs no agent on a PR from a fork, so rebase it onto `{}` yourself",
+                    key.trunk
+                ),
+                (false, false) => format!("{e:#}"),
+            }));
+        }
+        if unit.fork() {
+            let pr = unit.top();
+            if moved.is_empty() {
+                return Ok(Event::Rebased {
+                    head: heads[0].clone(),
+                    base: trunk.clone(),
+                });
+            }
+            let _cache = ctx.caches.lock(&key.repo).await;
+            let event = publish_to_fork(gh, &git, &fetched, &key.repo, pr, &rebased[0]).await?;
+            if matches!(event, Event::Rebased { .. }) {
+                carry_reviews(ctx, key, &[(pr.number, &heads[0], &rebased[0])]).await?;
+            }
+            return Ok(event);
+        }
+
+        if !self.may_publish(at, unit, heads).await? {
+            return Ok(Event::HeadMoved);
+        }
+        // Every layer, so that the update also fails if an author pushed to one left as it is: a
+        // layer's update to the head it has is its lease. Only a replay needs a force-push.
+        let moves: Vec<BranchMove> = unit
+            .layers
+            .iter()
+            .zip(heads.iter().zip(&rebased))
+            .enumerate()
+            .map(|(i, (pr, (before, after)))| BranchMove {
+                branch: &pr.head_ref_name,
+                before,
+                after,
+                force: moved.contains(&i) && !merged.contains(&i),
+            })
+            .collect();
+        if !moved.is_empty()
+            && let Err(e) = gh.update_branches(&snap.id, &moves).await
+        {
+            // `updateRefs` refuses when a branch moved: an author pushed while the jobs ran.
+            if unit.branch_heads(gh, &key.repo).await? != *heads {
+                return Ok(Event::HeadMoved);
+            }
+            bail!("publishing failed: {e:#}");
+        }
+        settle_reviews(ctx, key, unit, heads, &rebased, &moved, &resolved).await?;
+        Ok(Event::Rebased {
+            head: rebased.pop().expect("a unit has a PR"),
+            base: trunk.clone(),
+        })
     }
-    settle_reviews(ctx, key, unit, &heads, &rebased, &moved, &resolved).await?;
-    Ok(Event::Rebased {
-        head: rebased.pop().expect("a unit has a PR"),
-        base: trunk,
-    })
 }
 
 /// Moves fork PR `pr`'s branch from `before` to `after`, a commit created in this repo: GitHub
 /// lets the App push to a fork whose author allows edits by maintainers. The commit reaches the
 /// cache through a ref outside `refs/heads/`, on which no workflow runs the fork's code with this
-/// repo's secrets.
-#[allow(clippy::too_many_arguments)]
+/// repo's secrets. `before` is its head as `fetched`.
 async fn publish_to_fork(
     gh: &Installation,
     git: &Git,
-    cache: &Path,
-    key: &LaneKey,
+    fetched: &Fetched,
+    repo: &RepoName,
     pr: &PullRequest,
-    before: &str,
     after: &str,
-    trunk: String,
 ) -> Result<Event> {
-    let repo = &key.repo;
+    let Fetched {
+        cache,
+        heads,
+        trunk,
+    } = fetched;
+    let before = heads[0].as_str();
     let fork = pr.head_repository.as_ref().context("the fork is gone")?;
     let name = format!("refs/mergepatrol/publish/{}", pr.number);
     gh.delete_ref(repo, &name).await?;
@@ -3855,7 +4088,7 @@ async fn publish_to_fork(
     }
     Ok(Event::Rebased {
         head: after.to_owned(),
-        base: trunk,
+        base: trunk.clone(),
     })
 }
 
@@ -3864,123 +4097,142 @@ fn restack_branch(pr: &PullRequest) -> String {
     format!("mergeloop/restack-{}", pr.number)
 }
 
-/// Brings each layer from `rebased.len()` up to date, and creates its commits on GitHub: pushes
-/// its new head to `rebased`, its index to `moved` when it changed, to `resolved` when the agent
-/// resolved a conflict in it, and to `merged` when its base was merged into it.
-///
-/// A layer may be updated by a merge of its base, unless the repo merges PRs by rebasing them,
-/// which would replay the merge's commits, or a layer below it was rebased: a merge would then
-/// keep the commits that rebase replaced in this layer's history.
-#[allow(clippy::too_many_arguments)]
-async fn rebase_layers(
-    ctx: &Ctx,
-    gh: &Installation,
-    git: &Git,
-    cache: &Path,
-    key: &LaneKey,
-    snap: &RepoSnapshot,
-    unit: &Unit,
-    settings: &RepoSettings,
-    agent: bool,
-    heads: &[String],
-    trunk: &str,
-    rebased: &mut Vec<String>,
-    (moved, resolved, merged): (&mut Vec<usize>, &mut Vec<usize>, &mut Vec<usize>),
-) -> Result<()> {
-    let repo = &key.repo;
-    let mut may_merge = merge_method(gh, key, snap).await? != "rebase";
-    for i in rebased.len()..unit.layers.len() {
-        let pr = &unit.layers[i];
-        let head = &heads[i];
-        let onto = match i {
-            0 => trunk.to_owned(),
-            _ => rebased[i - 1].clone(),
-        };
-        if git.is_ancestor(cache, &onto, head).await? {
-            rebased.push(head.clone());
-            continue;
-        }
-        // The layer's own commits start at the layer below, as it is on GitHub. What they go
-        // onto is that layer rebased, on its own branch, or as it is.
-        let below_branch = match i {
-            0 => None,
-            _ if moved.contains(&(i - 1)) => Some(restack_branch(&unit.layers[i - 1])),
-            _ => Some(unit.layers[i - 1].head_ref_name.clone()),
-        };
-        let below = below_branch.as_deref().map(|branch| Below {
-            branch,
-            upstream: &heads[i - 1],
-        });
-        let upstream = below.as_ref().map(|b| b.upstream.to_owned());
-        let job_id = format!("{}-{}-{}-{}", repo.owner, repo.name, pr.number, &head[..8]);
-        let out = ctx.config.data_dir.join("jobs").join(&job_id);
-        let (mut spec, _granted) =
-            job_spec(ctx, gh, key, pr, settings, head, &onto, below, Task::Rebase).await?;
-        spec.leave_conflicts = !agent;
-        spec.update = match may_merge {
-            true => Update::Either,
-            false => Update::Rebase,
-        };
-        let ran = run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await;
-        let events = match ran {
-            // A replay of a long history can outlast the job: a merge does not replay it.
-            Err(e) if TimedOut::caused(&e) && spec.update == Update::Either => {
-                let why = format!("{e:#}: merging `{}` in instead", key.trunk);
-                record(ctx, key, pr.number, "merging-base", &why).await?;
-                spec.update = Update::Merge;
-                // The timed-out job revoked its token once it fetched.
-                spec.token = gh.read_token(&key.repo).await?;
-                let job_id = format!("{job_id}-merge");
-                run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?
-            }
-            ran => ran?,
-        };
-        if agent_resolved(&events) {
-            resolved.push(i);
-        }
-        let _cache = ctx.caches.lock(repo).await;
-        let updated = check_job_output(
-            git,
+/// How far a rebase of a unit's layers got: each layer's head once it is up to date, bottom to
+/// top, and the indexes of the layers it `moved`, the agent `resolved` a conflict in, and had
+/// their base `merged` into.
+#[derive(Default)]
+struct RebaseProgress {
+    rebased: Vec<String>,
+    moved: Vec<usize>,
+    resolved: Vec<usize>,
+    merged: Vec<usize>,
+}
+
+impl JobSandbox<'_> {
+    /// Brings each layer from `done.rebased.len()` up to date, and creates its commits on GitHub,
+    /// noting each in `done`. Without `Conflicts::Resolve`, a conflict stops it.
+    ///
+    /// A layer may be updated by a merge of its base, unless the repo merges PRs by rebasing them,
+    /// which would replay the merge's commits, or a layer below it was rebased: a merge would then
+    /// keep the commits that rebase replaced in this layer's history.
+    async fn rebase_layers(
+        &self,
+        at: LaneRead<'_>,
+        unit: &Unit,
+        fetched: &Fetched,
+        conflicts: Conflicts,
+        done: &mut RebaseProgress,
+    ) -> Result<()> {
+        let (ctx, gh, git) = (self.ctx, self.gh, &Git);
+        let LaneRead {
+            key,
+            snap,
+            settings,
+        } = at;
+        let Fetched {
             cache,
-            &out,
-            pr.number,
-            &onto,
-            head,
-            upstream.as_deref(),
-            spec.update,
-        )
-        .await?;
-        let publish = Publish {
-            repo,
-            repo_id: &snap.id,
-            branch: &pr.head_ref_name,
-            expected_head: head,
-            base: &onto,
-            local_head: &updated.head,
-        };
-        let sha = match updated.merged {
-            true => {
-                merged.push(i);
-                create_merge(gh, git, cache, &publish).await?
+            heads,
+            trunk,
+        } = fetched;
+        let RebaseProgress {
+            rebased,
+            moved,
+            resolved,
+            merged,
+        } = done;
+        let repo = &key.repo;
+        let mut may_merge = merge_method(gh, key, snap).await? != "rebase";
+        for i in rebased.len()..unit.layers.len() {
+            let pr = &unit.layers[i];
+            let head = &heads[i];
+            let onto = match i {
+                0 => trunk.to_owned(),
+                _ => rebased[i - 1].clone(),
+            };
+            if git.is_ancestor(cache, &onto, head).await? {
+                rebased.push(head.clone());
+                continue;
             }
-            false => {
-                may_merge = false;
-                create_commits(gh, git, cache, &publish).await?
+            // The layer's own commits start at the layer below, as it is on GitHub. What they go
+            // onto is that layer rebased, on its own branch, or as it is.
+            let below_branch = match i {
+                0 => None,
+                _ if moved.contains(&(i - 1)) => Some(restack_branch(&unit.layers[i - 1])),
+                _ => Some(unit.layers[i - 1].head_ref_name.clone()),
+            };
+            let below = below_branch.as_deref().map(|branch| Below {
+                branch,
+                upstream: &heads[i - 1],
+            });
+            let commits = Commits {
+                head,
+                onto: &onto,
+                below,
+            };
+            let job_id = format!("{}-{}-{}-{}", repo.owner, repo.name, pr.number, &head[..8]);
+            let out = ctx.config.data_dir.join("jobs").join(&job_id);
+            let (mut spec, _granted) =
+                job_spec(ctx, gh, key, pr, settings, commits, Task::Rebase).await?;
+            spec.leave_conflicts = conflicts == Conflicts::Leave;
+            spec.update = match may_merge {
+                true => Update::Either,
+                false => Update::Rebase,
+            };
+            let ran = self
+                .run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                .await;
+            let events = match ran {
+                // A replay of a long history can outlast the job: a merge does not replay it.
+                Err(e) if TimedOut::caused(&e) && spec.update == Update::Either => {
+                    let why = format!("{e:#}: merging `{}` in instead", key.trunk);
+                    record(ctx, key, pr.number, "merging-base", &why).await?;
+                    spec.update = Update::Merge;
+                    // The timed-out job revoked its token once it fetched.
+                    spec.token = gh.read_token(&key.repo).await?;
+                    let job_id = format!("{job_id}-merge");
+                    self.run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                        .await?
+                }
+                ran => ran?,
+            };
+            if agent_resolved(&events) {
+                resolved.push(i);
             }
-        };
-        rebased.push(sha.clone());
-        moved.push(i);
-        if i + 1 < unit.layers.len() {
-            // For the next layer's job, and for this cache, which the next layer's output
-            // must sit on.
-            let branch = restack_branch(pr);
-            gh.delete_branch(repo, &branch).await?;
-            gh.create_branch(repo, &branch, &sha).await?;
-            let refspec = format!("+refs/heads/{branch}:refs/mergepatrol/{branch}");
-            git.fetch(cache, &gh.token().await?, &[&refspec]).await?;
+            let _cache = ctx.caches.lock(repo).await;
+            let updated =
+                check_job_output(git, cache, &out, pr.number, commits, spec.update).await?;
+            let publish = Publish {
+                repo,
+                repo_id: &snap.id,
+                branch: &pr.head_ref_name,
+                expected_head: head,
+                base: &onto,
+                local_head: &updated.head,
+            };
+            let sha = match updated.merged {
+                true => {
+                    merged.push(i);
+                    create_merge(gh, git, cache, &publish).await?
+                }
+                false => {
+                    may_merge = false;
+                    create_commits(gh, git, cache, &publish).await?
+                }
+            };
+            rebased.push(sha.clone());
+            moved.push(i);
+            if i + 1 < unit.layers.len() {
+                // For the next layer's job, and for this cache, which the next layer's output
+                // must sit on.
+                let branch = restack_branch(pr);
+                gh.delete_branch(repo, &branch).await?;
+                gh.create_branch(repo, &branch, &sha).await?;
+                let refspec = format!("+refs/heads/{branch}:refs/mergepatrol/{branch}");
+                git.fetch(cache, &gh.token().await?, &[&refspec]).await?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// A rebase job's result, as `check_job_output` found it.
@@ -3995,18 +4247,17 @@ struct Updated {
 /// the PR's changes, and a merge only adds the base's, and a conflict can only be in a file the
 /// PR changed: the result may touch no file outside the PR's own. A merge, which `update` must
 /// allow, has the PR's head and the base as its parents. A stack layer's own changes start at
-/// `upstream`, the layer below as it was.
-#[allow(clippy::too_many_arguments)]
+/// its upstream, the layer below as it was.
 async fn check_job_output(
     git: &Git,
     cache: &Path,
     out: &Path,
     number: PrNumber,
-    onto: &str,
-    head: &str,
-    upstream: Option<&str>,
+    commits: Commits<'_>,
     update: Update,
 ) -> Result<Updated> {
+    let Commits { head, onto, below } = commits;
+    let upstream = below.map(|b| b.upstream);
     let local_head = import_job_output(git, cache, out, number).await?;
     let parents = git.parents(cache, &local_head).await?;
     let merged = parents.len() > 1;
@@ -4216,7 +4467,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/a-renamed HTTP/1.1",
                 "GET /repos/o/gone HTTP/1.1",
@@ -4280,7 +4531,12 @@ mod tests {
         Git.create_bundle(&work, &out.join(BUNDLE_FILE), &result, &trunk)
             .await
             .unwrap();
-        check_job_output(&Git, &cache, &out, 1, &trunk, &head, None, Update::Rebase)
+        let commits = Commits {
+            head: &head,
+            onto: &trunk,
+            below: None,
+        };
+        check_job_output(&Git, &cache, &out, 1, commits, Update::Rebase)
             .await
             .map(|u| u.head)
     }
@@ -4405,18 +4661,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_webhook_cuts_the_wait_short_even_when_it_came_first() {
-        use mergepatrol_web::Wake;
         let wakers = Wakers::default();
         let repo = RepoName::parse("o/r").unwrap();
         let hour = Duration::from_secs(3600);
 
-        wakers.wake(1, repo.clone());
+        wakers.wake_repo(1, &repo);
         let start = tokio::time::Instant::now();
         wakers.wait(1, &repo, hour).await;
         assert_eq!(start.elapsed(), Duration::ZERO);
 
         // Another repo's webhook does not count.
-        wakers.wake(1, RepoName::parse("o/other").unwrap());
+        wakers.wake_repo(1, &RepoName::parse("o/other").unwrap());
         wakers.wait(1, &repo, hour).await;
         assert_eq!(start.elapsed(), hour);
     }
@@ -4480,7 +4735,12 @@ mod tests {
         Git.create_bundle(&work, &out.join(BUNDLE_FILE), &result, &trunk)
             .await
             .unwrap();
-        check_job_output(&Git, &cache, &out, 1, &trunk, &head, None, update).await
+        let commits = Commits {
+            head: &head,
+            onto: &trunk,
+            below: None,
+        };
+        check_job_output(&Git, &cache, &out, 1, commits, update).await
     }
 
     #[tokio::test]

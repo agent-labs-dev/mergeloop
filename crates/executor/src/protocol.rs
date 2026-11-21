@@ -83,8 +83,8 @@ pub enum Task {
         answered: Vec<Answered>,
         #[serde(default)]
         sent_back: Vec<SentBack>,
-        /// The approved head it goes on from: only what the queue's agent changed since needs
-        /// reading.
+        /// The approved commit it goes on from, the approved head or one a rebase made of it:
+        /// only the commits after it need reading, the queue's agent's or the author's.
         #[serde(default)]
         since: Option<String>,
         /// The head `sent_back` went back on: once the PR's head descends from it, only what

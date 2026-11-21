@@ -175,7 +175,7 @@ mod tests {
                 .filter(|g| g.contains(&("grant_type".into(), "refresh_token".into())))
                 .count()
         };
-        assert_eq!(refreshes(&issuer.grants.lock().unwrap()), 1);
+        assert_eq!(refreshes(&issuer.grants.lock()), 1);
 
         // Only OpenAI's models run on the plan.
         assert_eq!(

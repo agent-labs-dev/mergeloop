@@ -554,6 +554,11 @@ impl RepoSettings {
     }
 
     /// The file that reads back as these settings over `defaults`, and sets nothing else.
+    ///
+    /// # Panics
+    ///
+    /// If `serde_yaml` fails to write the settings. They hold only strings, numbers, booleans
+    /// and lists of them, which it always writes.
     pub fn to_yaml(&self, defaults: &RepoSettings) -> String {
         let (s, d) = (&self.agent, &defaults.agent);
         // A model belongs to its provider, so the two are written together: the workspace's

@@ -57,19 +57,21 @@ async fn a_timeout_fallback_fetches_with_a_fresh_read_token() {
     let snap = GitHub::snapshot(&world.installation, &repo(), &settings.labels())
         .await
         .unwrap();
-    let event = rebase_and_publish(
-        &world.ctx,
-        &world.installation,
-        &world.key(),
-        &snap,
-        &unit,
-        0,
+    let sandbox = JobSandbox {
+        ctx: &world.ctx,
+        gh: &world.installation,
+        runs: Runs::InLane,
+    };
+    let key = world.key();
+    let at = LaneRead {
+        key: &key,
+        snap: &snap,
         settings,
-        true,
-        false,
-    )
-    .await
-    .unwrap();
+    };
+    let event = sandbox
+        .rebase_and_publish(at, &unit, 0, Conflicts::Resolve)
+        .await
+        .unwrap();
     assert!(matches!(event, Event::Rebased { .. }), "{event:?}");
     assert_eq!(
         *world.agent.updates.lock().unwrap(),

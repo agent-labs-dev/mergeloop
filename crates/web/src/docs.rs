@@ -64,6 +64,12 @@ pub const DOCS: &[Doc] = &[
             "How jobs are isolated",
         ],
     },
+    Doc {
+        slug: "build-lane",
+        title: "The build lane: issues built on your machines",
+        description: "Turn labeled issues into merged PRs with mergeloop daemon: an agent CLI on a developer's machine builds each one, a second reviews it, and MergeLoop opens and lands its PR. What the agent may do there, the config file, and dark merges.",
+        sections: &["The build lane"],
+    },
 ];
 
 /// Answers `/docs` and `/docs/<slug>` for a doc that exists. `None` for any other path, so the

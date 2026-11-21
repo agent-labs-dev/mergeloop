@@ -18,7 +18,7 @@ use tokio::sync::Barrier;
 
 use super::*;
 use crate::job::LEFT_CONFLICT;
-use crate::review::conclude;
+use crate::review::Reviewing;
 use mergepatrol_executor::protocol::ReviewOutput;
 
 mod outcomes_after_intervening_review;
@@ -600,7 +600,7 @@ impl World {
             .unwrap();
         ctx.config.data_dir = tmp.path().join("data");
         ctx.executor = agent.clone();
-        ctx.jobs = Semaphore::new(2);
+        ctx.jobs = JobSlots::new(2);
         // The App the review's comments mention, with no webhooks: the URL is http.
         ctx.hosted_app = Some(AppCredentials {
             id: 1,
@@ -664,6 +664,7 @@ impl World {
         let sandbox = JobSandbox {
             ctx: &self.ctx,
             gh: &self.installation,
+            runs: Runs::InLane,
         };
         tick(&self.ctx, &*self.gh, &sandbox, &repo())
             .await
@@ -768,7 +769,7 @@ impl World {
         let head = self.pr(1).head_ref_oid;
         let r = self
             .store
-            .start_review(1, &repo(), 1, &head, None)
+            .start_review(1, &repo(), 1, &head, None, None)
             .await
             .unwrap();
         self.conclude_review(&r, finding(confidence), settings)
@@ -782,20 +783,12 @@ impl World {
             summary: "s".into(),
             findings: vec![finding],
         };
-        let (key, pr) = (self.key(), self.pr(1));
+        let pr = self.pr(1);
         let bars = ReviewSettings::default();
-        conclude(
-            &self.ctx,
-            &self.installation,
-            &key,
-            &pr,
-            r,
-            settings,
-            &bars,
-            Ok(output),
-        )
-        .await
-        .unwrap();
+        Reviewing::new(&self.installation, &pr, r, settings, &bars)
+            .conclude(&self.ctx, Ok(output))
+            .await
+            .unwrap();
     }
 
     /// The PR's checks fail, and the agent's fix of them starts off the lane: the drain that
@@ -1335,6 +1328,60 @@ async fn a_pr_that_leaves_while_its_rebase_runs_gets_no_push() {
     }
 }
 
+/// The author pushes a commit to PR 1's branch: its new head.
+fn author_pushes(world: &World) -> String {
+    let origin = &world.origin;
+    git(origin, &["checkout", "-q", "pr-1"]);
+    let head = commit(origin, "more.txt", "more\n", "More from the author");
+    git(origin, &["checkout", "-q", "main"]);
+    world.gh.with_mut(|s| point_at_branch(s, 1, origin));
+    head
+}
+
+#[tokio::test]
+async fn a_push_while_a_rebase_waits_for_a_slot_drops_it_before_its_sandbox() {
+    for told in [true, false] {
+        let world = World::one_pr("shared.txt", "shared.txt").await;
+        world.gh.with_mut(|s| {
+            s.prs.get_mut(&1).unwrap().conflicting = true;
+        });
+        // Other repos' jobs hold every slot.
+        let mut held = Some((world.ctx.jobs.take(), world.ctx.jobs.take()));
+        let _drain = world.drain().await;
+        world.tick().await;
+        world
+            .until(|w| w.ctx.jobs.watched(1, &repo(), 1) == 1)
+            .await;
+
+        let pushed = author_pushes(&world);
+        match told {
+            // The webhook drops the job at once, slots or not.
+            true => mergepatrol_web::Wake::pushed(&*world.ctx, 1, &repo(), 1, &pushed),
+            // Without it, the job reads the head once it has its slot.
+            false => held = None,
+        }
+        let key = world.key();
+        world.until(|w| w.ctx.prep.claim(&key, 1).is_some()).await;
+        assert!(
+            world.tasks().is_empty(),
+            "told: {told}: no sandbox for the old head"
+        );
+        assert!(
+            !world.did(1, "prep-left"),
+            "told: {told}: {:?}",
+            world.kinds(1)
+        );
+        drop(held);
+
+        // The next tick asks for a rebase of the new head, which merges.
+        world.tick_until(|w| !w.merged().is_empty()).await;
+        assert_eq!(world.tasks(), [Task::Rebase], "told: {told}");
+        let head = world.branch("pr-1");
+        let shown = git(&world.origin, &["show", &format!("{head}:more.txt")]);
+        assert_eq!(shown, "more", "told: {told}: the push is in what merged");
+    }
+}
+
 #[tokio::test]
 async fn a_job_waits_for_the_cache_but_the_agent_does_not_hold_it() {
     let world = World::one_pr("feature.txt", "other.txt").await;
@@ -1404,7 +1451,7 @@ async fn approved_stack(
         let head = world.pr(n).head_ref_oid;
         let r = world
             .store
-            .start_review(1, &repo(), n, &head, None)
+            .start_review(1, &repo(), n, &head, None, None)
             .await
             .unwrap();
         world.store.finish_review(r.number, ReviewStatus::Approved);
@@ -1517,11 +1564,14 @@ async fn rebase_stack(world: &World) -> Event {
     let sandbox = JobSandbox {
         ctx: &world.ctx,
         gh: &world.installation,
+        runs: Runs::InLane,
     };
-    sandbox
-        .rebase(&key, &snap, &unit, settings, true)
-        .await
-        .unwrap()
+    let at = LaneRead {
+        key: &key,
+        snap: &snap,
+        settings,
+    };
+    sandbox.rebase(at, &unit, Conflicts::Resolve).await.unwrap()
 }
 
 /// The status of the review on PR `number`'s head, and the head it goes on from.
@@ -1589,7 +1639,7 @@ async fn a_pr_pushed_to_during_the_review_gets_no_out_of_date_review() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head, None)
+        .start_review(1, &repo(), 1, &head, None, None)
         .await
         .unwrap();
     world.gh.with_mut(|s| s.push(1, "pushed"));
@@ -1602,6 +1652,65 @@ async fn a_pr_pushed_to_during_the_review_gets_no_out_of_date_review() {
         ReviewStatus::Stale,
         "the new head gets its own review"
     );
+}
+
+#[tokio::test]
+async fn a_push_while_a_review_waits_or_runs_drops_it_for_the_new_head() {
+    for running in [false, true] {
+        let world = World::one_pr("feature.txt", "other.txt").await;
+        world.review_on();
+        let head = world.pr(1).head_ref_oid;
+        let r = world
+            .store
+            .start_review(1, &repo(), 1, &head, None, None)
+            .await
+            .unwrap();
+        // Waiting: other repos' jobs hold every slot. Running: the agent works until the push.
+        let held = (!running).then(|| (world.ctx.jobs.take(), world.ctx.jobs.take()));
+        let pushed = Arc::new(tokio::sync::Notify::new());
+        if running {
+            let pushed = pushed.clone();
+            world.during(async move {
+                pushed.notified().await;
+                std::future::pending::<()>().await;
+            });
+        }
+        let (pr, settings) = (world.pr(1), world.ctx.config.repo_defaults.clone());
+        let bars = ReviewSettings::default();
+        let reviewing = Reviewing::new(&world.installation, &pr, &r, &settings, &bars);
+        let push = async {
+            match running {
+                true => world.until(|w| !w.tasks().is_empty()).await,
+                false => {
+                    world
+                        .until(|w| w.ctx.jobs.watched(1, &repo(), 1) == 1)
+                        .await
+                }
+            }
+            let new = author_pushes(&world);
+            pushed.notify_one();
+            mergepatrol_web::Wake::pushed(&*world.ctx, 1, &repo(), 1, &new);
+        };
+        let reviewed = tokio::time::timeout(SETTLES_WITHIN, async {
+            tokio::join!(reviewing.review(&world.ctx), push).0
+        });
+        reviewed.await.expect("the push stopped it").unwrap();
+        let tasks = usize::from(running);
+        assert_eq!(world.tasks().len(), tasks, "running: {running}");
+        let status = world.store.review(r.id).await.unwrap().unwrap().status;
+        assert_eq!(status, ReviewStatus::Stale, "running: {running}");
+        assert!(
+            world.posted().is_empty(),
+            "running: {running}: nothing posted"
+        );
+        drop(held);
+        assert_eq!(
+            world.ctx.jobs.free(),
+            2,
+            "running: {running}: the slot went back"
+        );
+        assert_eq!(world.ctx.jobs.watched(1, &repo(), 1), 0);
+    }
 }
 
 #[tokio::test]
@@ -1622,7 +1731,7 @@ async fn the_next_review_says_what_became_of_what_the_last_sent_back() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head, None)
+        .start_review(1, &repo(), 1, &head, None, None)
         .await
         .unwrap();
     world.conclude_review(&r, fixed, &settings).await;
@@ -1665,7 +1774,7 @@ async fn a_review_that_asks_a_human_comments_and_dismisses_what_it_sent_back() {
     let head = world.pr(1).head_ref_oid;
     let r = world
         .store
-        .start_review(1, &repo(), 1, &head, None)
+        .start_review(1, &repo(), 1, &head, None, None)
         .await
         .unwrap();
     let asks = Finding {

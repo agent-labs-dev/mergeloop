@@ -2,6 +2,8 @@
 //! another Responses API, set CODEX_LIVE_BASE_URL, CODEX_LIVE_KEY and CODEX_LIVE_MODEL.
 //! `cargo test -p mergepatrol-resolver --test codex_live -- --ignored --nocapture`
 
+#![cfg(test)]
+
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;

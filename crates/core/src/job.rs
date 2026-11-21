@@ -215,6 +215,13 @@ impl Job {
         self.fixes < self.fix_attempts && !self.rechecked
     }
 
+    /// The job after `event`.
+    ///
+    /// # Panics
+    ///
+    /// If `event` cannot happen in the job's phase, such as `Merged` while it rebases. The queue
+    /// sends a phase only the events of the work it started, and the `HeadMoved`, `BaseMoved`
+    /// and `OnHold` that any phase takes.
     pub fn step(self, event: Event) -> Transition {
         use Event as E;
         match (&self.phase, event) {
@@ -242,11 +249,19 @@ impl Job {
                 };
                 self.with(phase)
             }
-            (P::Rerunning { failed, .. }, E::RerunFailed(_)) => {
-                let failed = failed.clone();
-                self.failed(failed)
+            (
+                P::Rerunning {
+                    head, base, failed, ..
+                },
+                E::RerunFailed(_),
+            ) => {
+                let (head, base, failed) = (head.clone(), base.clone(), failed.clone());
+                self.failed(head, base, failed)
             }
-            (P::AwaitingChecks { .. }, E::ChecksFailed(failed)) => self.failed(failed),
+            (P::AwaitingChecks { head, base }, E::ChecksFailed(failed)) => {
+                let (head, base) = (head.clone(), base.clone());
+                self.failed(head, base, failed)
+            }
             (P::AwaitingChecks { .. }, E::ChecksTimedOut(names)) => {
                 Transition::Ejected(EjectReason::ChecksTimedOut(names))
             }
@@ -311,24 +326,16 @@ impl Job {
         }
     }
 
-    /// The required checks `failed` on the head the job waits for, or ran again: a fix while
-    /// one is left, or else the PR is ejected.
-    fn failed(self, failed: Vec<String>) -> Transition {
-        let (P::AwaitingChecks { head, base } | P::Rerunning { head, base, .. }) = &self.phase
-        else {
-            unreachable!("only checks fail")
-        };
+    /// The required checks `failed` on `head`, the head the job waits for, or ran again: a fix
+    /// while one is left, or else the PR is ejected.
+    fn failed(self, head: String, base: String, failed: Vec<String>) -> Transition {
         if !self.can_fix() {
             return Transition::Ejected(EjectReason::ChecksFailed {
                 names: failed,
                 fixes: self.fixes,
             });
         }
-        let phase = P::Fixing {
-            head: head.clone(),
-            base: base.clone(),
-            failed,
-        };
+        let phase = P::Fixing { head, base, failed };
         Transition::Continue(Job {
             phase,
             fixes: self.fixes + 1,

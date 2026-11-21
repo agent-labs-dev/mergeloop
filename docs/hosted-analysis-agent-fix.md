@@ -1,7 +1,7 @@
 # Hosted analysis, review changes by the author
 
-Status: proposal; no runtime changes. Reconciled on 2026-11-13 with main at
-[`ac77839088a44af9d83e8182bd711f3a99eb87a0`](https://github.com/agent-labs-dev/mergeloop/commit/ac77839088a44af9d83e8182bd711f3a99eb87a0).
+Status: proposal; no runtime changes. Reconciled on 2026-11-21 with main at
+[`89ed1a748422f75b2cc9eed721609156b0483428`](https://github.com/agent-labs-dev/mergeloop/commit/89ed1a748422f75b2cc9eed721609156b0483428).
 This shipped baseline replaces the historical November 7 inventory. Proposed settings,
 tools and gates are explicitly marked; describing them does not make them available.
 
@@ -14,8 +14,9 @@ Read-only review may write disposable diagnostic files and publish findings; it 
 publish corrective code. Conflict resolution remains a separate hosted task.
 
 The first review reads the PR diff and surrounding code. After findings are sent back, later
-rounds read new commits plus those findings and author replies. A rebase or base merge resets
-that comparison to the whole PR diff when another review is needed. Approval reuse is distinct:
+rounds read new commits plus those findings and author replies. Main now also preserves approval
+over a diff-equivalent author rebase and reviews only commits added on top of an approved version, including after that rebase. An amend, squash or
+conflict resolution changing approved commits requires the full PR diff. Approval reuse is distinct:
 a clean queue rebase, or a stack layer whose own diff is unchanged, can retain its approval
 without another review. Do not invalidate every review merely because SHAs moved.
 
@@ -34,8 +35,12 @@ Source contracts: [hosted execution](../content/changelog/2026-11-07-agent-runs-
 [GitHub PR pages](../content/changelog/2026-11-10-prs-open-on-github.md),
 [stack visibility](../content/changelog/2026-11-11-see-each-pr-of-a-stack.md),
 [unchanged-layer approvals](../content/changelog/2026-11-11-stack-layers-keep-their-review.md),
-[GitHub approvals](../content/changelog/2026-11-12-mergeloop-approves-on-github.md) and
-[waiting for comments](../content/changelog/2026-11-12-no-approval-beside-open-comments.md).
+[GitHub approvals](../content/changelog/2026-11-12-mergeloop-approves-on-github.md),
+[waiting for comments](../content/changelog/2026-11-12-no-approval-beside-open-comments.md),
+[review since approval](../content/changelog/2026-11-20-review-since-approved.md),
+[fast checks](../content/changelog/2026-11-15-fast-checks.md),
+[explicit repo holds](../content/changelog/2026-11-20-off-repo-says-why.md) and
+[hosted MCP OAuth](../content/changelog/2026-11-21-hosted-mcp-sign-in.md).
 
 ## Feedback and decisions still needed
 
@@ -67,15 +72,90 @@ Those goals remain relevant, but earlier design choices now conflict with shippe
   resolution or a later review. Requiring independent correction replay and a retained prevention
   check is additional policy, not shipped behavior or all of #306.
 
+The November 21 additions also leave inventory presentation, the meaning of live, app-testing
+platforms/budgets/gates and event freshness/retention/push transport with Jonas.
+
 This update records these choices without implementing or silently deciding them. Default hosted
 behavior stays as shipped. Deep's non-security vote exception is an intentional policy change in
 #306, rather than a conflict with stack visibility or GitHub approvals.
+
+## November 21 wishlist: coverage and remaining scope
+
+This maps Furqan's text at 23:13 UTC; the screenshot was unavailable and supplies no requirements.
+The additions below are proposed contracts, not implemented tools or authorization to queue work.
+
+| Ask | Already covered in #260 / current main | Gap addressed here |
+| --- | --- | --- |
+| Queue manager of all his PRs: draft, in review, in MergeLoop, live | Readiness/control section, stack rows, queue status, author holds and merge outcomes. Main remains a GitHub-first queue, not an all-PR inbox. | An authorized cross-repo inventory, including unqueued/draft PRs, with separate PR, review, queue and deployment states. Choosing an in-app manager remains with Jonas. |
+| Reviewer understands the repo and executes on it | Hosted evidence and correction replay, author-owned fixes, diff-scoped review. Main reads base-version root/nested `AGENTS.md`, `CLAUDE.md`, `REVIEW.md` and referenced docs; it can inspect callers, tests, config, history and deploy files. | No new review engine or whole-repo audit. Make that existing context contract explicit, preserve current incremental/rebase coverage, and expose what was actually examined or not runnable. #306 owns Deep's pending replayed-evidence change. |
+| Tests apps, thorough or quick | Deep user-flow experiments and verify-command provenance; main already has Quick/Standard/Deep review and CI-derived commands. | Explicit requested app-testing scope, bounded quick/thorough plans and execution records; review depth alone does not prove an app was exercised. |
+| MCP live view of every state plus events | Shared API/MCP readiness, `next_need` long polling, `list_events` history and proposed author progress. Main now also supports hosted-client OAuth. | Resumable typed state events and fresh snapshots covering inventory, reviews, testing, proposals, queue and deployment; current history and need hashes are insufficient. |
+
+### All-PR inventory and lifecycle
+
+Propose a canonical backend read for the caller's PRs across explicitly selected, accessible repos,
+including drafts and PRs never queued. Return repo/PR/head/base, stack layer, author, timestamps,
+GitHub URL and links to authoritative review/check/queue records. Page results and identify repos
+that are inaccessible or could not be refreshed; do not imply an exhaustive list after a partial read.
+Reuse GitHub reads and queue/review producers on the server, with the same API/MCP projection.
+An agent can render the inventory in chat before any decision to restore dashboard PR pages.
+
+Keep independent dimensions: GitHub draft/open/closed/merged; review unassessed/pending/running/
+held/approved with coverage; queue membership/stage/position or last exit; and deployment unknown/
+pending/failed/live. A draft can be in review or queued on hold. Merge is not proof of deployment.
+Interpret "live" provisionally as deployed: show it only with an authorized deployment/environment
+record tied to the relevant commit, plus source/time; otherwise unknown. Jonas must confirm that
+meaning and the environments in scope. Inventory reads neither queue nor publish drafts, start
+reviews/tests, accept proposals nor authorize merging. Assess-only remains a separate explicit action.
+
+### App testing at a requested scope
+
+Reuse Quick/Standard/Deep for review effort, without equating reviewer count or report length with
+app-test coverage. An explicit test request names head/base, affected flows, target environment,
+quick or thorough effort, setup, time/cost bounds and permitted side effects. Quick proposes focused
+smoke checks of changed flows; thorough adds relevant integration/end-to-end and failure-path checks.
+The hosted reviewer plans from repository instructions and available tools rather than fixed per-app
+mappings. Read broad context to understand the diff; pre-existing defects remain non-blocking notes.
+
+Record planned, executed, failed, skipped and unavailable checks separately, with commands or flow
+steps, head/environment, output/artifact references and limits. No browser/device/credentials means
+that flow is untested, never an inferred pass. Reuse existing verify/evidence execution; app/device
+adapters and their access are capabilities to select, not shipped promises. External writes or shared
+app state need explicit owner authorization; use disposable environments by default. The user's own
+agent applies any accepted source/test/config fixes. Hosting a test run grants no corrective-write
+permission, and only red CI can invoke auto-fix. Keep #306 as the reference for Deep evidence rather
+than restating its implementation. Jonas selects initial platforms, budgets and whether requested
+app checks are advisory or required; existing gates cannot be weakened by choosing quick.
+
+### Live state and MCP events
+
+Current `list_events` is at most 200 newest-first queue records with no resume cursor;
+`next_need` waits up to 50 seconds for a changed need, not every state transition. MCP answers POSTs
+and rejects GET streaming. These are useful polling primitives, not a durable subscription or live
+sandbox tool stream. Build-lane leases already exist for issue builds; they are not acknowledgements
+from an arbitrary PR author's agent and must not be mistaken for the proposed author-work leases.
+
+Propose durable events from canonical state producers, with stable event ID/cursor, typed kind,
+repo/PR/layer, head, entity revision, observed time and authorized source. Cover draft/review/check/
+queue/merge/deployment changes, testing and owner-proposal/work progress. Pair events with an
+authoritative snapshot and cursor so initial reads and reconnects do not lose intervening changes.
+Support bounded cursor pagination/long polling, ordered replay and deduplication; an expired cursor
+or retention gap requires a marked snapshot refresh, never silent omission. Events invalidate stale
+views; clients reread canonical state instead of inferring readiness from event text. Enforce the same
+caller/repo access on history and snapshots, including permission changes on reconnect.
+
+Expose the contract through the existing API/MCP route registry. Start with resumable polling;
+server-pushed MCP notifications/subscriptions require a separate transport/compatibility decision
+and are not claimed available. Show freshness, disconnected/unknown state and execution versus carried
+coverage in every client. Neither an event, subscription nor heartbeat grants permission to write,
+queue or merge. Jonas selects polling freshness/retention targets and whether push delivery is needed.
 
 ## Current implementation seams
 
 The Rust crates retain their `mergepatrol` names. Hosted means a service job sandbox;
 `LocalExecutor` in [executor](../crates/executor/src/lib.rs) is a development subprocess executor,
-not an author-run review setting.
+not an author-run review setting. Main's separate issue-build lane has a local builder/reviewer
+and daemon leases; it does not restore local queue review or authorize writes under this proposal.
 
 | Responsibility | Current source and reuse boundary |
 | --- | --- |
@@ -83,7 +163,7 @@ not an author-run review setting.
 | CI and conflicts | [prep.rs](../crates/mergepatrol/src/queue/prep.rs), [queue.rs](../crates/mergepatrol/src/queue.rs) and [job.rs](../crates/mergepatrol/src/job.rs) dispatch prep/lane work. `FixChecks` is for red CI. Default `fix_ci.attempts` is three; conflicts are separate. |
 | Verify commands | `job::checks_for` uses configured `verify`, or [core/ci.rs](../crates/core/src/ci.rs)'s workflow derivation at the PR head. Reuse that parser. Derived commands guide agents; configured commands gate a resolution/fix, separately from required GitHub checks. |
 | Evidence | `job::check_evidence` resets to the reviewed head, applies only named evidence files and records command, patch and output. Timeouts and exit 126/127 do not qualify. Protected/outside-checkout files are refused. [core/review.rs](../crates/core/src/review.rs) owns routing; [resolver](../crates/resolver/src/lib.rs) owns instructions. |
-| Approval coverage | [store/review.rs](../crates/store/src/review.rs)'s `diff_id`, `carry_unchanged`, `carry_review` and `review_queue_change` distinguish unchanged coverage from edits needing review. Reuse the producer's per-layer comparison, not a client approximation. |
+| Approval coverage | [queue.rs](../crates/mergepatrol/src/queue.rs)'s `unreviewed` / `approved_within` and [store/review.rs](../crates/store/src/review.rs)'s `diff_id`, `since_head`, `carry_review` and `review_queue_change` distinguish unchanged coverage from edits needing review. Reuse the producer's per-layer comparison, not a client approximation. |
 | Gates | [web/gate.rs](../crates/web/src/gate.rs), review state, required checks, threads and the lane's final head checks govern merging. [queue-flow.md](queue-flow.md) documents prep/lane behavior. Neither readiness nor GitHub approval bypasses another gate. |
 | Reads and actions | [routes.rs](../crates/web/src/routes.rs) registers `list_queue`, `pull_status`, `get_agent_review`, `next_need`, `list_events`, `queue_pull` and `dequeue_pull`. Removed inbox, PR-detail, local-review-submission and in-app answer routes are not integration seams. Discussion/replies are on GitHub with `gh`. |
 | Polling | [need.rs](../crates/web/src/need.rs)'s `NeedView` has `needs`, `id`, `layer`, `brief`, `then`, `exit_code` and `status`. Its endpoint supports `after` and up to 50 seconds of long polling. [CLI](../crates/cli/src/main.rs) uses these tools; it starts no author agent. |
@@ -272,6 +352,9 @@ observe it. Register routes with `tool!`, update README descriptions and regener
 | Correction replay / recurring prevention | Additional design, not all of #306. Demonstrate failures/corrections at named SHAs and retained protection while preserving legitimate carried coverage. |
 | Author-publication policy | Needs Jonas's decision. Ship settings, proposal decisions/storage, prep/lane guards, publication guards and validation together; no `agent.runs` or local review. |
 | Progress | After ownership, add durable fenced acknowledgement/phase/freshness; no invented presence. |
+| All-PR inventory / deployment | Proposed canonical read; partial-read and unknown-deployment semantics above. No implicit execution or queueing. |
+| App-test requests | Proposed quick/thorough flow plans and execution provenance; platforms, budgets and gate policy need decisions. |
+| State events | Proposed snapshot/cursor replay and typed producer events; polling first, push transport undecided. |
 | PR manager, assess-only, scoped Merge UI | Separate product/authority choices against today's GitHub-first interface, not readiness/Deep prerequisites. |
 
 Extend existing review routing, job, review-store and
@@ -295,6 +378,12 @@ Extend existing review routing, job, review-store and
 - UI/API/MCP agree on readiness/next actor. Heartbeats, green CI, missing reads and unassessed PRs
   cannot become ready. Reading never queues. Optional scoped Merge rejects stale head/scope or
   missing authority, respects drafts/gates and reports the verified outcome.
+- Inventory includes unqueued drafts without changing them; partial repo failures remain visible.
+  A merged PR with no deployment evidence never displays live.
+- Requested quick/thorough app checks report actual execution and unavailable devices separately;
+  neither effort changes diff scope, owner authority or existing merge/evidence gates.
+- Snapshot/event replay survives reconnects, duplicates and cursor expiry without silently losing
+  state. Unauthorized repos are never disclosed; stale snapshots cannot show current execution.
 
 This is a design only. Runtime slices need validation and user-facing changelog entries.
 Keep #260 open, draft, unqueued and unlabeled with auto-merge off; Jonas decides what to adopt.

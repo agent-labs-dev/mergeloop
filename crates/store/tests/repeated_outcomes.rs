@@ -1,5 +1,7 @@
 //! Settling a recurring finding must settle each request counted by review stats.
 
+#![cfg(test)]
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -13,7 +15,10 @@ fn repo() -> RepoName {
 }
 
 async fn finished(store: &PgStore, head: &str, asked: bool) -> i64 {
-    let r = store.start_review(1, &repo(), 8, head, None).await.unwrap();
+    let r = store
+        .start_review(1, &repo(), 8, head, None, None)
+        .await
+        .unwrap();
     let claim = store
         .claim_review(Duration::from_secs(600))
         .await
@@ -114,4 +119,31 @@ async fn a_human_dismissing_a_recurring_finding_settles_every_request(pool: PgPo
             .unwrap()
     );
     both_settled(&store, first, second, Outcome::Dismissed).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn reclaiming_a_stale_review_lease_counts_against_attempts(pool: PgPool) {
+    let store = PgStore::migrate(pool.clone()).await.unwrap();
+    let review = store
+        .start_review(1, &repo(), 9, "head", None, None)
+        .await
+        .unwrap();
+    let first = store
+        .claim_review(Duration::from_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.attempts, 0);
+    sqlx::query("UPDATE agent_reviews SET claimed_at = now() - interval '2 hours' WHERE id = $1")
+        .bind(review.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reclaimed = store
+        .claim_review(Duration::from_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.id, review.id);
+    assert_eq!(reclaimed.attempts, 1);
 }

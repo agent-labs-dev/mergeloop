@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::{Method, StatusCode};
@@ -31,6 +33,8 @@ pub struct RepoSnapshot {
     pub merge_methods: Vec<String>,
     /// Open PRs with the trigger label, oldest first.
     pub labeled: Vec<PullRequest>,
+    /// Open PRs with the failed label, eligible for a later author retry.
+    pub failed: Vec<PullRequest>,
     /// Queue labels the repo does not have yet.
     pub missing_labels: Vec<String>,
 }
@@ -491,6 +495,11 @@ impl RepoSnapshot {
             .into_iter()
             .map(|pr| PullRequest::from_node(pr, r))
             .collect::<Result<_>>()?;
+        let failed = prs
+            .iter()
+            .filter(|pr| queued(pr, &labels.failed))
+            .map(|pr| PullRequest::from_node(pr, r))
+            .collect::<Result<_>>()?;
         let missing_labels = [
             ("trigger", &labels.trigger),
             ("priority", &labels.priority),
@@ -525,6 +534,7 @@ impl RepoSnapshot {
             .map(|(method, _)| method.to_owned())
             .collect(),
             labeled,
+            failed,
             missing_labels,
         })
     }
@@ -579,43 +589,66 @@ impl Installation {
         );
         // The labeled PRs come a page at a time. The rest of the repo is the same on every page:
         // the first page's.
-        let mut repository: Option<Value> = None;
-        let mut prs: Vec<Value> = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let mut data: Value = self
-                .graphql(
-                    "snapshot",
-                    &query,
-                    json!({
-                        "owner": repo.owner,
-                        "name": repo.name,
-                        "label": labels.trigger,
-                        "priority": labels.priority,
-                        "failed": labels.failed,
-                        "page": SNAPSHOT_PAGE,
-                        "after": after,
-                    }),
-                )
-                .await?;
-            let mut r = data["repository"].take();
-            let page = r
-                .as_object_mut()
-                .and_then(|r| r.remove("pullRequests"))
-                .context("repository.pullRequests")?;
-            prs.extend(page["nodes"].as_array().cloned().unwrap_or_default());
-            let next = &page["pageInfo"];
-            let more = next["hasNextPage"] == true;
-            after = next["endCursor"].clone();
-            repository.get_or_insert(r);
-            if !more || after.is_null() {
-                break;
-            }
+        let (repository, mut prs, mut after) = self
+            .snapshot_page(repo, labels, &query, Value::Null)
+            .await?;
+        while let Some(cursor) = after {
+            let (_, page, next) = self.snapshot_page(repo, labels, &query, cursor).await?;
+            prs.extend(page);
+            after = next;
         }
-        Ok(SnapshotParts {
-            repository: repository.expect("one page at least"),
-            prs,
-        })
+        // Read the failed-label connection independently, including every page.
+        let failed_query = query.replace("labels: [$label]", "labels: [$failed]");
+        let (_, failed, mut after) = self
+            .snapshot_page(repo, labels, &failed_query, Value::Null)
+            .await?;
+        prs.extend(failed);
+        while let Some(cursor) = after {
+            let (_, page, next) = self
+                .snapshot_page(repo, labels, &failed_query, cursor)
+                .await?;
+            prs.extend(page);
+            after = next;
+        }
+        prs.sort_by_key(|pr| pr["number"].as_u64());
+        prs.dedup_by_key(|pr| pr["number"].as_u64());
+        Ok(SnapshotParts { repository, prs })
+    }
+
+    /// The page of `query` after `after`: the repository without its PRs, the PR nodes, and the
+    /// cursor of the next page, if there is one.
+    async fn snapshot_page(
+        &self,
+        repo: &RepoName,
+        labels: &Labels,
+        query: &str,
+        after: Value,
+    ) -> Result<(Value, Vec<Value>, Option<Value>)> {
+        let mut data: Value = self
+            .graphql(
+                "snapshot",
+                query,
+                json!({
+                    "owner": repo.owner,
+                    "name": repo.name,
+                    "label": labels.trigger,
+                    "priority": labels.priority,
+                    "failed": labels.failed,
+                    "page": SNAPSHOT_PAGE,
+                    "after": after,
+                }),
+            )
+            .await?;
+        let mut repository = data["repository"].take();
+        let page = repository
+            .as_object_mut()
+            .and_then(|r| r.remove("pullRequests"))
+            .context("repository.pullRequests")?;
+        let prs = page["nodes"].as_array().cloned().unwrap_or_default();
+        let next = &page["pageInfo"];
+        let more = next["hasNextPage"] == true && !next["endCursor"].is_null();
+        let after = more.then(|| next["endCursor"].clone());
+        Ok((repository, prs, after))
     }
 
     /// A PR, as the snapshot reads it, whatever its state and labels.
@@ -774,6 +807,24 @@ impl Installation {
             )
             .await?;
         Ok(diff_id_of(&r))
+    }
+
+    /// The commits `head` has since it left `base`, oldest first. `None` when they are not one
+    /// line of commits, as a merge makes, or GitHub may list only some of them.
+    pub async fn commits(
+        &self,
+        repo: &RepoName,
+        base: &str,
+        head: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let r: Value = self
+            .rest(
+                Method::GET,
+                &format!("/repos/{repo}/compare/{base}...{head}"),
+                None,
+            )
+            .await?;
+        Ok(commits_of(&r))
     }
 
     /// Whether workflow runs on `sha` wait for a maintainer to approve them, as GitHub has a
@@ -1017,11 +1068,35 @@ impl Installation {
         title: &str,
         body: &str,
     ) -> Result<PrNumber> {
+        self.create_pr(repo, head, base, title, body, true).await
+    }
+
+    /// Opens a PR, ready for review, from `head` in the same repo.
+    pub async fn open_pr(
+        &self,
+        repo: &RepoName,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PrNumber> {
+        self.create_pr(repo, head, base, title, body, false).await
+    }
+
+    async fn create_pr(
+        &self,
+        repo: &RepoName,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<PrNumber> {
         let r: Value = self
             .rest(
                 Method::POST,
                 &format!("/repos/{repo}/pulls"),
-                Some(json!({ "head": head, "base": base, "title": title, "body": body, "draft": true })),
+                Some(json!({ "head": head, "base": base, "title": title, "body": body, "draft": draft })),
             )
             .await?;
         r["number"].as_u64().context("PR number")
@@ -1640,6 +1715,32 @@ fn diff_id_of(compare: &Value) -> Option<String> {
     Some(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A compare's commits, oldest first, from the base up, each the only parent of the next. `None`
+/// when one has another parent, or the compare lists only some of them.
+fn commits_of(compare: &Value) -> Option<Vec<String>> {
+    let listed = compare["commits"].as_array()?;
+    if compare["total_commits"].as_u64()? != listed.len() as u64 {
+        return None;
+    }
+    let mut child = HashMap::with_capacity(listed.len());
+    for c in listed {
+        let [parent] = c["parents"].as_array()?.as_slice() else {
+            return None;
+        };
+        let (parent, sha) = (parent["sha"].as_str()?, c["sha"].as_str()?);
+        if child.insert(parent, sha).is_some() {
+            return None;
+        }
+    }
+    let mut at = compare["merge_base_commit"]["sha"].as_str()?;
+    let mut line = Vec::with_capacity(listed.len());
+    while let Some(next) = child.remove(at) {
+        line.push(next.to_owned());
+        at = next;
+    }
+    (line.len() == listed.len()).then_some(line)
+}
+
 /// The most characters GitHub takes in a comment or a review's body.
 const COMMENT_CHARS: usize = 65_536;
 
@@ -1773,7 +1874,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![]).await;
         let labeled = of(layer(2, &["mp"]));
         assert!(gh.labeled_for_queue(&repo, &labeled, "mp").await.unwrap());
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
 
         // On a layer below: the whole stack is queued.
         let bare = of(layer(2, &[]));
@@ -1791,14 +1892,14 @@ mod tests {
         ])
         .await;
         assert!(!gh.labeled_for_queue(&repo, &bare, "mp").await.unwrap());
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
 
         // Outside a stack, a PR's own labels are the answer.
         let (gh, requests) = fake::serve(vec![]).await;
         let mut alone = bare.clone();
         alone.stack = None;
         assert!(!gh.labeled_for_queue(&repo, &alone, "mp").await.unwrap());
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
     }
 
     fn snapshot_page(numbers: std::ops::Range<u64>, next: Option<&str>) -> &'static str {
@@ -1818,6 +1919,22 @@ mod tests {
         let (gh, requests) = fake::serve(vec![
             (200, "", snapshot_page(1..101, Some("c1"))),
             (200, "", snapshot_page(101..103, None)),
+            (
+                200,
+                "",
+                leak(
+                    snapshot_page(103..203, Some("f1"))
+                        .replace("\"name\":\"mp\"", "\"name\":\"mp:failed\""),
+                ),
+            ),
+            (
+                200,
+                "",
+                leak(
+                    snapshot_page(203..205, None)
+                        .replace("\"name\":\"mp\"", "\"name\":\"mp:failed\""),
+                ),
+            ),
         ])
         .await;
         let repo = RepoName::parse("o/r").unwrap();
@@ -1829,8 +1946,12 @@ mod tests {
         let snap = gh.snapshot(&repo, &labels).await.unwrap();
         let numbers: Vec<u64> = snap.labeled.iter().map(|p| p.number).collect();
         assert_eq!(numbers, (1..103).collect::<Vec<_>>());
+        assert_eq!(
+            snap.failed.iter().map(|p| p.number).collect::<Vec<_>>(),
+            (103..205).collect::<Vec<_>>()
+        );
         assert_eq!(snap.missing_labels, ["mp:priority"]);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 4);
     }
 
     #[tokio::test]
@@ -1850,7 +1971,7 @@ mod tests {
         let repo = RepoName::parse("o/r").unwrap();
         gh.sticky_comment(&repo, 7, "new").await.unwrap();
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/r/issues/7/comments?per_page=100&page=1 HTTP/1.1",
                 "GET /repos/o/r/issues/7/comments?per_page=100&page=2 HTTP/1.1",
@@ -1864,10 +1985,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![(200, "", "{}")]).await;
         let repo = RepoName::parse("o/r").unwrap();
         gh.set_title(&repo, 7, "fix: it").await.unwrap();
-        assert_eq!(
-            *requests.lock().unwrap(),
-            ["PATCH /repos/o/r/pulls/7 HTTP/1.1"]
-        );
+        assert_eq!(*requests.lock(), ["PATCH /repos/o/r/pulls/7 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -1878,7 +1996,7 @@ mod tests {
         let repo = RepoName::parse("o/r").unwrap();
         let tree = gh.create_tree(&repo, "base", &[]).await.unwrap();
         assert_eq!(tree, "base");
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
     }
 
     async fn merge_answered(pr: &'static str) -> (MergeOutcome, Vec<String>) {
@@ -1889,7 +2007,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![reply, (200, "", pr)]).await;
         let repo = RepoName::parse("o/r").unwrap();
         let outcome = gh.merge(&repo, 7, "abc", "squash").await.unwrap();
-        let requests = requests.lock().unwrap().clone();
+        let requests = requests.lock().clone();
         (outcome, requests)
     }
 
@@ -1907,6 +2025,26 @@ mod tests {
                 "PUT /repos/o/r/pulls/7/merge-async HTTP/1.1",
                 "GET /repos/o/r/pulls/7 HTTP/1.1"
             ]
+        );
+    }
+
+    /// GitHub bypasses rules on `merge-async` only when asked (`bypass_rules`, default false). So
+    /// a repo that makes the App a bypass actor changes no merge MergeLoop makes today.
+    #[tokio::test]
+    async fn a_merge_never_asks_github_to_bypass_its_rules() {
+        let (gh, requests) = fake::serve_whole(vec![(
+            200,
+            "",
+            r#"{"status":"merged","details":{"sha":"m1"}}"#,
+        )])
+        .await;
+        let repo = RepoName::parse("o/r").unwrap();
+        gh.merge(&repo, 7, "abc", "squash").await.unwrap();
+        let request = requests.lock()[0].clone();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({ "sha": "abc", "merge_method": "squash", "merge_action": "direct_merge" })
         );
     }
 
@@ -2055,7 +2193,7 @@ mod tests {
         let dismissed = gh.dismiss_reviews_marked(&repo, 7, &["<!-- mark -->"], "cleared");
         assert_eq!(dismissed.await.unwrap(), 1);
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /repos/o/r/pulls/7/reviews?per_page=100&page=1 HTTP/1.1",
                 "PUT /repos/o/r/pulls/7/reviews/1/dismissals HTTP/1.1",
@@ -2075,7 +2213,7 @@ mod tests {
         let lines = [line];
         let posted = gh.review_lines(&repo, 7, "abc", Verdict::RequestChanges, "body", &lines);
         posted.await.unwrap();
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         let last = &requests[1];
         assert!(last.contains(r#""event":"REQUEST_CHANGES""#), "{last}");
@@ -2092,7 +2230,7 @@ mod tests {
         gh.review_lines(&repo, 7, "abc", Verdict::RequestChanges, "body", &[])
             .await
             .unwrap();
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(
             requests[0].contains(r#""event":"REQUEST_CHANGES""#),
             "{}",
@@ -2226,5 +2364,44 @@ mod tests {
             .map(|i| file(&format!("{i}.rs"), "+x"))
             .collect();
         assert_eq!(diff_id_of(&compare(Value::Array(many))), None);
+    }
+
+    /// A compare from `base` of `commits`, as (sha, parents), listed in the order given.
+    fn compare_of(base: &str, commits: &[(&str, &[&str])]) -> Value {
+        let commits: Vec<Value> = commits
+            .iter()
+            .map(|(sha, parents)| {
+                let parents: Vec<Value> = parents.iter().map(|p| json!({ "sha": p })).collect();
+                json!({ "sha": sha, "parents": parents })
+            })
+            .collect();
+        json!({
+            "merge_base_commit": { "sha": base },
+            "total_commits": commits.len(),
+            "commits": commits,
+        })
+    }
+
+    #[test]
+    fn a_line_of_commits_reads_oldest_first_whatever_order_github_lists_them_in() {
+        let listed = compare_of("b", &[("2", &["1"]), ("1", &["b"]), ("3", &["2"])]);
+        assert_eq!(
+            commits_of(&listed),
+            Some(vec!["1".into(), "2".into(), "3".into()])
+        );
+        assert_eq!(commits_of(&compare_of("b", &[])), Some(vec![]));
+    }
+
+    #[test]
+    fn commits_that_are_not_one_line_read_as_none() {
+        let merge = compare_of("b", &[("1", &["b"]), ("m", &["1", "t"])]);
+        assert_eq!(commits_of(&merge), None, "a merge");
+        let fork = compare_of("b", &[("1", &["b"]), ("2", &["b"])]);
+        assert_eq!(commits_of(&fork), None, "two lines");
+        let off = compare_of("b", &[("1", &["x"])]);
+        assert_eq!(commits_of(&off), None, "not from the base");
+        let mut some = compare_of("b", &[("1", &["b"])]);
+        some["total_commits"] = json!(300);
+        assert_eq!(commits_of(&some), None, "GitHub listed only some");
     }
 }

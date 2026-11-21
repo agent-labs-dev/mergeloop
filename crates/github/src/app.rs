@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -249,6 +249,14 @@ pub struct Installation {
     token: Arc<Mutex<Option<(String, SystemTime)>>>,
 }
 
+/// An installation token for one repo, with chosen permissions.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ScopedToken {
+    pub token: String,
+    /// When GitHub stops taking it, as RFC 3339.
+    pub expires_at: String,
+}
+
 pub(crate) struct Response {
     pub status: StatusCode,
     pub body: Value,
@@ -292,8 +300,42 @@ impl Installation {
         struct Tok {
             token: String,
         }
-        let permissions =
-            json!({ "repositories": [repo.name], "permissions": { "contents": "read" } });
+        let permissions = json!({ "contents": "read" });
+        let tok: Tok = self
+            .scoped_token(repo, permissions, "create a read-only token")
+            .await?;
+        Ok(tok.token)
+    }
+
+    /// A token that can push to `repo` and open PRs in it, and nothing else: the build lane
+    /// gives it to the daemon that holds a build there.
+    pub async fn push_token(&self, repo: &RepoName) -> Result<ScopedToken> {
+        let permissions = json!({ "contents": "write", "pull_requests": "write" });
+        self.scoped_token(repo, permissions, "create a push token")
+            .await
+    }
+
+    /// A token that can read `repo` and its PRs, and nothing else: the build lane gives it to the
+    /// agent that works a built PR's need, which reads what anyone who comments wrote.
+    pub async fn pr_read_token(&self, repo: &RepoName) -> Result<ScopedToken> {
+        let permissions = json!({ "contents": "read", "pull_requests": "read" });
+        self.scoped_token(repo, permissions, "create a PR read token")
+            .await
+    }
+
+    /// Revokes a token this installation minted.
+    pub async fn revoke(&self, token: &str) -> Result<()> {
+        revoke_token_at(&self.app.api, token).await
+    }
+
+    /// A token for `repo` alone, with `permissions` alone. GitHub ends its life after an hour.
+    async fn scoped_token<T: DeserializeOwned>(
+        &self,
+        repo: &RepoName,
+        permissions: Value,
+        what: &str,
+    ) -> Result<T> {
+        let body = json!({ "repositories": [repo.name], "permissions": permissions });
         let mint = || async {
             Ok(self
                 .app
@@ -304,10 +346,9 @@ impl Installation {
                 ))
                 .bearer_auth(self.app.jwt()?)
                 .headers(api_headers())
-                .json(&permissions))
+                .json(&body))
         };
-        let tok: Tok = json_ok(send(mint, "create a read-only token").await?)?;
-        Ok(tok.token)
+        json_ok(send(mint, what).await?)
     }
 
     /// The repos this installation can access.
@@ -448,8 +489,8 @@ impl Installation {
 /// A client that acts as a signed-in user, on the user's own rate limit, not the installation's:
 /// for what the dashboard reads on the user's behalf.
 pub struct AsUser {
-    http: reqwest::Client,
-    api: String,
+    pub(crate) http: reqwest::Client,
+    pub(crate) api: String,
     pub(crate) token: String,
 }
 
@@ -501,6 +542,56 @@ impl AsUser {
                 .json(&body))
         };
         graphql_data(name, None, true, send(build, "POST /graphql").await?)
+    }
+}
+
+/// Where the server reaches GitHub: GitHub itself. Only a test's fake ([`fake::github`]) answers
+/// in its place, so nothing else can point the server at another API.
+#[derive(Clone, Default)]
+pub struct GitHub {
+    /// The fake's address.
+    #[cfg(any(test, feature = "testing"))]
+    fake: Option<String>,
+}
+
+impl GitHub {
+    /// The App its credentials name.
+    pub fn app(&self, credentials: &crate::AppCredentials) -> Result<App> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(api) = &self.fake {
+            return Ok(fake::app(api.clone()));
+        }
+        App::from_credentials(credentials)
+    }
+
+    /// Trades the code GitHub's sign-in sent back for the user's token.
+    pub async fn exchange_code(
+        &self,
+        credentials: &crate::AppCredentials,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+    ) -> Result<crate::setup::UserToken> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(web) = &self.fake {
+            return crate::setup::exchange_code(web, credentials, code, redirect_uri, verifier)
+                .await;
+        }
+        crate::setup::exchange_code(crate::setup::WEB, credentials, code, redirect_uri, verifier)
+            .await
+    }
+
+    /// The user whose token this is.
+    pub fn as_user(&self, token: &str) -> Result<AsUser> {
+        let user = AsUser::new(token.to_owned())?;
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(api) = &self.fake {
+            return Ok(AsUser {
+                api: api.clone(),
+                ..user
+            });
+        }
+        Ok(user)
     }
 }
 
@@ -580,14 +671,37 @@ impl RateLimited {
 impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mins = self.remaining().as_secs().div_ceil(60).max(1);
+        let at = self
+            .until
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            % 86_400;
         write!(
             f,
-            "GitHub's API rate limit is used up for another {mins} min"
+            "GitHub's API rate limit is used up: it resets at {:02}:{:02}:{:02}Z, in {mins} min",
+            at / 3600,
+            at / 60 % 60,
+            at % 60
         )
     }
 }
 
 impl std::error::Error for RateLimited {}
+
+/// The rate limit a response says is used up, at once: for a caller that would rather say so
+/// than wait for it to lift.
+pub(crate) fn rate_limited(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> Option<RateLimited> {
+    match retry_after(status, headers, body, Duration::ZERO, unix_now())? {
+        Retry::RateLimit(wait) => Some(RateLimited {
+            until: SystemTime::now() + wait,
+        }),
+        Retry::Backoff(_) => None,
+    }
+}
 
 /// How many times a request goes out before its transient failure counts.
 const ATTEMPTS: u32 = 5;
@@ -728,17 +842,23 @@ async fn revoke_token_at(api: &str, token: &str) -> Result<()> {
             .bearer_auth(token)
             .headers(api_headers()))
     };
-    let (status, body) = send(build, "revoke the read-only token").await?;
+    let (status, body) = send(build, "revoke a token").await?;
     if !status.is_success() {
-        bail!("revoke the read-only token: {status} {body}");
+        bail!("revoke a token: {status} {body}");
     }
     Ok(())
 }
 
 fn api_headers() -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
-    h.insert("accept", "application/vnd.github+json".parse().unwrap());
-    h.insert("x-github-api-version", "2022-11-28".parse().unwrap());
+    h.insert(
+        "accept",
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    h.insert(
+        "x-github-api-version",
+        HeaderValue::from_static("2022-11-28"),
+    );
     h
 }
 
@@ -746,13 +866,14 @@ fn api_headers() -> reqwest::header::HeaderMap {
 /// function says.
 #[cfg(any(test, feature = "testing"))]
 pub mod fake {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
+    use parking_lot::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{App, AsUser, Installation};
+    use super::{App, AsUser, GitHub, Installation};
 
     /// A response: status, extra header lines, body.
     pub type Scripted = (u16, &'static str, &'static str);
@@ -785,20 +906,32 @@ pub mod fake {
         responses: Vec<Scripted>,
         keep: fn(&str) -> String,
     ) -> (Installation, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let api = format!("http://{}", listener.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port on localhost");
+        let api = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("a bound listener has an address")
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
         tokio::spawn(async move {
             for (status, headers, body) in responses {
-                let (mut conn, _) = listener.accept().await.unwrap();
+                let (mut conn, _) = listener
+                    .accept()
+                    .await
+                    .expect("the fake accepts a connection");
                 let request = read_request(&mut conn).await;
-                seen.lock().unwrap().push(keep(&request));
+                seen.lock().push(keep(&request));
                 let response = format!(
                     "HTTP/1.1 {status} Scripted\r\ncontent-length: {}\r\nconnection: close\r\n{headers}\r\n{body}",
                     body.len()
                 );
-                conn.write_all(response.as_bytes()).await.unwrap();
+                conn.write_all(response.as_bytes())
+                    .await
+                    .expect("the client reads the response");
             }
         });
         (installation(api), requests)
@@ -809,42 +942,109 @@ pub mod fake {
     pub async fn answered_by(
         answer: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> Installation {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let api = format!("http://{}", listener.local_addr().unwrap());
+        installation(listen(move |call| answer(call.method, call.path, call.body)).await)
+    }
+
+    /// The token of every installation of the App that [`github`] fakes.
+    pub const INSTALLATION_TOKEN: &str = "t";
+
+    /// A request to the fake.
+    pub struct Call<'a> {
+        /// The bearer token it came with: a user's, [`INSTALLATION_TOKEN`], or the App's JWT.
+        pub token: &'a str,
+        pub method: &'a str,
+        pub path: &'a str,
+        pub body: &'a str,
+    }
+
+    /// A GitHub whose App and users talk to `answer`, for a test of the server. It mints each
+    /// installation's own token itself, as [`INSTALLATION_TOKEN`]; a token scoped by a body is
+    /// `answer`'s.
+    pub async fn github(answer: impl Fn(&Call) -> (u16, String) + Send + Sync + 'static) -> GitHub {
+        let api = listen(move |call| {
+            let mints = call.method == "POST"
+                && call.path.starts_with("/app/installations/")
+                && call.path.ends_with("/access_tokens")
+                && call.body.is_empty();
+            if mints {
+                return (201, format!(r#"{{"token":"{INSTALLATION_TOKEN}"}}"#));
+            }
+            answer(&call)
+        })
+        .await;
+        GitHub { fake: Some(api) }
+    }
+
+    /// Answers each request to its address, which it returns, as `answer` says.
+    async fn listen(answer: impl Fn(Call) -> (u16, String) + Send + Sync + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port on localhost");
+        let api = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("a bound listener has an address")
+        );
         let answer = Arc::new(answer);
         tokio::spawn(async move {
             loop {
-                let (mut conn, _) = listener.accept().await.unwrap();
+                let (mut conn, _) = listener
+                    .accept()
+                    .await
+                    .expect("the fake accepts a connection");
                 let answer = answer.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut conn).await;
                     let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
                     let mut line = head.lines().next().unwrap_or_default().split(' ');
                     let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
-                    let (status, body) = answer(method, path, body);
+                    let token = head
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().strip_prefix("Bearer "))?
+                        })
+                        .unwrap_or("");
+                    let (status, body) = answer(Call {
+                        token,
+                        method,
+                        path,
+                        body,
+                    });
                     let response = format!(
                         "HTTP/1.1 {status} Answered\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    conn.write_all(response.as_bytes()).await.unwrap();
+                    conn.write_all(response.as_bytes())
+                        .await
+                        .expect("the client reads the response");
                 });
             }
         });
-        installation(api)
+        api
     }
 
-    fn installation(api: String) -> Installation {
-        let app = App {
+    /// The App, at the fake: its JWT is signed with a key the fake does not check.
+    pub(super) fn app(api: String) -> App {
+        App {
             app_id: 1,
             key: Arc::new(jsonwebtoken::EncodingKey::from_secret(b"unused")),
             http: reqwest::Client::new(),
             api,
             alg: jsonwebtoken::Algorithm::HS256,
-        };
-        let token = Some(("t".into(), SystemTime::now() + Duration::from_secs(3600)));
+        }
+    }
+
+    fn installation(api: String) -> Installation {
+        let token = Some((
+            INSTALLATION_TOKEN.into(),
+            SystemTime::now() + Duration::from_secs(3600),
+        ));
         Installation {
             id: 1,
-            app,
+            app: app(api),
             token: Arc::new(tokio::sync::Mutex::new(token)),
         }
     }
@@ -854,7 +1054,10 @@ pub mod fake {
         let mut buf = Vec::new();
         let mut chunk = [0; 4096];
         loop {
-            let n = conn.read(&mut chunk).await.unwrap();
+            let n = conn
+                .read(&mut chunk)
+                .await
+                .expect("the client sends a request");
             buf.extend_from_slice(&chunk[..n]);
             let text = String::from_utf8_lossy(&buf).into_owned();
             if let Some(end) = text.find("\r\n\r\n") {
@@ -863,7 +1066,11 @@ pub mod fake {
                     .find_map(|l| {
                         l.to_ascii_lowercase()
                             .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse().unwrap())
+                            .map(|v| {
+                                v.trim()
+                                    .parse()
+                                    .expect("reqwest sends a numeric content-length")
+                            })
                     })
                     .unwrap_or(0);
                 if n == 0 || buf.len() >= end + 4 + length {
@@ -951,7 +1158,7 @@ mod tests {
         .await;
         let v: Value = gh.graphql("ok", "{ ok }", json!({})).await.unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -967,7 +1174,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.downcast_ref::<RateLimited>().unwrap().remaining() > MAX_RATE_LIMIT_WAIT);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -999,7 +1206,7 @@ mod tests {
             gh.current_name(&old).await.unwrap(),
             RepoName::parse("o/new")
         );
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert!(requests[1].starts_with("GET /repositories/1 "));
         assert!(
             requests[1]
@@ -1064,7 +1271,7 @@ mod tests {
             fake::serve(vec![(502, "", "bad gateway"), (200, "", r#"{"ok":true}"#)]).await;
         let v: Value = gh.rest(Method::GET, "/x", None).await.unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(*requests.lock().unwrap(), ["GET /x HTTP/1.1"; 2]);
+        assert_eq!(*requests.lock(), ["GET /x HTTP/1.1"; 2]);
     }
 
     #[tokio::test]
@@ -1088,7 +1295,7 @@ mod tests {
             .rest(Method::POST, "/y", Some(json!({ "a": 1 })))
             .await
             .unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1096,7 +1303,7 @@ mod tests {
         let (gh, requests) = fake::serve(vec![(404, "", r#"{"message":"Not Found"}"#)]).await;
         let res = gh.request(Method::GET, "/z", None).await.unwrap();
         assert_eq!(res.status, StatusCode::NOT_FOUND);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1113,7 +1320,7 @@ mod tests {
         assert!(!seen[0].delivered() && seen[1].delivered());
         gh.app.redeliver(12).await.unwrap();
         assert_eq!(
-            *requests.lock().unwrap(),
+            *requests.lock(),
             [
                 "GET /app/hook/deliveries?per_page=100 HTTP/1.1",
                 "POST /app/hook/deliveries/12/attempts HTTP/1.1",
@@ -1135,10 +1342,7 @@ mod tests {
     async fn a_token_revokes_itself() {
         let (gh, requests) = fake::serve(vec![(204, "", "")]).await;
         revoke_token_at(&gh.app.api, "t").await.unwrap();
-        assert_eq!(
-            *requests.lock().unwrap(),
-            ["DELETE /installation/token HTTP/1.1"]
-        );
+        assert_eq!(*requests.lock(), ["DELETE /installation/token HTTP/1.1"]);
     }
 
     #[tokio::test]

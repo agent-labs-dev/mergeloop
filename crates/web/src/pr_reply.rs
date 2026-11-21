@@ -14,7 +14,7 @@ use mergepatrol_core::{
     Answer, FINDING_MARKS, PrNumber, REPLY_MARKS, RepoName, RepoSettings, ReviewStatus,
     finding_title, thread_title,
 };
-use mergepatrol_github::{App, Installation, PullRequest, ReviewThread};
+use mergepatrol_github::{Installation, PullRequest, ReviewThread};
 use mergepatrol_store::{ReviewAnswers, ReviewRecord};
 use serde_json::Value;
 
@@ -124,7 +124,7 @@ pub(crate) async fn heard(
         .app_credentials()
         .await?
         .context("no GitHub App is set up")?;
-    let gh = App::from_credentials(&creds)?.installation(installation);
+    let gh = app.github.app(&creds)?.installation(installation);
     // The queue acts on a PR only after the PR has been told to merge. A review or a comment on
     // one that has not is state only: nothing is nudged, asked, or answered.
     let pr = gh.pull_request(repo, reply.number).await?;

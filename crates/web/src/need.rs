@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use mergepatrol_core::RepoName;
+use mergepatrol_core::{REPO_CONFIG_PATH, RepoName};
+use mergepatrol_resolver::{COMMIT, REPLY, RESOLVE};
 use mergepatrol_store::{EventRecord, ExitRecord};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -16,7 +17,9 @@ use ts_rs::TS;
 
 use crate::api::repo_name;
 use crate::auth::{Caller, hash};
-use crate::v1::{HoldReasonView, PullStateView, QueueStateView, RepoStateView};
+use crate::v1::{
+    HoldReasonView, PullStateView, QueueStateView, RepoStateView, RepoStatusView, SwitchView,
+};
 use crate::{ApiError, AppState};
 
 /// The longest a call waits for something new. The load balancer allows an hour.
@@ -51,7 +54,8 @@ pub enum NeedKind {
 
 impl NeedKind {
     /// The `mergeloop` CLI's exit code for it: 0 for work to do, 10 merged, 11 ejected, 12
-    /// waiting on a human, 2 for a queue that cannot take it.
+    /// waiting on a human. A repo whose queue does not run waits on one too: only a human sets
+    /// it up. 2 is the CLI's own, for an error.
     fn exit_code(self) -> u8 {
         match self {
             NeedKind::Queue
@@ -61,8 +65,7 @@ impl NeedKind {
             | NeedKind::Draft => 0,
             NeedKind::Merged => 10,
             NeedKind::Ejected => 11,
-            NeedKind::Human | NeedKind::Removed => 12,
-            NeedKind::Off => 2,
+            NeedKind::Human | NeedKind::Removed | NeedKind::Off => 12,
         }
     }
 }
@@ -93,6 +96,18 @@ pub struct NeedView {
 pub(crate) struct NextQuery {
     after: Option<String>,
     wait: Option<u64>,
+    /// The brief is for an agent that `mergeloop daemon` runs on a PR it built.
+    for_daemon: Option<bool>,
+}
+
+/// Who reads a need's brief: what it may do on GitHub differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// An agent that commits, pushes, and acts on GitHub itself.
+    Agent,
+    /// An agent that `mergeloop daemon` runs on a PR it built, as the App's bot: it changes
+    /// files only, and the daemon commits, pushes, replies and resolves for it once it ends.
+    Daemon,
 }
 
 pub(crate) async fn next_need(
@@ -104,9 +119,13 @@ pub(crate) async fn next_need(
     let repo = repo_name(owner, name)?;
     let id = caller.repo(&app, id, &repo).await?;
     let after = q.after.as_deref();
+    let reader = match q.for_daemon {
+        Some(true) => Reader::Daemon,
+        _ => Reader::Agent,
+    };
     let deadline = Instant::now() + Duration::from_secs(q.wait.unwrap_or(0).min(MAX_WAIT));
     loop {
-        let view = read(&app, id, &repo, number, after).await?;
+        let view = read(&app, id, &repo, number, after, reader).await?;
         let seen = Some(view.id.as_str()) == after;
         let settled = matches!(view.needs, NeedKind::Merged | NeedKind::Off);
         if settled || (!seen && view.needs != NeedKind::Wait) {
@@ -126,6 +145,7 @@ async fn read(
     repo: &RepoName,
     number: u64,
     after: Option<&str>,
+    reader: Reader,
 ) -> Result<NeedView, ApiError> {
     let status = crate::v1::statuses(app, repo, Some(id), &[number])
         .await?
@@ -133,7 +153,7 @@ async fn read(
     let exits = app.store.last_exits(id, repo, &[number]).await?;
     let exit = exits.iter().find(|e| e.pr == number);
     let newest = app.store.events(id, repo, Some(number), 1).await?;
-    Ok(view(status, exit, newest.first(), after))
+    Ok(view(status, exit, newest.first(), after, reader))
 }
 
 /// The need of a PR, from where the queue has it, how it last left the queue, and its newest
@@ -143,6 +163,7 @@ fn view(
     exit: Option<&ExitRecord>,
     newest: Option<&EventRecord>,
     after: Option<&str>,
+    reader: Reader,
 ) -> NeedView {
     let exit = exit.filter(|_| status.queue.is_none());
     let mut need = need(&status, exit);
@@ -164,7 +185,12 @@ fn view(
     let number = status.number;
     let then = format!("mergeloop {}#{number} --after {id}", status.repo);
     NeedView {
-        brief: brief(&need, &status, &then),
+        brief: match reader {
+            Reader::Agent => brief(&need, &status, &then),
+            Reader::Daemon => {
+                daemon_brief(&need, &status).unwrap_or_else(|| brief(&need, &status, &then))
+            }
+        },
         needs: need.kind,
         exit_code: need.kind.exit_code(),
         id,
@@ -202,11 +228,7 @@ fn need(status: &PullStateView, exit: Option<&ExitRecord>) -> Need {
         detail,
     };
     if status.mergeloop.state != RepoStateView::On {
-        let why = status.mergeloop.config_error.clone().map_or_else(
-            || "MergeLoop is not installed on it, it has no config file, or the dashboard turned it off".to_owned(),
-            |e| format!("its config file does not parse: {e}"),
-        );
-        return of(NeedKind::Off, why);
+        return of(NeedKind::Off, off(&status.mergeloop));
     }
     let Some(queue) = &status.queue else {
         return match exit {
@@ -252,6 +274,28 @@ fn need(status: &PullStateView, exit: Option<&ExitRecord>) -> Need {
     }
 }
 
+/// Why a repo's queue does not run, and the one thing that runs it.
+fn off(repo: &RepoStatusView) -> String {
+    // Only a queue that would run is paused by its config: an off repo's error can be stale.
+    // The error starts with the file's path, which may be the legacy one.
+    if let (RepoStateView::Paused, Some(e)) = (repo.state, &repo.config_error) {
+        return format!(
+            "its config file does not parse: {e}. A PR that fixes that file, merged outside the queue, runs it"
+        );
+    }
+    if !repo.installed {
+        return "MergeLoop's GitHub App is not installed on it. A human installs the App on the repo, from the MergeLoop dashboard".into();
+    }
+    match repo.forced {
+        Some(SwitchView::Off) => {
+            "the MergeLoop dashboard turned it off. A human turns it on there".into()
+        }
+        _ => format!(
+            "its default branch has no `{REPO_CONFIG_PATH}`. A PR that adds one, merged outside the queue, turns it on, or a human turns it on in the MergeLoop dashboard"
+        ),
+    }
+}
+
 /// The need as it is now: a new event or a new hold makes it a new one, even of the same kind,
 /// as a review that sends findings back again after a push.
 fn need_id(need: &Need, exit: Option<&ExitRecord>, newest: Option<&EventRecord>) -> String {
@@ -275,21 +319,15 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
         _ => String::new(),
     };
     let detail = &need.detail;
-    let args = format!(r#"'{{"repo":"{repo}","number":{pr}}}'"#);
+    let args = args(repo, pr);
     match need.kind {
         NeedKind::Queue => format!(
             "#{number} is not queued. Queue it with `mergeloop call queue_pull {args}`, then run `{then}`."
         ),
         NeedKind::Wait => format!("Nothing for you yet: {detail}. Run `{then}`."),
-        NeedKind::Threads => THREADS
-            .replace("{on}", &on)
-            .replace("{detail}", detail)
-            .replace("{repo}", repo)
-            .replace("{pr}", &pr.to_string())
-            .replace("{args}", &args)
-            .replace("{then}", then),
+        NeedKind::Threads => fill(THREADS, need, status).replace("{then}", then),
         NeedKind::Changes => format!(
-            "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch and rebase onto the remote branch, push once, and reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
+            "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch the PR's branch and rebase your new commits onto it, and push once. Leave the base branch and its conflicts to MergeLoop. Reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
         ),
         NeedKind::Draft => format!(
             "#{pr} is a draft{on}. If its work is done, publish it with `gh pr ready {pr} --repo {repo}`. If not, finish it first, or tell the user it waits on them. Then run `{then}`."
@@ -298,23 +336,80 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
             "It waits on a human: {detail}. Nothing here is yours to do. Tell the user what it waits for, then run `{then}` in the background: it returns once something changes."
         ),
         NeedKind::Ejected => format!(
-            "MergeLoop ejected #{number}: {detail}. Fix the cause on its branch, then fetch, rebase onto the remote branch, and push. Then run `{then}`, which queues it again."
+            "MergeLoop ejected #{number}: {detail}. Fix the cause on its branch, then fetch the branch, rebase your new commits onto it, and push. Then run `{then}`, which queues it again."
         ),
         NeedKind::Removed => format!(
             "#{number} was taken out of the queue ({detail}), not by a failure. Don't queue it again unless the user asks you to: if they do, run `mergeloop call queue_pull {args}`. Tell the user, then run `{then}` in the background: it returns once someone queues it again."
         ),
         NeedKind::Merged => format!("#{number} merged, as {detail}. Nothing is left to do."),
         NeedKind::Off => format!(
-            "MergeLoop does not queue {repo}: {detail}. A human sets it up, or turns it on, in the MergeLoop dashboard. Tell the user."
+            "MergeLoop does not queue {repo}: {detail}. Nothing here is yours to do unless the user asks: tell them."
         ),
     }
 }
 
+/// The PR's `mergeloop call` arguments.
+fn args(repo: &str, pr: u32) -> String {
+    format!(r#"'{{"repo":"{repo}","number":{pr}}}'"#)
+}
+
+/// The command that lists the PR's review threads.
+fn threads(repo: &str, pr: u32) -> String {
+    let (owner, name) = repo.split_once('/').unwrap_or((repo, ""));
+    format!(
+        r#"`gh api graphql -f query='{{ repository(owner: "{owner}", name: "{name}") {{ pullRequest(number: {pr}) {{ reviewThreads(first: 100) {{ nodes {{ id isResolved path line comments(first: 20) {{ nodes {{ author {{ login }} body }} }} }} }} }} }} }}'`"#
+    )
+}
+
+/// What the agent the daemon runs does about the need, when it is one an agent works.
+fn daemon_brief(need: &Need, status: &PullStateView) -> Option<String> {
+    match need.kind {
+        NeedKind::Threads => Some(fill(DAEMON_THREADS, need, status)),
+        NeedKind::Changes => Some(fill(DAEMON_CHANGES, need, status)),
+        _ => None,
+    }
+}
+
+/// A brief's template with the need's placeholders filled: every one but `{then}`.
+fn fill(text: &str, need: &Need, status: &PullStateView) -> String {
+    let (repo, number) = (status.repo.as_str(), status.number);
+    let pr = need.layer.unwrap_or(number);
+    let on = match need.layer {
+        Some(layer) if layer != number => format!(" on #{layer}, a layer of its stack,"),
+        _ => String::new(),
+    };
+    text.replace("{on}", &on)
+        .replace("{detail}", &need.detail)
+        .replace("{repo}", repo)
+        .replace("{pr}", &pr.to_string())
+        .replace("{threads}", &threads(repo, pr))
+        .replace("{args}", &args(repo, pr))
+        .replace("{after}", DAEMON_AFTER)
+        .replace("{REPLY}", REPLY)
+        .replace("{RESOLVE}", RESOLVE)
+        .replace("{COMMIT}", COMMIT)
+}
+
+/// What the daemon does once its agent ends.
+const DAEMON_AFTER: &str = "You work in a checkout of the PR's branch, and `gh` acts as MergeLoop's App, which opened the PR. Change files only: do not commit, push, reply or resolve. Once you end, MergeLoop commits your change as one commit, pushes it, then posts your replies, each naming that commit, and resolves the threads you name.";
+
+const DAEMON_THREADS: &str = "Review threads{on} hold the PR: {detail}. Work each unresolved one now. {after}
+
+1. List the unresolved review threads of #{pr}: {threads}. MergeLoop's own findings, with their ids and evidence: `mergeloop call get_agent_review {args}`.
+2. Read each thread and the code it points at. Fix it, at every place its **Also at** names, or decide it doesn't apply, for a reason the code shows: a file and line, a test, a doc. Only a call on scope, product or design, access you lack, or a change outside the repo is for a human.
+3. End your last message with a line `{REPLY} <thread id> <reply>` for each thread you worked: one line on what changed, or the reason it doesn't apply. Then a line `{RESOLVE} <thread id>` for each you fixed or that doesn't apply. Another reviewer's thread that needs a human: reply with the decision needed and who should make it, and do not resolve it. If you changed files, end with a line `{COMMIT} <subject>`, the commit's one-line subject.
+
+MergeLoop's reviewer reads no reply from the App, so a finding of its that doesn't apply is settled by resolving its thread, with the reason as your reply. Leave each thread MergeLoop's review marked **For a human** to them, with no reply: resolving it answers it as fine as it is. Never approve the PR.";
+
+const DAEMON_CHANGES: &str = "A reviewer whose approval the branch requires asked for changes{on}. {after}
+
+Read their review, `gh pr view {pr} --repo {repo} --json reviews`, and their comments on its lines in the review threads: {threads}. Make the changes. End your last message with a line `{REPLY} <thread id> <reply>` for each of their threads, one line on what changed, and a line `{COMMIT} <subject>`, the commit's one-line subject. The PR goes on once they approve.";
+
 const THREADS: &str = "Review threads{on} hold the PR: {detail}. Work each unresolved one now, without waiting to be asked:
 
-1. List the unresolved review threads of #{pr}: `gh api graphql -f query='{ repository(owner: \"OWNER\", name: \"NAME\") { pullRequest(number: {pr}) { reviewThreads(first: 100) { nodes { id isResolved path line comments(first: 20) { nodes { author { login } body } } } } } } }'`, with `{repo}` as OWNER/NAME. MergeLoop's own findings, with their ids and evidence: `mergeloop call get_agent_review {args}`.
+1. List the unresolved review threads of #{pr}: {threads}. MergeLoop's own findings, with their ids and evidence: `mergeloop call get_agent_review {args}`.
 2. Read each thread and the code it points at. Fix it, at every place its **Also at** names, or decide it doesn't apply, for a reason the code shows: a file and line, a test, a doc. Only a call on scope, product or design, access you lack, or a change outside the repo is for a human.
-3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch and rebase onto the remote branch, then push once.
+3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch the PR's branch and rebase your new commits onto it, then push once. Leave the base branch and its conflicts to MergeLoop.
 4. Reply in each thread you worked: the fix's short SHA and one line on what changed, or the reason it doesn't apply. Then resolve it: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"ID\"}) { thread { isResolved } } }'`. Resolve only after the push. Another reviewer's thread that needs a human: reply with the decision needed and who should make it, and leave it unresolved.
 5. To have MergeLoop's reviewer settle one of its findings now, rather than on the next push, reply in its thread mentioning MergeLoop's App, as the review's summary names it, with why it doesn't apply. The agent reads the code again, answers in the thread, and withdraws the finding if your reason holds.
 
@@ -323,7 +418,17 @@ Leave each thread MergeLoop's review marked **For a human** to them: resolving i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1::{EjectedView, HoldView, MergedView, QueueView, RepoStatusView};
+    use crate::v1::{EjectedView, HoldView, MergedView, QueueView};
+
+    /// The need as an agent that acts on GitHub itself reads it.
+    fn view(
+        status: PullStateView,
+        exit: Option<&ExitRecord>,
+        newest: Option<&EventRecord>,
+        after: Option<&str>,
+    ) -> NeedView {
+        super::view(status, exit, newest, after, Reader::Agent)
+    }
 
     fn status(queue: Option<QueueView>) -> PullStateView {
         PullStateView {
@@ -410,11 +515,86 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_whose_queue_does_not_run_needs_a_human() {
-        let mut off = status(None);
-        off.mergeloop.state = RepoStateView::Off;
-        let v = view(off, None, None, None);
-        assert_eq!((v.needs, v.exit_code), (NeedKind::Off, 2));
+    fn a_repo_whose_queue_does_not_run_needs_a_human_and_says_why() {
+        let base = status(None).mergeloop;
+        let cases = [
+            (
+                RepoStatusView {
+                    installed: false,
+                    ..base.clone()
+                },
+                "GitHub App is not installed",
+            ),
+            (
+                RepoStatusView {
+                    forced: Some(SwitchView::Off),
+                    ..base.clone()
+                },
+                "dashboard turned it off",
+            ),
+            (
+                RepoStatusView {
+                    has_config: false,
+                    ..base.clone()
+                },
+                "has no `.mergeloop/mergeloop.yml`",
+            ),
+            (
+                RepoStatusView {
+                    config_error: Some("bad yaml".into()),
+                    ..base.clone()
+                },
+                "does not parse: bad yaml",
+            ),
+            // The file that did not parse was deleted: the error is stale.
+            (
+                RepoStatusView {
+                    has_config: false,
+                    config_error: Some("bad yaml".into()),
+                    ..base
+                },
+                "has no `.mergeloop/mergeloop.yml`",
+            ),
+        ];
+        for (mut repo, said) in cases {
+            repo.state = match repo.config_error {
+                Some(_) if repo.has_config => RepoStateView::Paused,
+                _ => RepoStateView::Off,
+            };
+            let v = view(
+                PullStateView {
+                    mergeloop: repo,
+                    ..status(None)
+                },
+                None,
+                None,
+                None,
+            );
+            assert_eq!((v.needs, v.exit_code), (NeedKind::Off, 12));
+            assert!(v.brief.contains(said), "{said}:\n{}", v.brief);
+        }
+    }
+
+    #[test]
+    fn a_config_error_names_the_file_that_does_not_parse() {
+        let mut repo = status(None).mergeloop;
+        repo.state = RepoStateView::Paused;
+        repo.config_error = Some(".mergepatrol/mergepatrol.yml: bad yaml".into());
+        let v = view(
+            PullStateView {
+                mergeloop: repo,
+                ..status(None)
+            },
+            None,
+            None,
+            None,
+        );
+        assert!(
+            v.brief.contains(".mergepatrol/mergepatrol.yml: bad yaml"),
+            "{}",
+            v.brief
+        );
+        assert!(!v.brief.contains(".mergeloop/mergeloop.yml"), "{}", v.brief);
     }
 
     #[test]
@@ -427,6 +607,24 @@ mod tests {
         assert_ne!(first.id, pushed.id);
         assert_eq!(first.then, format!("mergeloop o/r#6 --after {}", first.id));
         assert_eq!(first.exit_code, 0);
+    }
+
+    #[test]
+    fn a_hold_transition_does_not_replay_the_old_threads_need() {
+        let first = view(
+            status(held(HoldReasonView::UnresolvedThreads, None)),
+            None,
+            Some(&event("review-sent-back")),
+            None,
+        );
+        let current = view(
+            status(held(HoldReasonView::ReviewRequired, None)),
+            None,
+            Some(&event("review-sent-back")),
+            Some(&first.id),
+        );
+        assert_eq!(current.needs, NeedKind::Human);
+        assert_ne!(current.id, first.id);
     }
 
     #[test]
@@ -483,5 +681,138 @@ mod tests {
         assert!(v.brief.contains("on #4, a layer of its stack"));
         assert!(v.brief.contains("pullRequest(number: 4)"));
         assert!(v.brief.ends_with(&format!("Then run `{}`.", v.then)));
+    }
+
+    /// The first `{name}` left in `text`, a placeholder no one filled.
+    fn unfilled(text: &str) -> Option<&str> {
+        text.match_indices('{').find_map(|(at, _)| {
+            let rest = &text[at + 1..];
+            let end = rest.find('}')?;
+            let name = &rest[..end];
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic()))
+                .then_some(&text[at..at + end + 2])
+        })
+    }
+
+    #[test]
+    fn no_brief_leaves_a_placeholder_unfilled_and_a_threads_brief_names_its_pr() {
+        use HoldReasonView::*;
+        let reasons = [
+            Draft,
+            ReviewRequired,
+            ChangesRequested,
+            WorkflowApproval,
+            ForkEditsOff,
+            NoQueue,
+            NoSubscription,
+            FairUseLimit,
+            PrepRebasing,
+            PrepChecks,
+            PrepFixing,
+            Reviewing,
+            ReviewAsks,
+            ReviewChanges,
+            UnresolvedThreads,
+        ];
+        for reader in [Reader::Agent, Reader::Daemon] {
+            for layer in [None, Some(4)] {
+                for reason in reasons {
+                    let v = super::view(status(held(reason, layer)), None, None, None, reader);
+                    assert_eq!(
+                        unfilled(&v.brief),
+                        None,
+                        "{reason:?} {layer:?}:\n{}",
+                        v.brief
+                    );
+                    if v.needs == NeedKind::Threads {
+                        let pr = layer.unwrap_or(6);
+                        let named = format!("review threads of #{pr}:");
+                        assert!(
+                            v.brief.contains(&named),
+                            "{reason:?} {layer:?}:\n{}",
+                            v.brief
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_queued_prs_push_leaves_the_base_branch_to_mergeloop() {
+        for reason in [
+            HoldReasonView::ReviewChanges,
+            HoldReasonView::UnresolvedThreads,
+            HoldReasonView::ChangesRequested,
+        ] {
+            let brief = view(status(held(reason, None)), None, None, None).brief;
+            assert!(brief.contains("push once"), "{reason:?}:\n{brief}");
+            assert!(
+                brief.contains("Leave the base branch and its conflicts to MergeLoop."),
+                "{reason:?}:\n{brief}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_daemons_agent_changes_files_only_and_ends_with_what_the_daemon_posts() {
+        for (reason, kind) in [
+            (HoldReasonView::ReviewChanges, NeedKind::Threads),
+            (HoldReasonView::ChangesRequested, NeedKind::Changes),
+        ] {
+            let v = super::view(
+                status(held(reason, Some(4))),
+                None,
+                None,
+                None,
+                Reader::Daemon,
+            );
+            assert_eq!(v.needs, kind);
+            let brief = &v.brief;
+            for said in [
+                "do not commit, push, reply or resolve",
+                "MERGELOOP_REPLY: <thread id>",
+                "MERGELOOP_COMMIT: <subject>",
+                "pullRequest(number: 4)",
+                r#"repository(owner: "o", name: "r")"#,
+            ] {
+                assert!(brief.contains(said), "{kind:?} {said}:\n{brief}");
+            }
+            for unsaid in ["push once", "Then run", "mentioning MergeLoop's App", "{"] {
+                assert!(
+                    !brief
+                        .replace(&threads("o/r", 4), "")
+                        .replace(&args("o/r", 4), "")
+                        .contains(unsaid),
+                    "{kind:?} {unsaid}:\n{brief}"
+                );
+            }
+        }
+        let threads = super::view(
+            status(held(HoldReasonView::UnresolvedThreads, None)),
+            None,
+            None,
+            None,
+            Reader::Daemon,
+        );
+        assert!(threads.brief.contains("MERGELOOP_RESOLVE: <thread id>"));
+        // Needs no agent works are as an agent reads them.
+        let human = super::view(
+            status(held(HoldReasonView::ReviewRequired, None)),
+            None,
+            None,
+            None,
+            Reader::Daemon,
+        );
+        assert_eq!(
+            human.brief,
+            view(
+                status(held(HoldReasonView::ReviewRequired, None)),
+                None,
+                None,
+                None
+            )
+            .brief
+        );
     }
 }

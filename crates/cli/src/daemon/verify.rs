@@ -1,0 +1,424 @@
+//! The repo's verify commands, run by the daemon in a build's tree. The agent may have changed
+//! what they run, so in `workspace` access they get the agent's confinement: writes only in the
+//! build's room, and no reads of the denied paths, through a symlink either. macOS confines them
+//! with `sandbox-exec`, which matches a path after following its symlinks, Linux with `bwrap`
+//! (bubblewrap), which hides each denied path that exists under an empty one; elsewhere
+//! `workspace` access is refused when the daemon starts.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use mergepatrol_git::Tree;
+use mergepatrol_resolver::{Access, Env, Room, VerifyFailed};
+
+use super::groups::Groups;
+
+/// The longest one verify command may take.
+const TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How much of a failed command's output the agent is shown.
+const TAIL: usize = 6000;
+
+/// Whether this machine can confine the verify commands to `access`. An error says what is
+/// missing.
+pub async fn check(access: &Access) -> Result<()> {
+    let Access::Workspace { .. } = access else {
+        return Ok(());
+    };
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        bail!(
+            "`workspace` access confines the verify commands on macOS and Linux only: set `access = \"full\"`"
+        );
+    }
+    // The confinement the commands run under, as it is.
+    let argv = confine(&[], &[]);
+    let ok = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success());
+    if !ok {
+        let program = argv[0].to_string_lossy();
+        bail!(
+            "`workspace` access runs the verify commands under `{program}`, which does not run here{}: install it, or set `access = \"full\"`",
+            if program == "bwrap" {
+                " (bubblewrap, with unprivileged user namespaces allowed)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Runs each command in the room's tree, in order, until one fails: that one and the end of its
+/// output. Each runs in a process group of its own, noted in `groups` for `build`, and whatever
+/// it leaves running is stopped when it ends.
+pub async fn run(
+    commands: &[String],
+    room: &Room,
+    access: &Access,
+    env: &Env,
+    groups: &Groups,
+    build: u64,
+) -> Result<Option<VerifyFailed>> {
+    tokio::fs::create_dir_all(room.tmp()).await?;
+    for command in commands {
+        let mut cmd = shell(command, room, access);
+        env.apply(&mut cmd);
+        cmd.current_dir(&room.tree)
+            .env("TMPDIR", room.tmp())
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().with_context(|| format!("run `{command}`"))?;
+        if let Some(pid) = child.id() {
+            groups.track(build, pid);
+        }
+        let (stdout, stderr) = (read(child.stdout.take()), read(child.stderr.take()));
+        let waited = tokio::time::timeout(TIMEOUT, child.wait()).await;
+        // Ends what it left running, which may hold its output open.
+        groups.stop(build).await?;
+        let status = match waited {
+            Ok(status) => status.with_context(|| format!("run `{command}`"))?,
+            Err(_) => {
+                return Ok(Some(VerifyFailed {
+                    command: command.clone(),
+                    output: format!("It did not finish in {} minutes.", TIMEOUT.as_secs() / 60),
+                }));
+            }
+        };
+        if !status.success() {
+            let mut output = stdout.await.unwrap_or_default();
+            output.push_str(&stderr.await.unwrap_or_default());
+            return Ok(Some(VerifyFailed {
+                command: command.clone(),
+                output: tail(&output),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// All of `pipe`, read as it comes, so a full pipe never blocks the command.
+fn read(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = pipe.read_to_end(&mut bytes).await;
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// `sh -c command`, confined to the room in `workspace` access.
+fn shell(command: &str, room: &Room, access: &Access) -> tokio::process::Command {
+    let mut argv = match access {
+        Access::Workspace { deny_read } => confine(&[&room.root], deny_read),
+        Access::Full => vec![],
+    };
+    argv.extend(["sh", "-c", command].map(OsString::from));
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd
+}
+
+/// `tree`, its git run in `workspace` access under the verify commands' confinement: no reads
+/// of the denied paths, so that a tree a build pointed elsewhere while git ran gives git nothing
+/// denied to read; and writes only where git writes, the tree's git dir and its clone's objects,
+/// refs and logs.
+pub fn confine_tree(tree: Tree, clone: &Path, access: &Access) -> Result<Tree> {
+    let Access::Workspace { deny_read } = access else {
+        return Ok(tree);
+    };
+    let (objects, refs, logs) = (
+        clone.join("objects"),
+        clone.join("refs"),
+        clone.join("logs"),
+    );
+    // Bubblewrap binds only what exists.
+    std::fs::create_dir_all(&logs)?;
+    let writable = [tree.git_dir.as_path(), &objects, &refs, &logs];
+    let under = confine(&writable, deny_read);
+    Ok(tree.under(under))
+}
+
+/// The program and arguments that run a program confined: writes only in `writable` and to the
+/// terminal devices, and no reads of `deny_read`. On Linux, `bwrap` mounts everything read-only,
+/// `writable` writable, and over each denied path that exists an empty one (`man bwrap`).
+fn confine(writable: &[&Path], deny_read: &[PathBuf]) -> Vec<OsString> {
+    let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+    if cfg!(target_os = "macos") {
+        let mut argv = os(&["sandbox-exec", "-p"]);
+        argv.push(profile(writable, deny_read).into());
+        return argv;
+    }
+    // A fresh /proc needs a pid namespace of its own; its first process ends the rest with it.
+    let mut argv = os(&["bwrap", "--ro-bind", "/", "/", "--dev", "/dev"]);
+    argv.extend(os(&["--unshare-pid", "--proc", "/proc"]));
+    for path in writable {
+        argv.extend(["--bind".into(), path.into(), path.into()]);
+    }
+    for path in deny_read {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_dir() => argv.extend(["--tmpfs".into(), path.into()]),
+            Ok(_) => argv.extend(
+                os(&["--ro-bind", "/dev/null"])
+                    .into_iter()
+                    .chain([path.into()]),
+            ),
+            // What is not there cannot be read, nor made there: `writable` is all it writes.
+            Err(_) => {}
+        }
+    }
+    argv.push("--die-with-parent".into());
+    argv
+}
+
+/// The `sandbox-exec` profile: writes only in `writable` and to the terminal devices, and no
+/// reads of `deny_read`.
+fn profile(writable: &[&Path], deny_read: &[PathBuf]) -> String {
+    let quote = |p: &Path| {
+        let p = p.to_string_lossy();
+        format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let subpaths: Vec<String> = writable
+        .iter()
+        .map(|p| format!("(subpath {})", quote(p)))
+        .collect();
+    let mut profile = format!(
+        "(version 1)(allow default)(deny file-write*)\
+         (allow file-write* {} (literal \"/dev/null\") (literal \"/dev/zero\") \
+         (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\") (subpath \"/dev/fd\"))",
+        subpaths.join(" ")
+    );
+    for path in deny_read {
+        profile.push_str(&format!("(deny file-read* (subpath {}))", quote(path)));
+    }
+    profile
+}
+
+/// The last `TAIL` bytes of `s`, cut at a character.
+fn tail(s: &str) -> String {
+    let mut start = s.len().saturating_sub(TAIL);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mergepatrol_git::Git;
+
+    fn room(dir: &Path) -> Room {
+        Room {
+            root: dir.to_owned(),
+            tree: dir.to_owned(),
+        }
+    }
+
+    /// A note of process groups, in a folder of its own.
+    fn groups() -> (tempfile::TempDir, Groups) {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = Groups::new(dir.path().join("groups"));
+        (dir, groups)
+    }
+
+    /// Whether `access` can be confined here. A Linux machine may have no working bubblewrap,
+    /// and the test is skipped, unless `MERGELOOP_REQUIRE_SANDBOX` is set, as on CI; macOS
+    /// always has sandbox-exec.
+    async fn sandboxed(access: &Access) -> bool {
+        let Err(e) = check(access).await else {
+            return true;
+        };
+        if !cfg!(target_os = "linux") || std::env::var_os("MERGELOOP_REQUIRE_SANDBOX").is_some() {
+            panic!("{e:#}");
+        }
+        eprintln!("skipped: {e:#}");
+        false
+    }
+
+    #[tokio::test]
+    async fn the_first_failing_command_is_named_with_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = vec![
+            "echo fine".to_owned(),
+            "echo broken >&2; exit 3".to_owned(),
+            "touch never".to_owned(),
+        ];
+        let room = room(dir.path());
+        let (_g, groups) = groups();
+        let failed = run(&commands, &room, &Access::Full, &Env::default(), &groups, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.command, "echo broken >&2; exit 3");
+        assert_eq!(failed.output.trim(), "broken");
+        assert!(!dir.path().join("never").exists());
+        assert!(
+            run(
+                &commands[..1],
+                &room,
+                &Access::Full,
+                &Env::default(),
+                &groups,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_long_output_keeps_its_end() {
+        let long = format!("{}é{}", "a".repeat(10_000), "end");
+        let t = tail(&long);
+        assert!(t.ends_with("éend") && t.len() <= TAIL);
+        // A cut inside a character moves past it.
+        let t = tail(&format!("é{}", "a".repeat(TAIL - 1)));
+        assert_eq!(t, "a".repeat(TAIL - 1));
+    }
+
+    /// In the room it writes; beside it, and outside, it does not; a denied path it does not
+    /// read, nor a symlink to it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn in_workspace_access_a_command_writes_only_its_room_and_reads_nothing_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let room = Room {
+            root: root.join("ws/builds/1"),
+            tree: root.join("ws/builds/1/tree"),
+        };
+        let (sibling, decoy) = (root.join("ws/builds/2"), root.join("decoy"));
+        for d in [&room.tree, &sibling, &decoy] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(decoy.join("secret"), "DECOY").unwrap();
+        std::os::unix::fs::symlink(decoy.join("secret"), room.tree.join("link")).unwrap();
+        let access = Access::workspace(std::slice::from_ref(&decoy));
+        if !sandboxed(&access).await {
+            return;
+        }
+        let (_g, groups) = groups();
+        let confined = |commands: &[String]| {
+            let commands = commands.to_vec();
+            let (room, access, groups) = (room.clone(), access.clone(), groups.clone());
+            async move { run(&commands, &room, &access, &Env::default(), &groups, 1).await }
+        };
+        let inside = vec!["echo x > made && echo y > \"$TMPDIR/t\"".to_owned()];
+        assert!(confined(&inside).await.unwrap().is_none());
+        assert!(room.tree.join("made").exists() && room.tmp().join("t").exists());
+
+        for (command, left) in [
+            (
+                format!("echo x > {}/escaped", sibling.display()),
+                sibling.join("escaped"),
+            ),
+            (
+                format!("echo x > {}/escaped", root.display()),
+                root.join("escaped"),
+            ),
+        ] {
+            assert!(confined(&[command]).await.unwrap().is_some());
+            assert!(!left.exists());
+        }
+        for read in [
+            format!("cat {}/secret", decoy.display()),
+            "cat link".to_owned(),
+        ] {
+            let failed = confined(std::slice::from_ref(&read)).await.unwrap();
+            let failed = failed.unwrap_or_else(|| panic!("{read} read the decoy"));
+            assert!(
+                !failed.output.contains("DECOY"),
+                "{read}: {}",
+                failed.output
+            );
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    }
+
+    /// Commits whatever the tree is when its root was swapped for a link to `decoy` after the
+    /// daemon's check: whether the clone then holds the decoy's file.
+    async fn commits_a_swapped_tree(root: &Path, decoy: &Path, access: &Access) -> bool {
+        let (remote, clone) = (root.join("remote"), root.join("ws/repos/o/r.git"));
+        std::fs::create_dir_all(remote.join("seed")).unwrap();
+        std::fs::write(remote.join("seed/README.md"), "# r\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "."],
+            &["commit", "-qm", "1"],
+        ] {
+            assert!(git(&remote.join("seed"), args).status.success());
+        }
+        let cloned = git(
+            root,
+            &["clone", "-q", "--bare", "remote/seed", "ws/repos/o/r.git"],
+        );
+        assert!(cloned.status.success(), "{cloned:?}");
+        let dir = root.join("ws/builds/1/tree");
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        let tree = Git
+            .add_tree(&clone, &dir, "mergeloop/build-1", "main")
+            .await
+            .unwrap();
+        let tree = confine_tree(tree, &clone, access).unwrap().unpinned();
+        let base = Git.tree_head(&tree).await.unwrap();
+        std::fs::rename(&dir, root.join("ws/builds/1/saved")).unwrap();
+        std::os::unix::fs::symlink(decoy, &dir).unwrap();
+
+        let _ = Git.squash(&tree, &base, "m", ("b", "b@example.com")).await;
+
+        let hash = git(decoy, &["hash-object", "token"]);
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        git(&clone, &["cat-file", "-e", hash.trim()])
+            .status
+            .success()
+    }
+
+    /// Even when a build swaps its tree's root after the daemon checked it, the daemon's own git
+    /// in `workspace` access reads nothing denied. In `full` access it does: what the check is
+    /// for.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn in_workspace_access_the_daemons_git_stages_nothing_denied_from_a_swapped_tree() {
+        for confined in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let decoy = root.join("decoy");
+            std::fs::create_dir_all(&decoy).unwrap();
+            std::fs::write(decoy.join("token"), "DECOY CREDENTIAL\n").unwrap();
+            let access = if confined {
+                Access::workspace(std::slice::from_ref(&decoy))
+            } else {
+                Access::Full
+            };
+            if !sandboxed(&access).await {
+                return;
+            }
+            let staged = commits_a_swapped_tree(&root, &decoy, &access).await;
+            assert_eq!(staged, !confined, "confined: {confined}");
+        }
+    }
+}

@@ -13,3 +13,6 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

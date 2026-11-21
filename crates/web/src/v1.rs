@@ -3,7 +3,6 @@
 //! `ETag`, and the caller's rate limit.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
@@ -11,6 +10,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use mergepatrol_core::{EntryState, Hold, PrNumber, Provider, RepoName, SpendTask};
 use mergepatrol_store::{AgentTask, ExitRecord, LaneKey, RepoState, Scope};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -599,7 +599,7 @@ pub(crate) struct Budget {
 
 impl Budgets {
     pub(crate) fn spend(&self, caller: &str, now: u64) -> Budget {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         map.retain(|_, (start, _)| now < *start + WINDOW_SECS);
         let (start, used) = map.entry(caller.to_owned()).or_insert((now, 0));
         *used = used.saturating_add(1);

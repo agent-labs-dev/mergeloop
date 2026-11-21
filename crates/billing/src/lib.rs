@@ -5,7 +5,7 @@
 //! a queue, and `FAIR_USE_JOBS` jobs, an hour. Private repos need a subscription, which starts
 //! with a Stripe trial of `TRIAL_DAYS` that needs no card: `PRICE_USD` a month per seat. A
 //! developer takes a seat when their PR first joins a private repo's queue, and keeps it until
-//! freed in the dashboard; the subscription's quantity follows the seats. Either way, the
+//! freed in the dashboard (a PR the build lane opened is its developer's, as the queue says); the subscription's quantity follows the seats. Either way, the
 //! workspace brings its own model API key.
 //!
 //! Over the limit, or without a subscription, the repo's waiting PRs go on hold: they keep their

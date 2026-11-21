@@ -1225,7 +1225,7 @@ pub(crate) async fn github_app(app: &AppState) -> Result<App, ApiError> {
         .app_credentials()
         .await?
         .ok_or_else(|| ApiError::Status(StatusCode::CONFLICT, "No GitHub App yet.".into()))?;
-    Ok(App::from_credentials(&creds)?)
+    Ok(app.github.app(&creds)?)
 }
 
 pub(crate) async fn set_repo(
@@ -1361,6 +1361,7 @@ pub(crate) async fn queue(
     number: u64,
     priority: bool,
 ) -> Result<(), ApiError> {
+    let user = app.github.as_user(token)?;
     let (labels, _) = repo_labels(app, gh, repo).await?;
     let mut add = vec![labels.trigger.as_str()];
     let mut changed = vec![number];
@@ -1370,16 +1371,14 @@ pub(crate) async fn queue(
         // A stack has priority while any of its layers has the label.
         for n in layers(gh, repo, number).await? {
             as_user(
-                setup::remove_label_as(token, &repo.to_string(), n, &labels.priority).await,
+                user.remove_label(&repo.to_string(), n, &labels.priority)
+                    .await,
                 repo,
             )?;
             changed.push(n);
         }
     }
-    as_user(
-        setup::add_labels_as(token, &repo.to_string(), number, &add).await,
-        repo,
-    )?;
+    as_user(user.add_labels(&repo.to_string(), number, &add).await, repo)?;
     relabeled(&*app.store, &*app.wake, gh.id, repo.clone(), &changed).await;
     Ok(())
 }
@@ -1392,14 +1391,12 @@ pub(crate) async fn dequeue(
     repo: &RepoName,
     number: u64,
 ) -> Result<(), ApiError> {
+    let user = app.github.as_user(token)?;
     let (labels, _) = repo_labels(app, gh, repo).await?;
     let layers = layers(gh, repo, number).await?;
     for &n in &layers {
         for label in [&labels.trigger, &labels.priority] {
-            as_user(
-                setup::remove_label_as(token, &repo.to_string(), n, label).await,
-                repo,
-            )?;
+            as_user(user.remove_label(&repo.to_string(), n, label).await, repo)?;
         }
     }
     relabeled(&*app.store, &*app.wake, gh.id, repo.clone(), &layers).await;
@@ -2035,7 +2032,9 @@ impl RepoUpdateView {
 /// An error, for a user reading an outcome rather than a failed request.
 fn reason(e: ApiError, fallback: &str) -> String {
     match e {
-        ApiError::Status(_, why) | ApiError::GitHubLimited(_, why) => why,
+        ApiError::Status(_, why) | ApiError::Refused(_, why) | ApiError::GitHubLimited(_, why) => {
+            why
+        }
         ApiError::Internal(e) => {
             tracing::error!(error = %format!("{e:#}"), "{fallback}");
             fallback.to_owned()

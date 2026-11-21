@@ -5,6 +5,8 @@
 //! CHATGPT_LIVE_RENEW=1 renews the login first.
 //! `cargo test -p mergepatrol --test chatgpt_live -- --ignored --nocapture`
 
+#![cfg(test)]
+
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;

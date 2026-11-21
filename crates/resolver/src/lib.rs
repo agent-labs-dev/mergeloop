@@ -1,21 +1,35 @@
 //! The agent: resolves the conflicts of one commit in a stopped rebase, fixes the failed
-//! checks of a PR, or reviews a PR. It edits files only: the caller checks the result and
+//! checks of a PR, or reviews a PR. On a developer's machine (`LocalAgent`), it builds an issue
+//! for the build lane. It edits files only: the caller checks the result and
 //! commits it. A review may run the repo and write tests to show what it finds, which the caller
 //! throws away but for its evidence: its answer is its last message.
 
+mod answers;
+mod build;
 mod chatgpt;
 mod claude;
 mod cli;
 mod codex;
+mod group;
 mod keys;
+mod local;
+mod review;
 mod vote;
 
+pub use answers::{REPLY, RESOLVE, ThreadAnswers, thread_answers};
+pub use build::{BuildRequest, VerifyFailed, build_description, build_prompt, failed_note};
 #[cfg(any(test, feature = "testing"))]
 pub use chatgpt::testing;
 pub use chatgpt::{ChatGptAuth, ChatGptLogin, DeviceLogin};
 pub use claude::ClaudeResolver;
 pub use codex::CodexResolver;
+pub use group::Group;
 pub use keys::{KeyCheck, check_api_key};
+pub use local::{Access, Env, LocalAgent, Room, Vendor};
+pub use review::{
+    BuildFinding, BuildReview, findings_note, reply_json, review_build_findings,
+    review_build_prompt,
+};
 pub use vote::{DOES_NOT_HOLD, HOLDS, claim, vote};
 
 use std::path::Path;
@@ -127,6 +141,9 @@ pub enum Scope<'a> {
     /// `base..HEAD`: the first review, or one after a rebase.
     #[default]
     Whole,
+    /// The commit of HEAD whose changes a review approved, which the author pushed more commits
+    /// on: only `<it>..HEAD` needs reviewing.
+    Approved(&'a str),
     /// What the queue's agent committed on a version already approved, as "sha subject".
     QueueCommits(&'a [String]),
     /// The head the last review sent findings back on, which HEAD descends from: only
@@ -135,13 +152,19 @@ pub enum Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    /// What a review reads: the queue's commits on an approved version, else what changed since
-    /// `reviewed`, the head findings went back on that HEAD still descends from, else all of it.
-    pub fn of(queue_commits: &'a [String], reviewed: Option<&'a str>) -> Self {
-        match (queue_commits, reviewed) {
-            ([], Some(at)) => Scope::Since(at),
-            ([], None) => Scope::Whole,
-            (commits, _) => Scope::QueueCommits(commits),
+    /// What a review reads: what the author pushed on the `approved` commit, else the queue's
+    /// commits on an approved version, else what changed since `reviewed`, the head findings
+    /// went back on that HEAD still descends from, else all of it.
+    pub fn of(
+        approved: Option<&'a str>,
+        queue_commits: &'a [String],
+        reviewed: Option<&'a str>,
+    ) -> Self {
+        match (approved, queue_commits, reviewed) {
+            (Some(at), ..) => Scope::Approved(at),
+            (None, [], Some(at)) => Scope::Since(at),
+            (None, [], None) => Scope::Whole,
+            (None, commits, _) => Scope::QueueCommits(commits),
         }
     }
 }
@@ -211,7 +234,7 @@ pub trait Resolver: Send + Sync {
 
 pub(crate) const GIVE_UP: &str = "MERGEPATROL_GIVE_UP:";
 const RETITLE: &str = "MERGEPATROL_RETITLE:";
-const COMMIT: &str = "MERGELOOP_COMMIT:";
+pub const COMMIT: &str = "MERGELOOP_COMMIT:";
 
 /// The reason the agent gave up, if its last message says it did.
 pub(crate) fn gave_up(text: &str) -> Option<String> {
@@ -277,7 +300,7 @@ find how it runs its tests in its docs and its config. {setup}"
             verify.listed()
         ),
         Verify::Configured(_) => format!(
-            "The repo declares these verify commands, which a fix must pass:\n{}\n\n{setup}",
+            "The repo declares these verify commands. Do not finish until all of these checks pass:\n{}\n\n{setup}",
             verify.listed()
         ),
     }
@@ -344,6 +367,8 @@ MergeLoop rejects a result that changes any other file.
 
 {verify}
 
+Before you finish, read the repository's contributor and agent instructions for fast pre-push checks. Run those fast checks as well as the commands above, and run the focused unit tests that cover the files you changed. Do not finish until all of these checks pass.
+
 If you cannot resolve the conflict with confidence, stop and reply with one line: \
 `{GIVE_UP} <the reason>`. Do not guess."
     )
@@ -385,6 +410,8 @@ Rules:
 - Do not refactor or improve unrelated code.
 
 {verify}
+
+Before you finish, read the repository's contributor and agent instructions for fast pre-push checks. Run those fast checks as well as the commands above, and run the focused unit tests that cover the files you changed. Do not finish until all of these checks pass.
 
 MergeLoop commits your fix. End your reply with one line: `{COMMIT} <the commit's subject>`. \
 Write it in the form the repo's commit history and its commit hooks ask for, such as a \
@@ -537,6 +564,13 @@ only `git diff {reviewed}..HEAD`, what changed since, with `git log` and `git sh
 rest of the PR only to judge it. Check the findings you sent back wherever they are, but report \
 nothing else about the rest of the PR unless what changed since breaks it: what you did not find \
 on the first pass is not the author's to fix now.\n"
+        ),
+        Scope::Approved(at) => format!(
+            "\nYou approved this PR's changes up to `{at}`, at an earlier version: a rebase may have \
+moved them since, but not changed them. Then its author pushed the commits after it. Review only \
+`git diff {at}..HEAD`, what they changed, with `git log` and `git show`, and read the rest of the \
+PR only to judge them. Report nothing about the rest of the PR unless one of these commits breaks \
+it.\n"
         ),
         Scope::QueueCommits(commits) => format!(
             "\nThis PR was approved at an earlier version. Since then the merge queue's agent \
@@ -1103,11 +1137,29 @@ mod scope_tests {
     }
 
     #[test]
-    fn the_queues_commits_then_the_reviewed_head_narrow_a_review() {
+    fn the_authors_push_then_the_queues_commits_then_the_reviewed_head_narrow_a_review() {
         let queue = ["abc Fix ci".to_owned()];
-        assert_eq!(Scope::of(&queue, Some("0ld")), Scope::QueueCommits(&queue));
-        assert_eq!(Scope::of(&[], Some("0ld")), Scope::Since("0ld"));
-        assert_eq!(Scope::of(&[], None), Scope::Whole);
+        assert_eq!(
+            Scope::of(Some("ok"), &queue, Some("0ld")),
+            Scope::Approved("ok")
+        );
+        assert_eq!(
+            Scope::of(None, &queue, Some("0ld")),
+            Scope::QueueCommits(&queue)
+        );
+        assert_eq!(Scope::of(None, &[], Some("0ld")), Scope::Since("0ld"));
+        assert_eq!(Scope::of(None, &[], None), Scope::Whole);
+    }
+
+    #[test]
+    fn a_push_on_an_approved_version_reviews_only_the_commits_after_it() {
+        let approved = with(Scope::Approved("0k"));
+        assert!(
+            approved.contains("Review only `git diff 0k..HEAD`"),
+            "{approved}"
+        );
+        assert!(approved.contains("Report nothing about the rest of the PR unless"));
+        assert!(approved.contains("git diff b4se..HEAD"));
     }
 
     #[test]

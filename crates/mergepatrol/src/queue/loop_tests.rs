@@ -5848,7 +5848,8 @@ async fn a_webhook_before_github_shows_the_push_stops_the_job_on_a_later_tick() 
         tokio::task::yield_now().await;
         // Told first, while GitHub still shows the old head.
         slots.saw(1, &repo(), 1, "pr-1-v1");
-        tokio::task::yield_now().await;
+        // A sleep, not a yield: the clock moves only once the job has read the old head.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         gh.with_mut(|s| s.push(1, "pr-1-v1"));
         // Each tick tells it again; it reads GitHub for that head once a minute.
         loop {

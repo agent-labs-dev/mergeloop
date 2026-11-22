@@ -5671,7 +5671,16 @@ async fn failed_checks_retry_only_a_different_green_head_with_retained_intent() 
         if let Some(head) = old_head {
             run.store.retry_heads.lock().unwrap().insert(1, head.into());
         }
-        read_repo(&run.ctx, &*run.gh, &repo()).await.unwrap();
+        let read = read_repo(&run.ctx, &*run.gh, &repo())
+            .await
+            .unwrap()
+            .unwrap();
+        // Queued again, it joins on this read.
+        assert_eq!(
+            read.snap.labeled.iter().any(|pr| pr.number == 1),
+            retry,
+            "{old_head:?} -> {current_head}, {label}, {check:?}"
+        );
         assert_eq!(
             run.labels(1).contains(&TRIGGER.to_owned()),
             retry,

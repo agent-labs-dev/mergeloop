@@ -162,6 +162,13 @@ pub trait Store: ReadCache + ReviewStore {
         pr: Option<PrNumber>,
         limit: u32,
     ) -> Result<Vec<EventRecord>>;
+    /// When the PR last joined the queue: its newest `enqueued` event.
+    async fn last_enqueued(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+    ) -> Result<Option<String>>;
     /// A PR left the queue. Its time in the queue runs from its last `enqueued` event. Returns
     /// where that time went: none for a PR that left before it joined.
     async fn record_exit(
@@ -778,6 +785,25 @@ impl Store for PgStore {
             .iter()
             .map(|r| (r.get::<i64, _>("pr") as PrNumber, r.get("holder")))
             .collect())
+    }
+
+    async fn last_enqueued(
+        &self,
+        installation_id: u64,
+        repo: &RepoName,
+        pr: PrNumber,
+    ) -> Result<Option<String>> {
+        let at: Option<String> = sqlx::query_scalar(
+            r#"SELECT to_char(max(at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+             FROM events
+             WHERE installation_id = $1 AND repo = $2 AND pr = $3 AND kind = 'enqueued'"#,
+        )
+        .bind(installation_id as i64)
+        .bind(repo.to_string())
+        .bind(pr as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(at)
     }
 
     async fn has_left(&self, key: &LaneKey, pr: PrNumber) -> Result<bool> {

@@ -752,7 +752,8 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     };
     ctx.store.set_config_error(installation, repo, None).await?;
     let labels = settings.labels();
-    let snap = gh.snapshot(repo, &labels).await?;
+    let mut snap = gh.snapshot(repo, &labels).await?;
+    let mut requeued = false;
     // Only an ejection caused by required checks records retry intent. Keeping
     // the failed label is required: removing it is an explicit opt-out.
     for pr in &snap.failed {
@@ -783,6 +784,11 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
             "The new head passes the required checks. Queued again after the check failure.",
         )
         .await?;
+        requeued = true;
+    }
+    // So a PR queued again joins on this tick, read with its new labels, and not on the next.
+    if requeued {
+        snap = gh.snapshot(repo, &labels).await?;
     }
     // So people find the labels in GitHub's picker, not only in the docs.
     for spec in labels.specs() {

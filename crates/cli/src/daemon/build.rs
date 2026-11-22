@@ -99,9 +99,8 @@ impl Builder {
     ) -> Result<Ended> {
         let (stage, staged) = watch::channel(Stage::Building);
         let work = tokio::select! {
-            work = self.work(lane, task, &stage) => work,
+            work = self.work(lane, task, &stage, stop) => work,
             e = heartbeats(lane, task, || *staged.borrow(), self.heartbeat_every) => Err(e),
-            () = stopped(stop) => Err(Stopped.into()),
         };
         let ended = settle(lane, task, work).await;
         self.clean_up(task).await;
@@ -136,7 +135,36 @@ impl Builder {
             .await;
     }
 
-    async fn work(&self, lane: &Lane, task: &Task, stage: &watch::Sender<Stage>) -> Result<Work> {
+    /// A stop ends the build only until it publishes: once its push starts, the build pushes
+    /// and has its PR opened, as the server may open it whether or not its answer arrives, and
+    /// a build given back then would leave its PR with no build.
+    async fn work(
+        &self,
+        lane: &Lane,
+        task: &Task,
+        stage: &watch::Sender<Stage>,
+        stop: watch::Receiver<bool>,
+    ) -> Result<Work> {
+        let built = tokio::select! {
+            built = self.built(lane, task, stage) => built?,
+            () = stopped(stop) => return Err(Stopped.into()),
+        };
+        match built {
+            Ok((checkout, run, reviewed)) => {
+                self.publish(lane, task, &checkout, &run, reviewed.as_ref())
+                    .await
+            }
+            Err(why) => Ok(Work::Stuck(why)),
+        }
+    }
+
+    /// The build's checkout and its change, as `rounds` says it. `Err` with why it is stuck.
+    async fn built(
+        &self,
+        lane: &Lane,
+        task: &Task,
+        stage: &watch::Sender<Stage>,
+    ) -> Result<Result<(Checkout, Resolution, Option<Reviewed>), String>> {
         self.beat(lane, task, Stage::Building).await?;
         let token = self.mint(lane, task, Scope::Push).await?;
         let checkout = self.folder.checkout(task, &token, &self.access).await?;
@@ -148,13 +176,8 @@ impl Builder {
             task,
             &format!("building in {}", checkout.room.tree.display()),
         );
-        match self.rounds(lane, task, &checkout, &base, stage).await? {
-            Ok((built, reviewed)) => {
-                self.publish(lane, task, &checkout, &built, reviewed.as_ref())
-                    .await
-            }
-            Err(why) => Ok(Work::Stuck(why)),
-        }
+        let rounds = self.rounds(lane, task, &checkout, &base, stage).await?;
+        Ok(rounds.map(|(run, reviewed)| (checkout, run, reviewed)))
     }
 
     /// The change, committed on `base`, that the reviewer asks nothing more of: the builder's

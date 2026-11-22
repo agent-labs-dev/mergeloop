@@ -71,6 +71,8 @@ pub struct Lane {
     pub assigned: HashSet<u64>,
     /// Repo names the server no longer knows, as after a rename: a call on one is not found.
     pub gone: HashSet<String>,
+    /// When set, `open_build_pr` opens the PR at once but answers only once this is notified.
+    pub open_held: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Lane {
@@ -328,7 +330,15 @@ async fn mcp(State(seen): Shared, headers: HeaderMap, Json(message): Json<Value>
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
-    answer(seen, headers, message)
+    let held = match message["params"]["name"] == "open_build_pr" {
+        true => seen.lock().unwrap().lane.open_held.clone(),
+        false => None,
+    };
+    let answered = answer(seen, headers, message);
+    if let Some(held) = held {
+        held.notified().await;
+    }
+    answered
 }
 
 fn answer(seen: Arc<Mutex<Seen>>, headers: HeaderMap, message: Value) -> Response {

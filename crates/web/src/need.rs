@@ -165,8 +165,19 @@ fn view(
     after: Option<&str>,
     reader: Reader,
 ) -> NeedView {
-    let exit = exit.filter(|_| status.queue.is_none());
-    let mut need = need(&status, exit);
+    // The queue logs an event as it takes the PR back, before the PR's lane is saved: an exit
+    // older than the PR's newest event is how it left before, not where it is now.
+    let joining =
+        status.queue.is_none() && matches!((exit, newest), (Some(e), Some(n)) if n.at > e.at);
+    let exit = exit.filter(|_| status.queue.is_none() && !joining);
+    let mut need = match joining {
+        true => Need {
+            kind: NeedKind::Wait,
+            layer: None,
+            detail: "it is joining the queue".into(),
+        },
+        false => need(&status, exit),
+    };
     let mut id = need_id(&need, exit, newest);
     // The agent saw it ejected, and runs `then`: it queues it again, and waits on that
     // until the queue takes it.
@@ -478,7 +489,7 @@ mod tests {
             summary: Default::default(),
             enqueued_at: None,
             steps: None,
-            at: String::new(),
+            at: "2026-11-04T10:00:00.000Z".into(),
         }
     }
 
@@ -486,7 +497,7 @@ mod tests {
         EventRecord {
             repo: "o/r".into(),
             pr: 6,
-            at: "2026-11-04T10:00:00Z".into(),
+            at: "2026-11-04T10:00:00.000Z".into(),
             kind: kind.into(),
             message: String::new(),
         }
@@ -647,6 +658,24 @@ mod tests {
             Some(&again.id),
         );
         assert_eq!((queued.needs, queued.id), (NeedKind::Queue, again.id));
+    }
+
+    #[test]
+    fn a_pr_queued_again_after_its_exit_waits_while_it_joins_the_queue() {
+        let removed = view(status(None), Some(&exit(8, "dequeued")), None, None);
+        // The queue took it back and logged so, and its lane is not saved yet.
+        let enqueued = EventRecord {
+            at: "2026-11-04T10:05:00.000Z".into(),
+            ..event("enqueued")
+        };
+        let joining = view(
+            status(None),
+            Some(&exit(8, "dequeued")),
+            Some(&enqueued),
+            Some(&removed.id),
+        );
+        assert_eq!(joining.needs, NeedKind::Wait);
+        assert!(joining.brief.contains("it is joining the queue"));
     }
 
     #[test]

@@ -165,10 +165,11 @@ fn view(
     after: Option<&str>,
     reader: Reader,
 ) -> NeedView {
-    // The queue logs an event as it takes the PR back, before the PR's lane is saved: an exit
-    // older than the PR's newest event is how it left before, not where it is now.
-    let joining =
-        status.queue.is_none() && matches!((exit, newest), (Some(e), Some(n)) if n.at > e.at);
+    // The queue logs `enqueued` as it takes the PR back, before the PR's lane is saved: an exit
+    // older than that event is how it left before, not where it is now. Other events, as a
+    // review ending, are logged after an exit too and say nothing of the queue.
+    let joining = status.queue.is_none()
+        && matches!((exit, newest), (Some(e), Some(n)) if n.kind == "enqueued" && n.at > e.at);
     let exit = exit.filter(|_| status.queue.is_none() && !joining);
     let mut need = match joining {
         true => Need {
@@ -676,6 +677,18 @@ mod tests {
         );
         assert_eq!(joining.needs, NeedKind::Wait);
         assert!(joining.brief.contains("it is joining the queue"));
+    }
+
+    #[test]
+    fn an_event_after_the_exit_that_is_not_a_requeue_keeps_the_exit() {
+        let removed = view(status(None), Some(&exit(8, "dequeued")), None, None);
+        let done = EventRecord {
+            at: "2026-11-04T10:05:00.000Z".into(),
+            ..event("review-done")
+        };
+        let after = view(status(None), Some(&exit(8, "dequeued")), Some(&done), None);
+        assert_eq!(after.needs, removed.needs);
+        assert_ne!(after.needs, NeedKind::Wait);
     }
 
     #[test]

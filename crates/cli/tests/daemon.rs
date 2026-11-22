@@ -655,7 +655,13 @@ async fn a_stop_while_its_pr_opens_keeps_the_build() {
     // The server opened the PR, and the daemon stops before its answer comes.
     let stop = async {
         until(|| w.fake.lane(|l| l.opened.len() == 1)).await;
-        held.notify_one();
+        // The answer comes only once a build given back on the stop would show, or none shows.
+        let (seen, held) = (w.fake.seen.clone(), held.clone());
+        tokio::spawn(async move {
+            let given_back = until(|| !seen.lock().unwrap().lane.released.is_empty());
+            let _ = tokio::time::timeout(Duration::from_secs(2), given_back).await;
+            held.notify_one();
+        });
     };
     tokio::time::timeout(Duration::from_secs(60), daemon.run(stop))
         .await

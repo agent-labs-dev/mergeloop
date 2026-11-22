@@ -147,11 +147,11 @@ impl Builder {
     ) -> Result<Work> {
         let built = tokio::select! {
             built = self.built(lane, task, stage) => built?,
-            () = stopped(stop) => return Err(Stopped.into()),
+            () = stopped(stop.clone()) => return Err(Stopped.into()),
         };
         match built {
             Ok((checkout, run, reviewed)) => {
-                self.publish(lane, task, &checkout, &run, reviewed.as_ref())
+                self.publish(lane, task, &checkout, &run, reviewed.as_ref(), stop)
                     .await
             }
             Err(why) => Ok(Work::Stuck(why)),
@@ -481,9 +481,17 @@ impl Builder {
         checkout: &Checkout,
         run: &Resolution,
         reviewed: Option<&Reviewed>,
+        stop: watch::Receiver<bool>,
     ) -> Result<Work> {
-        let head = Git.tree_head(&checkout.tree).await?;
-        let token = self.mint(lane, task, Scope::Push).await?;
+        // Nothing is pushed yet, so a stop here still gives the build back.
+        let (head, token) = tokio::select! {
+            ready = async {
+                let head = Git.tree_head(&checkout.tree).await?;
+                let token = self.mint(lane, task, Scope::Push).await?;
+                Ok::<_, anyhow::Error>((head, token))
+            } => ready?,
+            () = stopped(stop) => return Err(Stopped.into()),
+        };
         if !push(task, checkout, &token, &head).await? {
             return Ok(Work::Stuck(format!(
                 "The branch {} changed on GitHub while the build ran, so the build did not push \

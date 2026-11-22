@@ -153,23 +153,32 @@ async fn read(
     let exits = app.store.last_exits(id, repo, &[number]).await?;
     let exit = exits.iter().find(|e| e.pr == number);
     let newest = app.store.events(id, repo, Some(number), 1).await?;
-    Ok(view(status, exit, newest.first(), after, reader))
+    let enqueued = app.store.last_enqueued(id, repo, number).await?;
+    Ok(view(
+        status,
+        exit,
+        newest.first(),
+        enqueued.as_deref(),
+        after,
+        reader,
+    ))
 }
 
-/// The need of a PR, from where the queue has it, how it last left the queue, and its newest
-/// event. `after` is the need the agent saw last.
+/// The need of a PR, from where the queue has it, how it last left the queue, its newest event
+/// and when it last joined the queue. `after` is the need the agent saw last.
 fn view(
     status: PullStateView,
     exit: Option<&ExitRecord>,
     newest: Option<&EventRecord>,
+    enqueued: Option<&str>,
     after: Option<&str>,
     reader: Reader,
 ) -> NeedView {
     // The queue logs `enqueued` as it takes the PR back, before the PR's lane is saved: an exit
-    // older than that event is how it left before, not where it is now. Other events, as a
-    // review ending, are logged after an exit too and say nothing of the queue.
+    // older than that event is how it left before, not where it is now. It is the last join,
+    // not the newest event, that says so: a hold or a review ending is logged after it.
     let joining = status.queue.is_none()
-        && matches!((exit, newest), (Some(e), Some(n)) if n.kind == "enqueued" && n.at > e.at);
+        && matches!((exit, enqueued), (Some(e), Some(at)) if at > e.at.as_str());
     let exit = exit.filter(|_| status.queue.is_none() && !joining);
     let mut need = match joining {
         true => Need {
@@ -439,7 +448,10 @@ mod tests {
         newest: Option<&EventRecord>,
         after: Option<&str>,
     ) -> NeedView {
-        super::view(status, exit, newest, after, Reader::Agent)
+        let enqueued = newest
+            .filter(|n| n.kind == "enqueued")
+            .map(|n| n.at.as_str());
+        super::view(status, exit, newest, enqueued, after, Reader::Agent)
     }
 
     fn status(queue: Option<QueueView>) -> PullStateView {
@@ -680,6 +692,26 @@ mod tests {
     }
 
     #[test]
+    fn a_requeued_pr_waits_through_its_initial_hold_before_the_lane_is_saved() {
+        let previous = exit(8, "ejected");
+        let removed = view(status(None), Some(&previous), None, None);
+        // `held` is logged right after `enqueued`, so it is the newest event.
+        let held = EventRecord {
+            at: "2026-11-04T10:05:01.000Z".into(),
+            ..event("held")
+        };
+        let joining = super::view(
+            status(None),
+            Some(&previous),
+            Some(&held),
+            Some("2026-11-04T10:05:00.000Z"),
+            Some(&removed.id),
+            Reader::Agent,
+        );
+        assert_eq!(joining.needs, NeedKind::Wait);
+    }
+
+    #[test]
     fn an_event_after_the_exit_that_is_not_a_requeue_keeps_the_exit() {
         let removed = view(status(None), Some(&exit(8, "dequeued")), None, None);
         let done = EventRecord {
@@ -759,7 +791,8 @@ mod tests {
         for reader in [Reader::Agent, Reader::Daemon] {
             for layer in [None, Some(4)] {
                 for reason in reasons {
-                    let v = super::view(status(held(reason, layer)), None, None, None, reader);
+                    let v =
+                        super::view(status(held(reason, layer)), None, None, None, None, reader);
                     assert_eq!(
                         unfilled(&v.brief),
                         None,
@@ -807,6 +840,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Reader::Daemon,
             );
             assert_eq!(v.needs, kind);
@@ -835,12 +869,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             Reader::Daemon,
         );
         assert!(threads.brief.contains("MERGELOOP_RESOLVE: <thread id>"));
         // Needs no agent works are as an agent reads them.
         let human = super::view(
             status(held(HoldReasonView::ReviewRequired, None)),
+            None,
             None,
             None,
             None,

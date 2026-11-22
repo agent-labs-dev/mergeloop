@@ -1406,6 +1406,9 @@ impl Store for Mem {
     ) -> Result<Vec<EventRecord>> {
         unreachable!()
     }
+    async fn last_enqueued(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<Option<String>> {
+        unreachable!()
+    }
     async fn record_exit(
         &self,
         _: &LaneKey,

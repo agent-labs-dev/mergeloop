@@ -1123,7 +1123,10 @@ async fn a_flaky_job_runs_again_off_the_lane_and_merges_with_no_fix() {
     });
     let _drain = world.drain().await;
     world.tick().await;
-    assert_eq!(world.lane(), [(1, "Held(PrepChecks)".into())]);
+    assert_eq!(
+        world.lane(),
+        [(1, "Held(PrepChecks { waiting: [\"ci\"] })".into())]
+    );
 
     world.tick_until(|w| !w.merged().is_empty()).await;
     let fixes = world.tasks();

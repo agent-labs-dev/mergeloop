@@ -1277,7 +1277,12 @@ pub(crate) async fn queue_pull(
             return Ok(Json(QueuedView::degraded(status)));
         }
     };
-    Ok(Json(QueuedView::new(status, pull.queue, pull.ejected)))
+    Ok(Json(QueuedView::new(
+        status,
+        pull.queue,
+        pull.ejected,
+        pull.merged,
+    )))
 }
 
 /// A PR just queued: what the queue says will become of it, once it has the PR.
@@ -1296,19 +1301,32 @@ impl QueuedView {
         status: RepoStatusView,
         queue: Option<QueueView>,
         ejected: Option<crate::v1::EjectedView>,
+        merged: Option<crate::v1::MergedView>,
     ) -> Self {
-        let mut message = match (status.state, &queue, &status.hold, &ejected) {
-            (_, None, _, Some(ejected)) => {
-                format!("Labeled, but it was ejected: {}.", ejected.reason)
+        // A recorded exit describes the PR's last run through the queue, which may predate
+        // this queueing: report what it says with its timestamp rather than as a verdict on
+        // the current attempt.
+        let mut message = match (status.state, &queue, &status.hold, &ejected, &merged) {
+            (_, None, _, Some(ejected), _) => {
+                format!(
+                    "Labeled, but it was last ejected at {}: {}.",
+                    ejected.at, ejected.reason
+                )
             }
-            (RepoStateView::Off, _, _, _) => {
+            (_, None, _, _, Some(merged)) => {
+                format!(
+                    "Labeled, but it already merged at {} ({}).",
+                    merged.at, merged.sha
+                )
+            }
+            (RepoStateView::Off, _, _, _, _) => {
                 "Labeled, but MergeLoop is off on this repo: nothing merges it.".to_owned()
             }
-            (RepoStateView::Paused, _, _, _) => format!(
+            (RepoStateView::Paused, _, _, _, _) => format!(
                 "Queued, but the queue is paused: {}.",
                 status.config_error.as_deref().unwrap_or_default()
             ),
-            (RepoStateView::On, Some(entry), _, _) => {
+            (RepoStateView::On, Some(entry), _, _, _) => {
                 match (&entry.state, &entry.hold, &status.hold) {
                     (QueueStateView::Held, Some(hold), _) => {
                         format!("Queued, but it goes on hold: {}.", hold.message)
@@ -1321,10 +1339,10 @@ impl QueuedView {
                     _ => "Queued.".to_owned(),
                 }
             }
-            (RepoStateView::On, None, Some(hold), _) => {
+            (RepoStateView::On, None, Some(hold), _, _) => {
                 format!("Queued, but it goes on hold: {}.", hold.message)
             }
-            (RepoStateView::On, None, None, _) => {
+            (RepoStateView::On, None, None, _, _) => {
                 "Queued, waiting to join the queue on its next tick.".to_owned()
             }
         };
@@ -2644,17 +2662,17 @@ mod tests {
             })
         };
         assert_eq!(
-            QueuedView::new(status(None, None), waiting(), None).message,
+            QueuedView::new(status(None, None), waiting(), None, None).message,
             "Queued."
         );
         // The repo's status alone never says it joined: without a queue entry, the
         // acknowledgement says it still has to join.
         assert_eq!(
-            QueuedView::new(status(None, None), None, None).message,
+            QueuedView::new(status(None, None), None, None, None).message,
             "Queued, waiting to join the queue on its next tick."
         );
         assert_eq!(
-            QueuedView::new(status(Some(Hold::NoSubscription), None), None, None).message,
+            QueuedView::new(status(Some(Hold::NoSubscription), None), None, None, None).message,
             "Queued, but it goes on hold: private repos need a MergeLoop subscription."
         );
         assert_eq!(
@@ -2664,6 +2682,7 @@ mod tests {
                     waiting: vec!["check".into()]
                 })),
                 None,
+                None,
             )
             .message,
             "Queued, but it goes on hold: its checks are running: check."
@@ -2672,6 +2691,7 @@ mod tests {
             QueuedView::new(
                 status(None, Some("the workspace has no key")),
                 waiting(),
+                None,
                 None,
             )
             .message,
@@ -2686,14 +2706,35 @@ mod tests {
                     at: "2026-11-23T00:00:00Z".into(),
                     reason: "unsupported fork stack".into(),
                 }),
+                None,
             )
             .message,
-            "Labeled, but it was ejected: unsupported fork stack."
+            "Labeled, but it was last ejected at 2026-11-23T00:00:00Z: unsupported fork stack."
+        );
+        // A recorded merge is reported the same honest way, with its timestamp.
+        assert_eq!(
+            QueuedView::new(
+                status(None, None),
+                None,
+                None,
+                Some(crate::v1::MergedView {
+                    at: "2026-11-23T00:00:00Z".into(),
+                    sha: "abc123".into(),
+                }),
+            )
+            .message,
+            "Labeled, but it already merged at 2026-11-23T00:00:00Z (abc123)."
         );
         // A repo-wide hold gates everything already queued too: a gate that engaged after
         // the lane caught the PR still blocks it.
         assert_eq!(
-            QueuedView::new(status(Some(Hold::NoSubscription), None), waiting(), None,).message,
+            QueuedView::new(
+                status(Some(Hold::NoSubscription), None),
+                waiting(),
+                None,
+                None
+            )
+            .message,
             "Queued, but it goes on hold: private repos need a MergeLoop subscription."
         );
         // The entry's own hold stays more specific than the repo-wide one.
@@ -2703,6 +2744,7 @@ mod tests {
                 queued(Some(Hold::PrepChecks {
                     waiting: vec!["check".into()]
                 })),
+                None,
                 None,
             )
             .message,

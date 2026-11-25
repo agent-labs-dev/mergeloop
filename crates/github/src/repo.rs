@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::{Method, StatusCode};
@@ -805,6 +807,24 @@ impl Installation {
             )
             .await?;
         Ok(diff_id_of(&r))
+    }
+
+    /// The commits `head` has since it left `base`, oldest first. `None` when they are not one
+    /// line of commits, as a merge makes, or GitHub may list only some of them.
+    pub async fn commits(
+        &self,
+        repo: &RepoName,
+        base: &str,
+        head: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let r: Value = self
+            .rest(
+                Method::GET,
+                &format!("/repos/{repo}/compare/{base}...{head}"),
+                None,
+            )
+            .await?;
+        Ok(commits_of(&r))
     }
 
     /// Whether workflow runs on `sha` wait for a maintainer to approve them, as GitHub has a
@@ -1695,6 +1715,32 @@ fn diff_id_of(compare: &Value) -> Option<String> {
     Some(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A compare's commits, oldest first, from the base up, each the only parent of the next. `None`
+/// when one has another parent, or the compare lists only some of them.
+fn commits_of(compare: &Value) -> Option<Vec<String>> {
+    let listed = compare["commits"].as_array()?;
+    if compare["total_commits"].as_u64()? != listed.len() as u64 {
+        return None;
+    }
+    let mut child = HashMap::with_capacity(listed.len());
+    for c in listed {
+        let [parent] = c["parents"].as_array()?.as_slice() else {
+            return None;
+        };
+        let (parent, sha) = (parent["sha"].as_str()?, c["sha"].as_str()?);
+        if child.insert(parent, sha).is_some() {
+            return None;
+        }
+    }
+    let mut at = compare["merge_base_commit"]["sha"].as_str()?;
+    let mut line = Vec::with_capacity(listed.len());
+    while let Some(next) = child.remove(at) {
+        line.push(next.to_owned());
+        at = next;
+    }
+    (line.len() == listed.len()).then_some(line)
+}
+
 /// The most characters GitHub takes in a comment or a review's body.
 const COMMENT_CHARS: usize = 65_536;
 
@@ -2318,5 +2364,44 @@ mod tests {
             .map(|i| file(&format!("{i}.rs"), "+x"))
             .collect();
         assert_eq!(diff_id_of(&compare(Value::Array(many))), None);
+    }
+
+    /// A compare from `base` of `commits`, as (sha, parents), listed in the order given.
+    fn compare_of(base: &str, commits: &[(&str, &[&str])]) -> Value {
+        let commits: Vec<Value> = commits
+            .iter()
+            .map(|(sha, parents)| {
+                let parents: Vec<Value> = parents.iter().map(|p| json!({ "sha": p })).collect();
+                json!({ "sha": sha, "parents": parents })
+            })
+            .collect();
+        json!({
+            "merge_base_commit": { "sha": base },
+            "total_commits": commits.len(),
+            "commits": commits,
+        })
+    }
+
+    #[test]
+    fn a_line_of_commits_reads_oldest_first_whatever_order_github_lists_them_in() {
+        let listed = compare_of("b", &[("2", &["1"]), ("1", &["b"]), ("3", &["2"])]);
+        assert_eq!(
+            commits_of(&listed),
+            Some(vec!["1".into(), "2".into(), "3".into()])
+        );
+        assert_eq!(commits_of(&compare_of("b", &[])), Some(vec![]));
+    }
+
+    #[test]
+    fn commits_that_are_not_one_line_read_as_none() {
+        let merge = compare_of("b", &[("1", &["b"]), ("m", &["1", "t"])]);
+        assert_eq!(commits_of(&merge), None, "a merge");
+        let fork = compare_of("b", &[("1", &["b"]), ("2", &["b"])]);
+        assert_eq!(commits_of(&fork), None, "two lines");
+        let off = compare_of("b", &[("1", &["x"])]);
+        assert_eq!(commits_of(&off), None, "not from the base");
+        let mut some = compare_of("b", &[("1", &["b"])]);
+        some["total_commits"] = json!(300);
+        assert_eq!(commits_of(&some), None, "GitHub listed only some");
     }
 }

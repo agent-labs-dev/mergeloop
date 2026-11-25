@@ -156,20 +156,41 @@ async fn read(
     let exits = app.store.last_exits(id, repo, &[number]).await?;
     let exit = exits.iter().find(|e| e.pr == number);
     let newest = app.store.events(id, repo, Some(number), 1).await?;
-    Ok(view(status, exit, newest.first(), after, reader))
+    let enqueued = app.store.last_enqueued(id, repo, number).await?;
+    Ok(view(
+        status,
+        exit,
+        newest.first(),
+        enqueued.as_deref(),
+        after,
+        reader,
+    ))
 }
 
-/// The need of a PR, from where the queue has it, how it last left the queue, and its newest
-/// event. `after` is the need the agent saw last.
+/// The need of a PR, from where the queue has it, how it last left the queue, its newest event
+/// and when it last joined the queue. `after` is the need the agent saw last.
 fn view(
     status: PullStateView,
     exit: Option<&ExitRecord>,
     newest: Option<&EventRecord>,
+    enqueued: Option<&str>,
     after: Option<&str>,
     reader: Reader,
 ) -> NeedView {
-    let exit = exit.filter(|_| status.queue.is_none());
-    let mut need = need(&status, exit);
+    // The queue logs `enqueued` as it takes the PR back, before the PR's lane is saved: an exit
+    // older than that event is how it left before, not where it is now. It is the last join,
+    // not the newest event, that says so: a hold or a review ending is logged after it.
+    let joining = status.queue.is_none()
+        && matches!((exit, enqueued), (Some(e), Some(at)) if at > e.at.as_str());
+    let exit = exit.filter(|_| status.queue.is_none() && !joining);
+    let mut need = match joining {
+        true => Need {
+            kind: NeedKind::Wait,
+            layer: None,
+            detail: "it is joining the queue".into(),
+        },
+        false => need(&status, exit),
+    };
     let mut id = need_id(&need, exit, newest);
     // The agent saw it ejected, and runs `then`: it queues it again, and waits on that
     // until the queue takes it.
@@ -331,7 +352,7 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
         NeedKind::Wait => format!("Nothing for you yet: {detail}. Run `{then}`."),
         NeedKind::Threads => fill(THREADS, need, status).replace("{then}", then),
         NeedKind::Changes => format!(
-            "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch and rebase onto the remote branch, push once, and reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
+            "A reviewer whose approval the branch requires asked for changes{on}. Read their review (`gh pr view {pr} --repo {repo} --comments`), make the changes, fetch the PR's branch and rebase your new commits onto it, and push once. Leave the base branch and its conflicts to MergeLoop. Reply to each of their comments with what changed. The PR goes on once they approve. Then run `{then}`."
         ),
         NeedKind::Draft => format!(
             "#{pr} is a draft{on}. If its work is done, publish it with `gh pr ready {pr} --repo {repo}`. If not, finish it first, or tell the user it waits on them. Then run `{then}`."
@@ -343,7 +364,7 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
             "It waits on a human: {detail}. Nothing here is yours to do. Tell the user what it waits for, then run `{then}` in the background: it returns once something changes."
         ),
         NeedKind::Ejected => format!(
-            "MergeLoop ejected #{number}: {detail}. Fix the cause on its branch, then fetch, rebase onto the remote branch, and push. Then run `{then}`, which queues it again."
+            "MergeLoop ejected #{number}: {detail}. Fix the cause on its branch, then fetch the branch, rebase your new commits onto it, and push. Then run `{then}`, which queues it again."
         ),
         NeedKind::Removed => format!(
             "#{number} was taken out of the queue ({detail}), not by a failure. Don't queue it again unless the user asks you to: if they do, run `mergeloop call queue_pull {args}`. Tell the user, then run `{then}` in the background: it returns once someone queues it again."
@@ -416,7 +437,7 @@ const THREADS: &str = "Review threads{on} hold the PR: {detail}. Work each unres
 
 1. List the unresolved review threads of #{pr}: {threads}. MergeLoop's own findings, with their ids and evidence: `mergeloop call get_agent_review {args}`.
 2. Read each thread and the code it points at. Fix it, at every place its **Also at** names, or decide it doesn't apply, for a reason the code shows: a file and line, a test, a doc. Only a call on scope, product or design, access you lack, or a change outside the repo is for a human.
-3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch and rebase onto the remote branch, then push once.
+3. Commit the fixes together, as few commits as you can: each push gets a new review. Fetch the PR's branch and rebase your new commits onto it, then push once. Leave the base branch and its conflicts to MergeLoop.
 4. Reply in each thread you worked: the fix's short SHA and one line on what changed, or the reason it doesn't apply. Then resolve it: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"ID\"}) { thread { isResolved } } }'`. Resolve only after the push. Another reviewer's thread that needs a human: reply with the decision needed and who should make it, and leave it unresolved.
 5. To have MergeLoop's reviewer settle one of its findings now, rather than on the next push, reply in its thread mentioning MergeLoop's App, as the review's summary names it, with why it doesn't apply. The agent reads the code again, answers in the thread, and withdraws the finding if your reason holds.
 
@@ -434,7 +455,10 @@ mod tests {
         newest: Option<&EventRecord>,
         after: Option<&str>,
     ) -> NeedView {
-        super::view(status, exit, newest, after, Reader::Agent)
+        let enqueued = newest
+            .filter(|n| n.kind == "enqueued")
+            .map(|n| n.at.as_str());
+        super::view(status, exit, newest, enqueued, after, Reader::Agent)
     }
 
     fn status(queue: Option<QueueView>) -> PullStateView {
@@ -485,7 +509,7 @@ mod tests {
             summary: Default::default(),
             enqueued_at: None,
             steps: None,
-            at: String::new(),
+            at: "2026-11-04T10:00:00.000Z".into(),
         }
     }
 
@@ -493,7 +517,7 @@ mod tests {
         EventRecord {
             repo: "o/r".into(),
             pr: 6,
-            at: "2026-11-04T10:00:00Z".into(),
+            at: "2026-11-04T10:00:00.000Z".into(),
             kind: kind.into(),
             message: String::new(),
         }
@@ -658,6 +682,56 @@ mod tests {
     }
 
     #[test]
+    fn a_pr_queued_again_after_its_exit_waits_while_it_joins_the_queue() {
+        let removed = view(status(None), Some(&exit(8, "dequeued")), None, None);
+        // The queue took it back and logged so, and its lane is not saved yet.
+        let enqueued = EventRecord {
+            at: "2026-11-04T10:05:00.000Z".into(),
+            ..event("enqueued")
+        };
+        let joining = view(
+            status(None),
+            Some(&exit(8, "dequeued")),
+            Some(&enqueued),
+            Some(&removed.id),
+        );
+        assert_eq!(joining.needs, NeedKind::Wait);
+        assert!(joining.brief.contains("it is joining the queue"));
+    }
+
+    #[test]
+    fn a_requeued_pr_waits_through_its_initial_hold_before_the_lane_is_saved() {
+        let previous = exit(8, "ejected");
+        let removed = view(status(None), Some(&previous), None, None);
+        // `held` is logged right after `enqueued`, so it is the newest event.
+        let held = EventRecord {
+            at: "2026-11-04T10:05:01.000Z".into(),
+            ..event("held")
+        };
+        let joining = super::view(
+            status(None),
+            Some(&previous),
+            Some(&held),
+            Some("2026-11-04T10:05:00.000Z"),
+            Some(&removed.id),
+            Reader::Agent,
+        );
+        assert_eq!(joining.needs, NeedKind::Wait);
+    }
+
+    #[test]
+    fn an_event_after_the_exit_that_is_not_a_requeue_keeps_the_exit() {
+        let removed = view(status(None), Some(&exit(8, "dequeued")), None, None);
+        let done = EventRecord {
+            at: "2026-11-04T10:05:00.000Z".into(),
+            ..event("review-done")
+        };
+        let after = view(status(None), Some(&exit(8, "dequeued")), Some(&done), None);
+        assert_eq!(after.needs, removed.needs);
+        assert_ne!(after.needs, NeedKind::Wait);
+    }
+
+    #[test]
     fn acknowledging_removal_does_not_authorize_requeue() {
         let removed = view(status(None), Some(&exit(8, "dequeued")), None, None);
         assert_eq!((removed.needs, removed.exit_code), (NeedKind::Removed, 12));
@@ -726,7 +800,8 @@ mod tests {
         for reader in [Reader::Agent, Reader::Daemon] {
             for layer in [None, Some(4)] {
                 for reason in reasons {
-                    let v = super::view(status(held(reason, layer)), None, None, None, reader);
+                    let v =
+                        super::view(status(held(reason, layer)), None, None, None, None, reader);
                     assert_eq!(
                         unfilled(&v.brief),
                         None,
@@ -748,6 +823,22 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_prs_push_leaves_the_base_branch_to_mergeloop() {
+        for reason in [
+            HoldReasonView::ReviewChanges,
+            HoldReasonView::UnresolvedThreads,
+            HoldReasonView::ChangesRequested,
+        ] {
+            let brief = view(status(held(reason, None)), None, None, None).brief;
+            assert!(brief.contains("push once"), "{reason:?}:\n{brief}");
+            assert!(
+                brief.contains("Leave the base branch and its conflicts to MergeLoop."),
+                "{reason:?}:\n{brief}"
+            );
+        }
+    }
+
+    #[test]
     fn the_daemons_agent_changes_files_only_and_ends_with_what_the_daemon_posts() {
         for (reason, kind) in [
             (HoldReasonView::ReviewChanges, NeedKind::Threads),
@@ -755,6 +846,7 @@ mod tests {
         ] {
             let v = super::view(
                 status(held(reason, Some(4))),
+                None,
                 None,
                 None,
                 None,
@@ -786,12 +878,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             Reader::Daemon,
         );
         assert!(threads.brief.contains("MERGELOOP_RESOLVE: <thread id>"));
         // Needs no agent works are as an agent reads them.
         let human = super::view(
             status(held(HoldReasonView::ReviewRequired, None)),
+            None,
             None,
             None,
             None,

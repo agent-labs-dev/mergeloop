@@ -32,7 +32,7 @@ use mergepatrol_github::{
 use mergepatrol_store::{AgentTask, Change, GITHUB_APP, LaneKey, PgStore, Scope, Store, Vault};
 use parking_lot::Mutex;
 use secrecy::ExposeSecret;
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -43,6 +43,7 @@ use crate::github::GitHub;
 use crate::job::{GAVE_UP, LEFT_CONFLICT, RETITLED};
 use crate::publish::{Publish, create_commits, create_merge, publish};
 use crate::review::REVIEW_MARKS;
+use crate::slots::{JobSlots, Outdated};
 
 const CHECKS_POLL: Duration = Duration::from_secs(15);
 /// With no required checks, how long after a publish its checks may first count as green: a
@@ -90,7 +91,7 @@ pub struct Ctx {
     pub proxy: Arc<ApiProxy>,
     pub chatgpt: ChatGpt,
     /// Sandboxed jobs running at once, across repos. A PR waiting for its checks holds none.
-    pub jobs: Semaphore,
+    pub jobs: JobSlots,
     pub wakers: Arc<Wakers>,
     pub analytics: Analytics,
     pub prs: Prs,
@@ -247,9 +248,13 @@ impl Wakers {
     }
 }
 
-impl mergepatrol_web::Wake for Wakers {
+impl mergepatrol_web::Wake for Ctx {
     fn wake(&self, installation: u64, repo: RepoName) {
-        self.get(installation, &repo).notify_one();
+        self.wakers.wake_repo(installation, &repo);
+    }
+
+    fn pushed(&self, installation: u64, repo: &RepoName, number: PrNumber, head: &str) {
+        self.jobs.saw(installation, repo, number, head);
     }
 }
 
@@ -747,7 +752,8 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     };
     ctx.store.set_config_error(installation, repo, None).await?;
     let labels = settings.labels();
-    let snap = gh.snapshot(repo, &labels).await?;
+    let mut snap = gh.snapshot(repo, &labels).await?;
+    let mut requeued = false;
     // Only an ejection caused by required checks records retry intent. Keeping
     // the failed label is required: removing it is an explicit opt-out.
     for pr in &snap.failed {
@@ -778,6 +784,11 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
             "The new head passes the required checks. Queued again after the check failure.",
         )
         .await?;
+        requeued = true;
+    }
+    // So a PR queued again joins on this tick, read with its new labels, and not on the next.
+    if requeued {
+        snap = gh.snapshot(repo, &labels).await?;
     }
     // So people find the labels in GitHub's picker, not only in the docs.
     for spec in labels.specs() {
@@ -789,6 +800,10 @@ async fn read_repo(ctx: &Ctx, gh: &dyn GitHub, repo: &RepoName) -> Result<Option
     ctx.unpinned.keep_labeled(installation, repo, &snap.labeled);
     let units = units(gh, repo, &snap.labeled).await?;
     let layers: Vec<PullRequest> = units.iter().flat_map(|u| u.layers.clone()).collect();
+    for pr in &layers {
+        ctx.jobs
+            .saw(installation, repo, pr.number, &pr.head_ref_oid);
+    }
     let saved: Vec<Lane> = lanes.iter().map(|(_, lane)| lane.clone()).collect();
     let left = saved
         .iter()
@@ -930,19 +945,32 @@ async fn review_hold(
                         None
                     }
                 };
-                let carried = match &diff_id {
-                    Some(id) => {
+                let unreviewed =
+                    unreviewed(ctx, gh, key, number, base, head, diff_id.as_deref()).await?;
+                let carried = match &unreviewed {
+                    Unreviewed::Nothing { approved } => {
                         ctx.store
-                            .carry_unchanged(key.installation_id, &key.repo, number, head, id)
+                            .carry_review(key.installation_id, &key.repo, number, approved, head)
                             .await?
                     }
-                    None => false,
+                    _ => false,
                 };
                 if carried {
                     let why = "its changes are those of the head it approved";
                     record(ctx, key, number, "review-carried", why).await?;
                     ReviewStatus::Approved
                 } else {
+                    let since = match unreviewed {
+                        Unreviewed::After(at) => {
+                            let why = format!(
+                                "it approved the changes up to {}: only the commits pushed after it are reviewed",
+                                &at[..7.min(at.len())]
+                            );
+                            record(ctx, key, number, "review-since", &why).await?;
+                            Some(at)
+                        }
+                        _ => None,
+                    };
                     let r = ctx
                         .store
                         .start_review(
@@ -951,6 +979,7 @@ async fn review_hold(
                             number,
                             head,
                             diff_id.as_deref(),
+                            since.as_deref(),
                         )
                         .await?;
                     // Woken by the caller once the lane is saved: a PR just queued is in it then.
@@ -974,6 +1003,94 @@ async fn review_hold(
         }
     }
     Ok(Hold::of_reviews(stacked, statuses).or(unresolved_hold))
+}
+
+/// What of a PR's new head the agent has yet to review.
+#[derive(Debug, PartialEq)]
+enum Unreviewed {
+    /// Nothing: it changes what the head `approved` did, as a rebase keeps them.
+    Nothing {
+        approved: String,
+    },
+    /// The commits after this one of the head, which changes what an approved head did: the
+    /// author pushed them on top, after a rebase or without one.
+    After(String),
+    All,
+}
+
+/// What of PR `number`'s new `head` the agent has yet to review, from the PR's newest finished
+/// review, once that approved. `base` is where the PR's changes start, and `diff_id` the id of
+/// `head`'s. A head whose older commits changed, as an amend, a squash or a resolved conflict
+/// does, is reviewed whole, as is one GitHub cannot say enough about.
+async fn unreviewed(
+    ctx: &Ctx,
+    gh: &dyn GitHub,
+    key: &LaneKey,
+    number: PrNumber,
+    base: &str,
+    head: &str,
+    diff_id: Option<&str>,
+) -> Result<Unreviewed> {
+    let reviews = ctx
+        .store
+        .reviews_of(key.installation_id, &key.repo, number, u32::MAX)
+        .await?;
+    // A review that has yet to finish is of a head the PR left.
+    let finished = reviews.into_iter().find(|r| {
+        !matches!(
+            r.status,
+            ReviewStatus::Pending | ReviewStatus::Running | ReviewStatus::Stale
+        )
+    });
+    let Some(approved) = finished.filter(|r| r.status == ReviewStatus::Approved) else {
+        return Ok(Unreviewed::All);
+    };
+    let Some(id) = approved.diff_id.as_deref() else {
+        return Ok(Unreviewed::All);
+    };
+    if diff_id == Some(id) {
+        return Ok(Unreviewed::Nothing {
+            approved: approved.head_sha,
+        });
+    }
+    let after = approved_within(gh, &key.repo, base, &approved.head_sha, id, head);
+    Ok(match after.await {
+        Ok(Some(at)) => Unreviewed::After(at),
+        Ok(None) => Unreviewed::All,
+        Err(e) => {
+            tracing::warn!(repo = %key.repo, pr = number, error = %format!("{e:#}"), "could not read the PR's commits");
+            Unreviewed::All
+        }
+    })
+}
+
+/// The commit of `head` whose changes are those of `approved`, whose diff id is `id`, with more
+/// commits on top of it: as many commits from `base` as `approved` has.
+async fn approved_within(
+    gh: &dyn GitHub,
+    repo: &RepoName,
+    base: &str,
+    approved: &str,
+    id: &str,
+    head: &str,
+) -> Result<Option<String>> {
+    let Some(was) = gh.commits(repo, base, approved).await? else {
+        return Ok(None);
+    };
+    let Some(now) = gh.commits(repo, base, head).await? else {
+        return Ok(None);
+    };
+    let Some(at) = was.len().checked_sub(1).and_then(|i| now.get(i)) else {
+        return Ok(None);
+    };
+    if now.len() == was.len() {
+        return Ok(None);
+    }
+    // On the approved head itself, no rebase moved it.
+    if at == approved || gh.diff_id(repo, base, at).await?.as_deref() == Some(id) {
+        return Ok(Some(at.clone()));
+    }
+    Ok(None)
 }
 
 /// Shows on GitHub that the review gate lets the PRs go on: MergeLoop dismisses the changes its
@@ -3578,34 +3695,40 @@ fn clean_moves(moved: &[usize], resolved: &[usize]) -> Vec<usize> {
     clean.copied().collect()
 }
 
-/// Runs a job in the sandbox, with its output in `out`: what it told of. `Err` says why it failed.
-async fn run_sandboxed(
-    ctx: &Ctx,
-    key: &LaneKey,
-    number: PrNumber,
-    job_id: &str,
-    spec: &JobSpec,
-    out: &Path,
-    private: bool,
-) -> Result<Vec<JobEvent>> {
-    let _ = tokio::fs::remove_dir_all(out).await;
-    record(ctx, key, number, "job", job_id).await?;
-    if let Some(b) = &ctx.billing {
-        b.job(key.installation_id, private, unix_now()).await?;
+impl JobSandbox<'_> {
+    /// Runs a job in the sandbox, with its output in `out`: what it told of. `Err` says why it
+    /// failed, `Outdated` if the PR moved off the job's head first.
+    async fn run_sandboxed(
+        &self,
+        key: &LaneKey,
+        number: PrNumber,
+        job_id: &str,
+        spec: &JobSpec,
+        out: &Path,
+        private: bool,
+    ) -> Result<Vec<JobEvent>> {
+        let ctx = self.ctx;
+        let _ = tokio::fs::remove_dir_all(out).await;
+        record(ctx, key, number, "job", job_id).await?;
+        let job = async {
+            if let Some(b) = &ctx.billing {
+                b.job(key.installation_id, private, unix_now()).await?;
+            }
+            ctx.executor
+                .run(job_id, spec, out)
+                .await
+                .context("the job failed")
+        };
+        let head = (spec.head_ref.as_str(), spec.head_sha.as_str());
+        let result = ctx.jobs.run(self.gh, key, number, head, job).await?;
+        for e in &result.events {
+            record(ctx, key, number, &e.kind, &e.message).await?;
+        }
+        if let JobOutcome::Failed { reason } = result.outcome {
+            bail!("{reason}");
+        }
+        Ok(result.events)
     }
-    let _slot = ctx.jobs.acquire().await?;
-    let result = ctx
-        .executor
-        .run(job_id, spec, out)
-        .await
-        .context("the job failed")?;
-    for e in &result.events {
-        record(ctx, key, number, &e.kind, &e.message).await?;
-    }
-    if let JobOutcome::Failed { reason } = result.outcome {
-        bail!("{reason}");
-    }
-    Ok(result.events)
 }
 
 /// Publishes the commits `base..local_head` to the PR branch, if it is still at `expected_head`.
@@ -3680,7 +3803,8 @@ impl JobSandbox<'_> {
             return Ok(Event::FixFailed(why));
         }
         let fixed = async {
-            run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?;
+            self.run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                .await?;
             let _cache = ctx.caches.lock(repo).await;
             if !self.may_publish(at, unit, &heads).await? {
                 return anyhow::Ok(Err(Event::HeadMoved));
@@ -3703,6 +3827,7 @@ impl JobSandbox<'_> {
         Ok(match fixed.await {
             Ok(Ok(sha)) => Event::Fixed { head: sha },
             Ok(Err(event)) => event,
+            Err(e) if Outdated::caused(&e) => Event::HeadMoved,
             Err(e) => {
                 let reason = format!("{e:#}");
                 match proposed_title(&reason, may_retitle) {
@@ -3852,6 +3977,9 @@ impl JobSandbox<'_> {
             // Not the PR's failure: the caller runs it again, as for any error outside the PR.
             if TimedOut::caused(&e) {
                 return Err(e);
+            }
+            if Outdated::caused(&e) {
+                return Ok(Event::HeadMoved);
             }
             if conflicts == Conflicts::Leave && format!("{e:#}").starts_with(LEFT_CONFLICT) {
                 return Ok(Event::RebaseConflict);
@@ -4060,7 +4188,9 @@ impl JobSandbox<'_> {
                 true => Update::Either,
                 false => Update::Rebase,
             };
-            let ran = run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await;
+            let ran = self
+                .run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                .await;
             let events = match ran {
                 // A replay of a long history can outlast the job: a merge does not replay it.
                 Err(e) if TimedOut::caused(&e) && spec.update == Update::Either => {
@@ -4070,7 +4200,8 @@ impl JobSandbox<'_> {
                     // The timed-out job revoked its token once it fetched.
                     spec.token = gh.read_token(&key.repo).await?;
                     let job_id = format!("{job_id}-merge");
-                    run_sandboxed(ctx, key, pr.number, &job_id, &spec, &out, snap.private).await?
+                    self.run_sandboxed(key, pr.number, &job_id, &spec, &out, snap.private)
+                        .await?
                 }
                 ran => ran?,
             };
@@ -4540,18 +4671,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_webhook_cuts_the_wait_short_even_when_it_came_first() {
-        use mergepatrol_web::Wake;
         let wakers = Wakers::default();
         let repo = RepoName::parse("o/r").unwrap();
         let hour = Duration::from_secs(3600);
 
-        wakers.wake(1, repo.clone());
+        wakers.wake_repo(1, &repo);
         let start = tokio::time::Instant::now();
         wakers.wait(1, &repo, hour).await;
         assert_eq!(start.elapsed(), Duration::ZERO);
 
         // Another repo's webhook does not count.
-        wakers.wake(1, RepoName::parse("o/other").unwrap());
+        wakers.wake_repo(1, &RepoName::parse("o/other").unwrap());
         wakers.wait(1, &repo, hour).await;
         assert_eq!(start.elapsed(), hour);
     }

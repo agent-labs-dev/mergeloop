@@ -644,6 +644,36 @@ async fn a_build_that_panics_is_released_as_stuck_and_cleaned_up_and_the_daemon_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_stop_while_its_pr_opens_keeps_the_build() {
+    let w = World::new().await;
+    w.fake.add_task(w.task(9, 19, &[]));
+    let held = std::sync::Arc::new(tokio::sync::Notify::new());
+    w.fake.seen.lock().unwrap().lane.open_held = Some(held.clone());
+    let agent = w.agent("builder", "echo x > x.txt", BUILT);
+    let mut daemon = Daemon::new(w.config(1, &agent), w.client());
+    daemon.poll = Duration::from_millis(50);
+    // The server opened the PR, and the daemon stops before its answer comes.
+    let stop = async {
+        until(|| w.fake.lane(|l| l.opened.len() == 1)).await;
+        // The answer comes only once a build given back on the stop would show, or none shows.
+        let (seen, held) = (w.fake.seen.clone(), held.clone());
+        tokio::spawn(async move {
+            let given_back = until(|| !seen.lock().unwrap().lane.released.is_empty());
+            let _ = tokio::time::timeout(Duration::from_secs(2), given_back).await;
+            held.notify_one();
+        });
+    };
+    tokio::time::timeout(Duration::from_secs(60), daemon.run(stop))
+        .await
+        .expect("the daemon stops in time")
+        .unwrap();
+
+    let released = w.fake.lane(|l| l.released.clone());
+    assert!(released.is_empty(), "{released:?}");
+    assert_eq!(w.fake.lane(|l| l.opened.len()), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn on_start_a_worktree_and_branch_of_a_build_it_does_not_hold_are_removed() {
     let w = World::new().await;
     w.mark();

@@ -25,6 +25,7 @@ use tokio::task::JoinSet;
 
 use crate::github::GitHub;
 use crate::queue::{Alive, Commits, Ctx, app_credentials, job_spec, record, unix_now};
+use crate::slots::Outdated;
 
 /// Reviews running at once, across workspaces. Each also takes one of the sandbox's job slots.
 const REVIEWS_AT_ONCE: usize = 4;
@@ -213,29 +214,39 @@ async fn review(ctx: &Ctx, r: ReviewRecord) -> Result<()> {
         }
     };
     let bars = workspace.with(&settings.review);
-    let reviewing = Reviewing::new(&gh, &pr, &r, &settings, &bars);
+    Reviewing::new(&gh, &pr, &r, &settings, &bars)
+        .review(ctx)
+        .await
+}
 
-    let found = match pr.is_cross_repository {
-        // A fork's code is not trusted: no agent reads it, as none rebases or fixes it.
-        true => Err("The agent does not review PRs from forks.".to_owned()),
-        false => reviewing.run(ctx).await,
-    };
-    let output = match found {
-        Ok(output) => Ok(output),
-        Err(why) if r.attempts + 1 < ATTEMPTS && !why.starts_with(NO_KEY) => {
-            ctx.store
-                .retry_review(r.id, r.claim, &why, RETRY_AFTER)
-                .await?;
-            return Ok(());
-        }
-        Err(why) => Err(why),
-    };
-    recover_conclusion(
-        ctx.store.as_ref(),
-        &r,
-        reviewing.conclude(ctx, output).await,
-    )
-    .await
+impl Reviewing<'_> {
+    /// Has the agent review the PR, and ends the review: runs it again later on an error outside
+    /// the PR, and drops it if the PR was pushed to before the agent was done.
+    pub(crate) async fn review(&self, ctx: &Ctx) -> Result<()> {
+        let r = self.record;
+        let found = match self.pr.is_cross_repository {
+            // A fork's code is not trusted: no agent reads it, as none rebases or fixes it.
+            true => Err("The agent does not review PRs from forks.".to_owned()),
+            false => match self.run(ctx).await {
+                // The new head gets a review of its own.
+                Err(e) if Outdated::caused(&e) => {
+                    return ctx.store.stale_review(r.id, r.claim).await;
+                }
+                found => found.map_err(|e| format!("{e:#}")),
+            },
+        };
+        let output = match found {
+            Ok(output) => Ok(output),
+            Err(why) if r.attempts + 1 < ATTEMPTS && !why.starts_with(NO_KEY) => {
+                ctx.store
+                    .retry_review(r.id, r.claim, &why, RETRY_AFTER)
+                    .await?;
+                return Ok(());
+            }
+            Err(why) => Err(why),
+        };
+        recover_conclusion(ctx.store.as_ref(), r, self.conclude(ctx, output).await).await
+    }
 }
 
 async fn recover_conclusion(
@@ -366,8 +377,9 @@ fn below(pr: &PullRequest) -> Option<String> {
 }
 
 impl Reviewing<'_> {
-    /// Runs the review in the sandbox. `Err` says why the agent could not review.
-    async fn run(&self, ctx: &Ctx) -> std::result::Result<ReviewOutput, String> {
+    /// Runs the review in the sandbox. `Err` says why the agent could not review, or is
+    /// `Outdated`.
+    async fn run(&self, ctx: &Ctx) -> Result<ReviewOutput> {
         let Self {
             gh,
             ref key,
@@ -380,7 +392,7 @@ impl Reviewing<'_> {
             answered,
             sent_back,
             reviewed,
-        } = earlier(ctx, gh, r).await.map_err(|e| format!("{e:#}"))?;
+        } = earlier(ctx, gh, r).await?;
         let job_id = format!(
             "{}-{}-{}-review-{}",
             r.repo.owner,
@@ -388,40 +400,37 @@ impl Reviewing<'_> {
             r.number,
             &r.head_sha[..8]
         );
-        let ran = async {
-            let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
-            let task = Task::Review {
-                answered,
-                sent_back,
-                since: r.since_head.clone(),
-                reviewed,
-                depth: bars.depth,
-            };
-            let commits = Commits {
-                head: &r.head_sha,
-                onto: &trunk,
-                below: None,
-            };
-            let (mut spec, granted) = job_spec(ctx, gh, key, pr, settings, commits, task).await?;
-            spec.base_ref = below(pr);
-            if granted.is_none() {
-                bail!(
-                    "{NO_KEY} in the workspace's settings for {}: the agent cannot review.",
-                    spec.resolver.provider.name()
-                );
-            }
-            let out = run_job(ctx, gh, settings, key, r.number, &job_id, &spec).await?;
-            let text = tokio::fs::read(out.join(REVIEW_FILE))
-                .await
-                .context("the job wrote no review")?;
-            anyhow::Ok(serde_json::from_slice::<ReviewOutput>(&text)?)
+        let trunk = gh.branch_sha(&r.repo, &pr.base_ref_name).await?;
+        let task = Task::Review {
+            answered,
+            sent_back,
+            since: r.since_head.clone(),
+            reviewed,
+            depth: bars.depth,
         };
-        ran.await.map_err(|e| format!("{e:#}"))
+        let commits = Commits {
+            head: &r.head_sha,
+            onto: &trunk,
+            below: None,
+        };
+        let (mut spec, granted) = job_spec(ctx, gh, key, pr, settings, commits, task).await?;
+        spec.base_ref = below(pr);
+        if granted.is_none() {
+            bail!(
+                "{NO_KEY} in the workspace's settings for {}: the agent cannot review.",
+                spec.resolver.provider.name()
+            );
+        }
+        let out = run_job(ctx, gh, settings, key, r.number, &job_id, &spec).await?;
+        let text = tokio::fs::read(out.join(REVIEW_FILE))
+            .await
+            .context("the job wrote no review")?;
+        Ok(serde_json::from_slice::<ReviewOutput>(&text)?)
     }
 }
 
 /// Runs a job in the sandbox, on one of its slots: the directory its output is in. Hosted, it
-/// counts as the queue's jobs do.
+/// counts as the queue's jobs do. `Outdated` if the PR moved off the job's head first.
 async fn run_job(
     ctx: &Ctx,
     gh: &Installation,
@@ -431,18 +440,21 @@ async fn run_job(
     job_id: &str,
     spec: &JobSpec,
 ) -> Result<std::path::PathBuf> {
-    if let Some(b) = &ctx.billing {
-        let private = GitHub::snapshot(gh, &key.repo, &settings.labels())
-            .await?
-            .private;
-        b.job(key.installation_id, private, unix_now()).await?;
-    }
     let out = ctx.config.data_dir.join("jobs").join(job_id);
     let _ = tokio::fs::remove_dir_all(&out).await;
-    let result = {
-        let _slot = ctx.jobs.acquire().await?;
-        ctx.executor.run(job_id, spec, &out).await?
+    let job = async {
+        if let Some(b) = &ctx.billing {
+            let private = GitHub::snapshot(gh, &key.repo, &settings.labels())
+                .await?
+                .private;
+            b.job(key.installation_id, private, unix_now()).await?;
+        }
+        ctx.executor.run(job_id, spec, &out).await
     };
+    let result = ctx
+        .jobs
+        .run(gh, key, number, (&spec.head_ref, &spec.head_sha), job)
+        .await?;
     for e in &result.events {
         record(ctx, key, number, &e.kind, &e.message).await?;
     }
@@ -1310,7 +1322,10 @@ mod tests {
             .await
             .unwrap();
         let repo = RepoName::parse("o/r").unwrap();
-        let started = store.start_review(1, &repo, 7, "head", None).await.unwrap();
+        let started = store
+            .start_review(1, &repo, 7, "head", None, None)
+            .await
+            .unwrap();
         let mut finding = review(1, true, None).findings.remove(0);
         finding.finding.evidence.as_mut().unwrap().output = "before\0after".into();
         let done = ReviewDone {

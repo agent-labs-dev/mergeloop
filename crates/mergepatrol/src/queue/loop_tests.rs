@@ -127,6 +127,8 @@ struct State {
     behind: Vec<String>,
     /// Each head's diff id, by its base and head: a restack keeps one. Unknown heads have none.
     diff_ids: HashMap<(String, String), String>,
+    /// The commits of a head since it left a base, oldest first, by (base, head).
+    commits: HashMap<(String, String), Vec<String>>,
     /// Heads whose workflow runs wait for a maintainer's approval.
     awaiting_approval: Vec<String>,
     /// PRs that change workflow files.
@@ -513,6 +515,11 @@ impl GitHub for Fake {
     async fn diff_id(&self, _: &RepoName, base: &str, head: &str) -> Result<Option<String>> {
         let s = self.state.lock().unwrap();
         Ok(s.diff_ids.get(&(base.to_owned(), head.to_owned())).cloned())
+    }
+
+    async fn commits(&self, _: &RepoName, base: &str, head: &str) -> Result<Option<Vec<String>>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.commits.get(&(base.to_owned(), head.to_owned())).cloned())
     }
 
     async fn awaiting_approval(&self, _: &RepoName, sha: &str) -> Result<bool> {
@@ -1091,6 +1098,7 @@ impl ReviewStore for Mem {
         pr: PrNumber,
         head: &str,
         diff_id: Option<&str>,
+        since: Option<&str>,
     ) -> Result<ReviewRecord> {
         let mut reviews = self.reviews.lock().unwrap();
         if let Some(r) = reviews
@@ -1111,7 +1119,7 @@ impl ReviewStore for Mem {
             repo: repo.clone(),
             number: pr,
             head_sha: head.to_owned(),
-            since_head: None,
+            since_head: since.map(str::to_owned),
             diff_id: diff_id.map(str::to_owned),
             claim: 0,
             status: ReviewStatus::Pending,
@@ -1130,33 +1138,6 @@ impl ReviewStore for Mem {
         };
         reviews.push(r.clone());
         Ok(r)
-    }
-    async fn carry_unchanged(
-        &self,
-        _: u64,
-        _: &RepoName,
-        pr: PrNumber,
-        head: &str,
-        diff_id: &str,
-    ) -> Result<bool> {
-        let mut reviews = self.reviews.lock().unwrap();
-        if reviews.iter().any(|r| r.number == pr && r.head_sha == head) {
-            return Ok(false);
-        }
-        let newest = reviews.iter().rev().find(|r| r.number == pr).cloned();
-        let Some(r) = newest.filter(|r| {
-            r.status == ReviewStatus::Approved && r.diff_id.as_deref() == Some(diff_id)
-        }) else {
-            return Ok(false);
-        };
-        let id = reviews.len() as i64 + 1;
-        reviews.push(ReviewRecord {
-            id,
-            head_sha: head.to_owned(),
-            since_head: None,
-            ..r
-        });
-        Ok(true)
     }
     async fn claim_review(&self, _: Duration) -> Result<Option<ReviewRecord>> {
         unreachable!()
@@ -1217,19 +1198,29 @@ impl ReviewStore for Mem {
         pr: PrNumber,
         before: &str,
         after: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut reviews = self.reviews.lock().unwrap();
+        if reviews
+            .iter()
+            .any(|r| r.number == pr && r.head_sha == after)
+        {
+            return Ok(false);
+        }
         let approved = reviews
             .iter()
             .find(|r| r.number == pr && r.head_sha == before && r.status == ReviewStatus::Approved)
             .cloned();
-        if let Some(r) = approved {
-            reviews.push(ReviewRecord {
-                head_sha: after.to_owned(),
-                ..r
-            });
-        }
-        Ok(())
+        let Some(r) = approved else {
+            return Ok(false);
+        };
+        let id = reviews.len() as i64 + 1;
+        reviews.push(ReviewRecord {
+            id,
+            head_sha: after.to_owned(),
+            since_head: None,
+            ..r
+        });
+        Ok(true)
     }
     async fn answer_review(&self, _: i64, _: &ReviewAnswers) -> Result<bool> {
         unreachable!()
@@ -1413,6 +1404,9 @@ impl Store for Mem {
         _: Option<PrNumber>,
         _: u32,
     ) -> Result<Vec<EventRecord>> {
+        unreachable!()
+    }
+    async fn last_enqueued(&self, _: u64, _: &RepoName, _: PrNumber) -> Result<Option<String>> {
         unreachable!()
     }
     async fn record_exit(
@@ -1662,7 +1656,7 @@ fn ctx(store: Arc<Mem>) -> Ctx {
         }),
         proxy: Arc::new(ApiProxy::new(Upstreams::default())),
         chatgpt: Default::default(),
-        jobs: Semaphore::new(1),
+        jobs: JobSlots::new(1),
         wakers: Arc::default(),
         analytics: Analytics::default(),
         prs: Default::default(),
@@ -2604,6 +2598,161 @@ async fn a_layer_restacked_onto_a_fix_below_keeps_its_approval() {
     assert_eq!(hold("pr-1-v1", "pr-2-v2").await, reviewing(2));
 }
 
+/// The review gate of PR 1, alone, at each head the author pushes: what holds it, and the head
+/// its newest review reads on from.
+struct Pushes {
+    run: Run,
+}
+
+impl Pushes {
+    /// `heads` are (head, diff id, commits since `main`): each head's changes, and its commits.
+    fn new(heads: &[(&str, &str, &[&str])]) -> Self {
+        let heads: Vec<(String, String, Vec<String>)> = heads
+            .iter()
+            .map(|(h, id, c)| {
+                (
+                    h.to_string(),
+                    id.to_string(),
+                    c.iter().map(|c| c.to_string()).collect(),
+                )
+            })
+            .collect();
+        let run = Run::new(Fake::new(move |s| {
+            s.add_pr(1);
+            for (head, id, commits) in heads {
+                s.diff_ids.insert(("main".into(), head.clone()), id);
+                s.commits.insert(("main".into(), head), commits);
+            }
+        }));
+        Self { run }
+    }
+
+    /// Adds the diff id of a commit that is not a head.
+    fn diff_id(&self, commit: &str, id: &str) {
+        let mut s = self.run.gh.state.lock().unwrap();
+        s.diff_ids.insert(("main".into(), commit.into()), id.into());
+    }
+
+    async fn push(&self, head: &str) -> (Option<Hold>, Option<String>) {
+        let settings = ReviewSettings {
+            enabled: true,
+            ..ReviewSettings::default()
+        };
+        let key = LaneKey {
+            installation_id: 1,
+            repo: repo(),
+            trunk: "main".into(),
+        };
+        let heads = [(1, head, 0)];
+        let hold = review_hold(
+            &self.run.ctx,
+            &*self.run.gh,
+            &key,
+            &settings,
+            false,
+            &heads,
+            &mut false,
+        )
+        .await
+        .unwrap();
+        let (newest, since) = self.run.store.newest_review(1);
+        assert_eq!(newest, head);
+        (hold, since)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authors_rebase_keeps_the_approval_and_what_they_push_on_it_is_reviewed_alone() {
+    let p = Pushes::new(&[
+        ("v0", "one", &["a", "v0"]),
+        // A rebase: the same changes on a new base.
+        ("r1", "one", &["a1", "r1"]),
+        // A rebase, and a commit on top.
+        ("r2", "one, two", &["a2", "b2", "r2"]),
+        // A commit on top, without a rebase.
+        ("v1", "one, three", &["a", "v0", "v1"]),
+    ]);
+    p.diff_id("b2", "one");
+    assert_eq!(p.push("v0").await, (Some(Hold::Reviewing), None));
+    p.run.store.finish_review(1, ReviewStatus::Approved);
+
+    assert_eq!(p.push("r1").await, (None, None), "the approval carries");
+    assert_eq!(p.run.kinds(1).last().unwrap(), "review-carried");
+
+    assert_eq!(
+        p.push("r2").await,
+        (Some(Hold::Reviewing), Some("b2".into())),
+        "only what came after the rebased approval"
+    );
+    assert_eq!(p.run.kinds(1).last().unwrap(), "review-since");
+    p.run.store.finish_review(1, ReviewStatus::Approved);
+
+    // On the head the agent approved, with nothing to read its id from.
+    p.run.gh.state.lock().unwrap().commits.insert(
+        ("main".into(), "v1".into()),
+        vec!["a2".into(), "b2".into(), "r2".into(), "v1".into()],
+    );
+    assert_eq!(
+        p.push("v1").await,
+        (Some(Hold::Reviewing), Some("r2".into()))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authors_push_that_rewrites_approved_commits_is_reviewed_whole() {
+    let p = Pushes::new(&[
+        ("v0", "one", &["a", "v0"]),
+        // An amend: as many commits, other changes.
+        ("amended", "one, amended", &["a1", "amended"]),
+        // A conflict resolved on the rebase, then a commit on top.
+        ("resolved", "one, resolved, two", &["a2", "b2", "resolved"]),
+        // A squash.
+        ("squashed", "one, two", &["squashed"]),
+        // A merge of the trunk: GitHub lists no line of commits.
+        ("merged", "one, two", &[]),
+    ]);
+    p.diff_id("b2", "one, resolved");
+    let merged = ("main".to_owned(), "merged".to_owned());
+    p.run.gh.state.lock().unwrap().commits.remove(&merged);
+    assert_eq!(p.push("v0").await, (Some(Hold::Reviewing), None));
+    p.run.store.finish_review(1, ReviewStatus::Approved);
+    // Each push leaves the one before unreviewed, so each is compared to the approval.
+    for head in ["amended", "resolved", "squashed", "merged"] {
+        assert_eq!(p.push(head).await, (Some(Hold::Reviewing), None), "{head}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_is_compared_to_the_newest_finished_review_only_once_it_approved() {
+    let p = Pushes::new(&[
+        ("v0", "one", &["a", "v0"]),
+        ("v1", "one, two", &["a", "v0", "v1"]),
+        ("r1", "one", &["a1", "r1"]),
+        ("v2", "one, three", &["a", "v0", "v2"]),
+        ("v3", "one, four", &["a", "v0", "v3"]),
+    ]);
+    p.push("v0").await;
+    p.run.store.finish_review(1, ReviewStatus::Approved);
+    // A push whose review has yet to finish when the author rebases the approved head.
+    assert_eq!(
+        p.push("v1").await,
+        (Some(Hold::Reviewing), Some("v0".into()))
+    );
+    assert_eq!(
+        p.push("r1").await,
+        (None, None),
+        "the approval still carries"
+    );
+
+    // A review that holds the PR since: the next push is reviewed whole.
+    assert_eq!(
+        p.push("v2").await,
+        (Some(Hold::Reviewing), Some("v0".into()))
+    );
+    p.run.store.finish_review(1, ReviewStatus::Changes);
+    assert_eq!(p.push("v3").await, (Some(Hold::Reviewing), None));
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_agents_fix_needs_a_review_of_itself_before_the_pr_merges() {
     let mut run = Run::on_the_lane(Fake::new(failing_ci));
@@ -2912,7 +3061,7 @@ async fn only_the_sandbox_takes_a_job_slot() {
         s.checks.insert("ci".into(), CheckState::Pending);
         s.required = vec!["ci".into()];
     }));
-    run.ctx.jobs = Semaphore::new(0);
+    run.ctx.jobs = JobSlots::new(0);
     run.gh.then(|_| {});
     run.gh.then(|s| {
         s.checks.insert("ci".into(), CheckState::Passed);
@@ -5541,7 +5690,16 @@ async fn failed_checks_retry_only_a_different_green_head_with_retained_intent() 
         if let Some(head) = old_head {
             run.store.retry_heads.lock().unwrap().insert(1, head.into());
         }
-        read_repo(&run.ctx, &*run.gh, &repo()).await.unwrap();
+        let read = read_repo(&run.ctx, &*run.gh, &repo())
+            .await
+            .unwrap()
+            .unwrap();
+        // Queued again, it joins on this read.
+        assert_eq!(
+            read.snap.labeled.iter().any(|pr| pr.number == 1),
+            retry,
+            "{old_head:?} -> {current_head}, {label}, {check:?}"
+        );
         assert_eq!(
             run.labels(1).contains(&TRIGGER.to_owned()),
             retry,
@@ -5587,4 +5745,156 @@ async fn a_stack_starts_every_layer_review_before_reporting_the_first_hold() {
     assert_eq!(run.store.newest_review(1).0, "one");
     assert_eq!(run.store.newest_review(2).0, "two");
     assert_eq!(run.store.newest_review(3).0, "three");
+}
+
+/// PR 1's branch, as a job on it fetches it, and its first head.
+const PR_1: (&str, &str) = ("refs/heads/pr-1", "pr-1-v0");
+
+static LANE: std::sync::LazyLock<LaneKey> = std::sync::LazyLock::new(|| LaneKey {
+    installation_id: 1,
+    repo: repo(),
+    trunk: "main".into(),
+});
+
+#[tokio::test]
+async fn a_job_whose_pr_moved_while_it_waited_for_a_slot_never_starts() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let held = slots.take();
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async {
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    // No webhook tells of the push: the read once the job has its slot finds it.
+    let push = async {
+        tokio::task::yield_now().await;
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        drop(held);
+    };
+    let (ran, ()) = tokio::join!(job, push);
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(slots.free(), 1, "the slot went back");
+    assert_eq!(slots.watched(1, &repo(), 1), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_told_drops_a_job_waiting_for_a_slot() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let _held = slots.take();
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async { Ok(()) });
+    let push = async {
+        tokio::task::yield_now().await;
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        slots.saw(1, &repo(), 1, "pr-1-v1");
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::join!(job, push).0
+    });
+    let ran = ran.await.expect("it waits no more for the slot");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    assert_eq!(slots.watched(1, &repo(), 1), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_told_stops_a_running_job_and_frees_its_slot() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let (dropped, ended) = tokio::sync::oneshot::channel::<()>();
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async move {
+        // The sandbox, which ends when its future is dropped.
+        let _sandbox = dropped;
+        std::future::pending::<Result<()>>().await
+    });
+    let push = async {
+        tokio::task::yield_now().await;
+        assert_eq!(slots.free(), 0, "the job runs");
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        slots.saw(1, &repo(), 1, "pr-1-v1");
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::join!(job, push).0
+    });
+    let ran = ran.await.expect("the job stopped");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    assert!(ended.await.is_err(), "the sandbox was let go");
+    assert_eq!(slots.free(), 1);
+}
+
+#[tokio::test]
+async fn a_webhook_for_a_head_github_does_not_show_leaves_the_job_running() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+    let job = slots.run(&*gh, &LANE, 1, PR_1, async {
+        finished.await?;
+        Ok("done")
+    });
+    // A late delivery, of a head the PR had before.
+    let told = async {
+        tokio::task::yield_now().await;
+        slots.saw(1, &repo(), 1, "pr-1-old");
+        tokio::task::yield_now().await;
+        // Another PR's push is not this job's.
+        slots.saw(1, &repo(), 2, "pr-2-v1");
+        finish.send(()).unwrap();
+    };
+    let (ran, ()) = tokio::join!(job, told);
+    assert_eq!(ran.unwrap(), "done");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tick_that_sees_a_pushed_head_stops_the_job_on_the_old_one() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    let job = run.ctx.jobs.run(
+        &*run.gh,
+        &LANE,
+        1,
+        PR_1,
+        std::future::pending::<Result<()>>(),
+    );
+    let push = async {
+        tokio::task::yield_now().await;
+        run.gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        run.tick().await;
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::join!(job, push).0
+    });
+    let ran = ran.await.expect("the tick stopped it");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_webhook_before_github_shows_the_push_stops_the_job_on_a_later_tick() {
+    let gh = Fake::new(|s| s.add_pr(1));
+    let slots = JobSlots::new(1);
+    let job = slots.run(&*gh, &LANE, 1, PR_1, std::future::pending::<Result<()>>());
+    let push = async {
+        tokio::task::yield_now().await;
+        // Told first, while GitHub still shows the old head.
+        slots.saw(1, &repo(), 1, "pr-1-v1");
+        // A sleep, not a yield: the clock moves only once the job has read the old head.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        gh.with_mut(|s| s.push(1, "pr-1-v1"));
+        // Each tick tells it again; it reads GitHub for that head once a minute.
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            slots.saw(1, &repo(), 1, "pr-1-v1");
+        }
+    };
+    let ran = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::select! {
+            ran = job => ran,
+            () = push => unreachable!(),
+        }
+    });
+    let since = Instant::now();
+    let ran = ran.await.expect("a later tick stopped it");
+    assert!(Outdated::caused(&ran.unwrap_err()));
+    let waited = since.elapsed();
+    assert!(waited >= Duration::from_secs(60), "{waited:?}");
+    assert!(waited <= Duration::from_secs(70), "{waited:?}");
 }

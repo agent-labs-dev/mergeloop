@@ -320,6 +320,15 @@ impl GitHub for Cached<'_> {
         // Read once per head, when its review starts: nothing to keep.
         GitHub::diff_id(self.gh, repo, base, head).await
     }
+    async fn commits(
+        &self,
+        repo: &RepoName,
+        base: &str,
+        head: &str,
+    ) -> Result<Option<Vec<String>>> {
+        // Read once per head, as `diff_id` is.
+        GitHub::commits(self.gh, repo, base, head).await
+    }
     async fn awaiting_approval(&self, repo: &RepoName, sha: &str) -> Result<bool> {
         let read = GitHub::awaiting_approval(self.gh, repo, sha);
         let key = format!("approval:{sha}");

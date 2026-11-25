@@ -263,12 +263,23 @@ mod tests {
             .as_secs() as i64
     }
 
+    /// The repos woken, and the PRs told pushed, with their new heads.
     #[derive(Default)]
-    struct Woken(Mutex<Vec<(u64, String)>>);
+    struct Woken(Mutex<Vec<(u64, String)>>, Mutex<Vec<(u64, u64, String)>>);
 
     impl Wake for Woken {
         fn wake(&self, installation: u64, repo: mergepatrol_core::RepoName) {
             self.0.lock().push((installation, repo.to_string()));
+        }
+
+        fn pushed(
+            &self,
+            installation: u64,
+            _: &mergepatrol_core::RepoName,
+            number: u64,
+            head: &str,
+        ) {
+            self.1.lock().push((installation, number, head.to_owned()));
         }
     }
 
@@ -917,8 +928,14 @@ mod tests {
         let res = register(serde_json::json!(["http://localhost:9999/callback"])).await;
         assert_eq!(res.status(), StatusCode::CREATED);
         assert!(json_of(res).await["client_id"].is_string());
-        // A redirect off this machine could carry the code anywhere.
-        let res = register(serde_json::json!(["https://evil.example/callback"])).await;
+        // A site, over https: the consent page names it before any code goes there.
+        let res = register(serde_json::json!([
+            "https://api.nebula.gg/mcp-servers/oauth/callback"
+        ]))
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        // Plain http off this machine, where anyone on the way could read the code.
+        let res = register(serde_json::json!(["http://evil.example/callback"])).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_of(res).await["error"], "invalid_redirect_uri");
     }
@@ -963,10 +980,10 @@ mod tests {
         assert!(back.ends_with("&state=s%20t"), "{back}");
         assert!(cookies.contains(&"mp_mcp=".to_owned()), "{cookies:?}");
 
-        // A cookie planted to send the code off this machine is not followed.
+        // A cookie planted to send the code over plain http is not followed.
         use base64::Engine;
         let planted = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({ "redirect_uri": "https://evil.example/cb", "state": null, "challenge": challenge })
+            serde_json::json!({ "redirect_uri": "http://evil.example/cb", "state": null, "challenge": challenge })
                 .to_string(),
         );
         let res = authorize(format!(
@@ -996,9 +1013,9 @@ mod tests {
             "{back}"
         );
         assert!(back.ends_with("&state=x"), "{back}");
-        // Without a loopback redirect, nowhere.
+        // Without a loopback or https redirect, nowhere.
         let res = authorize(format!(
-            "response_type=code&client_id=c&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge={challenge}&code_challenge_method=S256"
+            "response_type=code&client_id=c&redirect_uri=http%3A%2F%2Fevil.example%2Fcb&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -1231,7 +1248,7 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .start_review(1, &key.repo, number, "h", None)
+                .start_review(1, &key.repo, number, "h", None, None)
                 .await
                 .unwrap();
         }
@@ -1371,7 +1388,10 @@ mod tests {
         let (status, body) = json(&router, "GET", path, &cookie, None).await;
         assert_eq!((status, body), (StatusCode::OK, serde_json::Value::Null));
 
-        let r = store.start_review(1, &repo, 7, "head", None).await.unwrap();
+        let r = store
+            .start_review(1, &repo, 7, "head", None, None)
+            .await
+            .unwrap();
         let claim = store
             .claim_review(std::time::Duration::from_secs(60))
             .await
@@ -1791,6 +1811,29 @@ mod tests {
             changes.push(store.github_value(7, &repo, key).await.unwrap().changes);
         }
         assert_eq!(changes, [1, 0, 1, 1, 1]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_push_to_a_pr_tells_the_queue_its_new_head(pool: PgPool) {
+        let woken = Arc::new(Woken::default());
+        let (router, _) = with_app(pool, Some(app(Some("hush"))), woken.clone()).await;
+        let send = async |action: &str| {
+            let body = format!(
+                r#"{{"action":"{action}","installation":{{"id":7}},"repository":{{"full_name":"o/r"}},"pull_request":{{"number":3,"head":{{"sha":"new"}}}}}}"#
+            );
+            let req = Request::post("/webhooks/github")
+                .header("x-github-event", "pull_request")
+                .header(
+                    "x-hub-signature-256",
+                    webhook::sign("hush", body.as_bytes()),
+                )
+                .body(Body::from(body))
+                .unwrap();
+            router.clone().oneshot(req).await.unwrap().status()
+        };
+        assert_eq!(send("labeled").await, StatusCode::NO_CONTENT);
+        assert_eq!(send("synchronize").await, StatusCode::NO_CONTENT);
+        assert_eq!(*woken.1.lock(), [(7, 3, "new".to_owned())]);
     }
 
     async fn deliver_push(router: &Router, body: &str) -> StatusCode {

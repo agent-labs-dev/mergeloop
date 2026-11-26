@@ -706,8 +706,6 @@ pub struct ReviewBriefView {
     pub cleared: u32,
     pub asked: Vec<String>,
     pub answered_by: Option<String>,
-    /// The agent could not review.
-    pub failed: bool,
 }
 
 impl From<&ReviewRecord> for ReviewBriefView {
@@ -721,7 +719,6 @@ impl From<&ReviewRecord> for ReviewBriefView {
             cleared: r.findings.len() as u32 - asks - sent_back,
             asked: r.asked.clone(),
             answered_by: r.answered_by.clone(),
-            failed: r.status == ReviewStatus::Failed,
         }
     }
 }

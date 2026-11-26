@@ -154,7 +154,7 @@ async fn tell_off(
     let file = found.file.text.as_deref();
     let off = Off::of(state.as_ref(), found.at, file, &defaults, label);
     match off {
-        Some(off) => gh.sticky_comment(repo, pr, &off.comment(repo, label)).await,
+        Some(off) => gh.sticky_comment(repo, pr, &off.comment(repo)).await,
         None => Ok(()),
     }
 }
@@ -162,10 +162,10 @@ async fn tell_off(
 /// Why a repo's queue does not run, for a PR labelled with its trigger label.
 #[derive(Debug, PartialEq, Eq)]
 enum Off {
-    /// The default branch has no config file.
-    NoConfig,
-    /// The dashboard turned the queue off.
-    TurnedOff,
+    /// The default branch has no config file; the queue, once on, triggers on this label.
+    NoConfig(String),
+    /// The dashboard turned the queue off; the queue triggers on this label.
+    TurnedOff(String),
 }
 
 impl Off {
@@ -196,24 +196,31 @@ impl Off {
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(label))
         };
-        if !settings.iter().any(queues) {
-            return None;
-        }
+        let matched = settings.iter().find(|s| queues(s))?;
         if state.is_some_and(|s| s.enabled == Some(false)) {
-            Some(Off::TurnedOff)
+            Some(Off::TurnedOff(matched.label.clone()))
         } else {
-            file.is_none().then_some(Off::NoConfig)
+            // Enabled by a new file at `at`, the queue triggers on that path's label, which may
+            // differ from the legacy label that was just applied.
+            file.is_none()
+                .then(|| Off::NoConfig(at.inherit(defaults).label))
         }
     }
 
-    fn comment(&self, repo: &RepoName, label: &str) -> String {
-        let why = match self {
-            Off::NoConfig => format!(
-                "{repo} has no `{}` on its default branch, so its queue is off. Add that file, or turn the queue on in the MergeLoop dashboard",
-                ConfigPath::Current.path()
+    fn comment(&self, repo: &RepoName) -> String {
+        let (why, label) = match self {
+            Off::NoConfig(label) => (
+                format!(
+                    "{repo} has no `{}` on its default branch, so its queue is off. Add that file, or turn the queue on in the MergeLoop dashboard",
+                    ConfigPath::Current.path()
+                ),
+                label,
             ),
-            Off::TurnedOff => format!(
-                "the queue of {repo} is turned off in the MergeLoop dashboard. Turn it on there"
+            Off::TurnedOff(label) => (
+                format!(
+                    "the queue of {repo} is turned off in the MergeLoop dashboard. Turn it on there"
+                ),
+                label,
             ),
         };
         format!(
@@ -450,33 +457,38 @@ mod tests {
             private: None,
             agent: Vec::new(),
         };
+        let queue = |l: &str| Off::NoConfig(l.into());
         let none = ConfigPath::Current;
         let of = |s: Option<&RepoState>, file, label| Off::of(s, none, file, &defaults, label);
         // No config file: the label of either path is one a user meant, and nothing else is.
-        assert_eq!(of(None, None, "mergeloop"), Some(Off::NoConfig));
+        assert_eq!(of(None, None, "mergeloop"), Some(queue("mergeloop")));
         assert_eq!(
             of(Some(&state(None)), None, "MergePatrol"),
-            Some(Off::NoConfig)
+            Some(queue("mergeloop"))
         );
         assert_eq!(of(None, None, "bug"), None);
-        assert_eq!(of(None, None, "mergeloop:priority"), Some(Off::NoConfig));
+        assert_eq!(
+            of(None, None, "mergeloop:priority"),
+            Some(queue("mergeloop"))
+        );
         assert_eq!(of(None, None, "mergeloop:failed"), None);
         // Turned off in the dashboard: only the file's label is the trigger.
         let file = Some("label: ship\n");
         assert_eq!(
             of(Some(&state(Some(false))), file, "ship"),
-            Some(Off::TurnedOff)
+            Some(Off::TurnedOff("ship".into()))
         );
         assert_eq!(of(Some(&state(Some(false))), file, "mergeloop"), None);
         // A config file the queue has not read yet: it runs once it does.
         assert_eq!(of(Some(&state(None)), file, "ship"), None);
-        let comment = Off::NoConfig.comment(&RepoName::parse("o/r").unwrap(), "mergepatrol");
+        // The legacy label was applied, but the queue a new file enables triggers on `mergeloop`.
+        let comment = queue("mergeloop").comment(&RepoName::parse("o/r").unwrap());
         assert!(
             comment.contains("no `.mergeloop/mergeloop.yml`"),
             "{comment}"
         );
         assert!(
-            comment.ends_with("then add `mergepatrol` again."),
+            comment.ends_with("then add `mergeloop` again."),
             "{comment}"
         );
     }

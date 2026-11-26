@@ -1265,6 +1265,11 @@ struct Ran {
 const TAIL_LINES: usize = 20;
 const TAIL_BYTES: usize = 4_000;
 
+/// A command's output as text to show and keep: what is not UTF-8, and NUL, become U+FFFD.
+fn shown(bytes: &[u8]) -> String {
+    mergepatrol_core::keepable(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Runs a command from the repo's root. One that runs past the timeout did not pass.
 async fn run_command(dir: &Path, cmd: &str) -> Result<Ran> {
     use std::process::Stdio;
@@ -1293,8 +1298,8 @@ async fn run_command(dir: &Path, cmd: &str) -> Result<Ran> {
         });
     };
     let output = output?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut text = shown(&output.stdout);
+    text.push_str(&shown(&output.stderr));
     let lines: Vec<&str> = text.lines().collect();
     let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
     let mut cut = tail.len().saturating_sub(TAIL_BYTES);
@@ -1356,6 +1361,17 @@ mod tests {
             "{}",
             ran.tail.len()
         );
+    }
+
+    /// A command that prints binary, as `cat` of a gzip file, leaves no NUL in the text that
+    /// Postgres keeps: it refuses one, and the review could not be stored.
+    #[tokio::test]
+    async fn a_commands_binary_output_is_kept_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = run_command(dir.path(), "printf 'a\\000b\\377c'; exit 1")
+            .await
+            .unwrap();
+        assert_eq!(ran.tail, "a\u{FFFD}b\u{FFFD}c");
     }
 
     #[test]

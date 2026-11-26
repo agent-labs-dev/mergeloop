@@ -29,6 +29,7 @@ flowchart TD
         review -- "sent back: changes requested" --> author
         author -- "new head: CI runs again" --> ci
         review -- "asks" --> human
+        review -- "failed: author retries, or a human reviews" --> human
         human -- "resumes" --> review
     end
 

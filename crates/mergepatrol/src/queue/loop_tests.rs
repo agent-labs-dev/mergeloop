@@ -2835,6 +2835,22 @@ async fn with_the_review_on_a_pr_keeps_its_place_until_the_agent_or_a_human_appr
     assert_eq!(run.merged(), [2, 1]);
 }
 
+/// A review that failed asks no human anything: the PR is held as failed, and its status
+/// comment says so and how to go on, as no review of the agent's may be on the PR.
+#[tokio::test(start_paused = true)]
+async fn a_failed_review_holds_the_pr_as_failed_and_says_so() {
+    let run = Run::new(Fake::new(|s| s.add_pr(1)));
+    *run.store.review_settings.lock().unwrap() = Some(ReviewSettings::default());
+    run.tick().await;
+    run.store.finish_review(1, ReviewStatus::Failed);
+    run.tick().await;
+    assert_eq!(run.lane(), [(1, "Held(ReviewFailed)".into())]);
+    assert_eq!(
+        comments_on(&run, 1).last().unwrap(),
+        &on_hold(&Hold::ReviewFailed)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_pr_goes_on_once_its_author_resolves_every_comment_with_no_human() {
     let run = Run::new(Fake::new(|s| s.add_pr(1)));

@@ -2,13 +2,14 @@
 //! queue of its repo, which reads that again from GitHub. A lost delivery costs time, not state:
 //! the queue reads the whole repo again now and then.
 
+use anyhow::Context;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use hmac::{Hmac, KeyInit, Mac};
 use mergepatrol_analytics::{Analytics, WorkspaceInfo};
-use mergepatrol_core::{ConfigPath, PrNumber, RepoName};
-use mergepatrol_store::{BRANCH_RULES, Change};
+use mergepatrol_core::{ConfigPath, PrNumber, RepoName, RepoSettings};
+use mergepatrol_store::{BRANCH_RULES, Change, RepoState};
 use serde_json::Value;
 use sha2::Sha256;
 
@@ -92,6 +93,12 @@ pub(crate) async fn receive(
                     .await;
             }
         }
+        if event == Some("pull_request")
+            && let Some((pr, label)) = labeled(&payload)
+            && let Err(e) = tell_off(&state, installation, &repo, pr, label).await
+        {
+            tracing::warn!(installation, %repo, pr, error = %format!("{e:#}"), "could not tell a labelled PR why its repo does not queue it");
+        }
         if let Some(reply) = crate::pr_reply::reply(event, &payload)
             && let Err(e) = crate::pr_reply::heard(&state, installation, &repo, reply).await
         {
@@ -110,6 +117,116 @@ pub(crate) async fn receive(
         stored?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// An open PR a label was just put on: its number, and the label.
+fn labeled(payload: &Value) -> Option<(PrNumber, &str)> {
+    let pr = &payload["pull_request"];
+    if payload["action"] != "labeled" || pr["state"] != "open" {
+        return None;
+    }
+    Some((pr["number"].as_u64()?, payload["label"]["name"].as_str()?))
+}
+
+/// Tells a PR labelled to merge, in a repo whose queue does not run, why nothing queues it: the
+/// queue reads only the repos it runs, so it never would.
+async fn tell_off(
+    app: &AppState,
+    installation: u64,
+    repo: &RepoName,
+    pr: PrNumber,
+    label: &str,
+) -> anyhow::Result<()> {
+    let state = app.store.repo_state(installation, repo).await?;
+    if state.as_ref().is_some_and(RepoState::on) {
+        return Ok(());
+    }
+    let creds = app
+        .app_credentials()
+        .await?
+        .context("no GitHub App is set up")?;
+    let gh = app.github.app(&creds)?.installation(installation);
+    let found = gh.config_file(repo).await?;
+    let defaults = app
+        .store
+        .inherited(installation, &app.repo_defaults)
+        .await?;
+    let file = found.file.text.as_deref();
+    let off = Off::of(state.as_ref(), found.at, file, &defaults, label);
+    match off {
+        Some(off) => gh.sticky_comment(repo, pr, &off.comment(repo)).await,
+        None => Ok(()),
+    }
+}
+
+/// Why a repo's queue does not run, for a PR labelled with its trigger label.
+#[derive(Debug, PartialEq, Eq)]
+enum Off {
+    /// The default branch has no config file; the queue, once on, triggers on this label.
+    NoConfig(String),
+    /// The dashboard turned the queue off; the queue triggers on this label.
+    TurnedOff(String),
+}
+
+impl Off {
+    /// Why, when `label` is the repo's trigger label and its queue is off. `None` for any other
+    /// label, and for a repo with a config file the queue has not read yet: it runs once it does.
+    fn of(
+        state: Option<&RepoState>,
+        at: ConfigPath,
+        file: Option<&str>,
+        defaults: &RepoSettings,
+        label: &str,
+    ) -> Option<Off> {
+        // Without a config file, either path's label is one a user may have meant.
+        let settings: Vec<RepoSettings> = match file {
+            Some(_) => vec![
+                RepoSettings::from_file_at(at, file, defaults)
+                    .unwrap_or_else(|_| at.inherit(defaults)),
+            ],
+            None => ConfigPath::ALL
+                .iter()
+                .map(|p| p.inherit(defaults))
+                .collect(),
+        };
+        // The trigger label queues a PR, and its priority form queues it first.
+        let queues = |s: &RepoSettings| {
+            let l = s.labels();
+            [l.trigger, l.priority]
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(label))
+        };
+        let matched = settings.iter().find(|s| queues(s))?;
+        if state.is_some_and(|s| s.enabled == Some(false)) {
+            Some(Off::TurnedOff(matched.label.clone()))
+        } else {
+            // Enabled by a new file at `at`, the queue triggers on that path's label, which may
+            // differ from the legacy label that was just applied.
+            file.is_none()
+                .then(|| Off::NoConfig(at.inherit(defaults).label))
+        }
+    }
+
+    fn comment(&self, repo: &RepoName) -> String {
+        let (why, label) = match self {
+            Off::NoConfig(label) => (
+                format!(
+                    "{repo} has no `{}` on its default branch, so its queue is off. Add that file, or turn the queue on in the MergeLoop dashboard",
+                    ConfigPath::Current.path()
+                ),
+                label,
+            ),
+            Off::TurnedOff(label) => (
+                format!(
+                    "the queue of {repo} is turned off in the MergeLoop dashboard. Turn it on there"
+                ),
+                label,
+            ),
+        };
+        format!(
+            "**Not queued.** MergeLoop does not queue this PR: {why}, then add `{label}` again."
+        )
+    }
 }
 
 /// The PR and its new head, of a `pull_request` delivery for a push to it.
@@ -306,6 +423,75 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_label_on_an_open_pr_is_heard() {
+        let pr = |action: &str, state: &str| json!({ "action": action, "label": { "name": "mergeloop" }, "pull_request": { "number": 5, "state": state } });
+        assert_eq!(labeled(&pr("labeled", "open")), Some((5, "mergeloop")));
+        assert_eq!(labeled(&pr("unlabeled", "open")), None);
+        assert_eq!(labeled(&pr("labeled", "closed")), None);
+    }
+
+    #[test]
+    fn a_trigger_label_on_a_repo_whose_queue_is_off_says_why() {
+        let defaults = RepoSettings {
+            label: mergepatrol_core::DEFAULT_LABEL.into(),
+            batch_size: 8,
+            agent: mergepatrol_core::AgentSettings {
+                provider: Default::default(),
+                model: "m".into(),
+                effort: "medium".into(),
+                overrides: Default::default(),
+            },
+            verify: Vec::new(),
+            fix_ci: Default::default(),
+            branches: Vec::new(),
+            review: Default::default(),
+        };
+        let state = |enabled| RepoState {
+            repo: RepoName::parse("o/r").unwrap(),
+            installation_id: 1,
+            enabled,
+            has_config: false,
+            config_error: None,
+            private: None,
+            agent: Vec::new(),
+        };
+        let queue = |l: &str| Off::NoConfig(l.into());
+        let none = ConfigPath::Current;
+        let of = |s: Option<&RepoState>, file, label| Off::of(s, none, file, &defaults, label);
+        // No config file: the label of either path is one a user meant, and nothing else is.
+        assert_eq!(of(None, None, "mergeloop"), Some(queue("mergeloop")));
+        assert_eq!(
+            of(Some(&state(None)), None, "MergePatrol"),
+            Some(queue("mergeloop"))
+        );
+        assert_eq!(of(None, None, "bug"), None);
+        assert_eq!(
+            of(None, None, "mergeloop:priority"),
+            Some(queue("mergeloop"))
+        );
+        assert_eq!(of(None, None, "mergeloop:failed"), None);
+        // Turned off in the dashboard: only the file's label is the trigger.
+        let file = Some("label: ship\n");
+        assert_eq!(
+            of(Some(&state(Some(false))), file, "ship"),
+            Some(Off::TurnedOff("ship".into()))
+        );
+        assert_eq!(of(Some(&state(Some(false))), file, "mergeloop"), None);
+        // A config file the queue has not read yet: it runs once it does.
+        assert_eq!(of(Some(&state(None)), file, "ship"), None);
+        // The legacy label was applied, but the queue a new file enables triggers on `mergeloop`.
+        let comment = queue("mergeloop").comment(&RepoName::parse("o/r").unwrap());
+        assert!(
+            comment.contains("no `.mergeloop/mergeloop.yml`"),
+            "{comment}"
+        );
+        assert!(
+            comment.ends_with("then add `mergeloop` again."),
+            "{comment}"
+        );
+    }
 
     #[test]
     fn a_ruleset_change_clears_the_branch_rules() {

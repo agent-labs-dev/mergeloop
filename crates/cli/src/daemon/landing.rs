@@ -58,7 +58,8 @@ enum Act {
 fn act(needs: &str) -> Act {
     match needs {
         "threads" | "changes" => Act::Work,
-        "draft" | "human" | "removed" => Act::Wait,
+        // The daemon's agent is not the PR's author, who alone may retry a failed review.
+        "draft" | "human" | "removed" | "review_failed" => Act::Wait,
         "ejected" => Act::Ejected,
         "merged" => Act::Merged,
         _ => Act::Later,
@@ -654,7 +655,7 @@ mod tests {
     fn only_review_threads_and_requested_changes_run_the_agent() {
         assert_eq!(act("threads"), Act::Work);
         assert_eq!(act("changes"), Act::Work);
-        for waits in ["draft", "human", "removed"] {
+        for waits in ["draft", "human", "removed", "review_failed"] {
             assert_eq!(act(waits), Act::Wait, "{waits}");
         }
         assert_eq!(act("ejected"), Act::Ejected);

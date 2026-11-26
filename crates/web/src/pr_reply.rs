@@ -116,8 +116,9 @@ pub(crate) async fn heard(
     else {
         return Ok(());
     };
-    // Only a review that asks, or sent something back, has threads to answer or ask about.
-    if review.status != ReviewStatus::Asks && !review.findings.iter().any(|f| f.sent_back) {
+    // Only a review that waits on a human, or sent something back, has threads to answer or ask
+    // about, or a review of the PR to take.
+    if !review.status.waits_on_a_human() && !review.findings.iter().any(|f| f.sent_back) {
         return Ok(());
     }
     let creds = app
@@ -137,7 +138,7 @@ pub(crate) async fn heard(
             let mention = format!("@{}", creds.slug);
             return in_threads(app, &gh, &mut writers, &review, &pr, &mention).await;
         }
-        _ if review.status != ReviewStatus::Asks => return Ok(()),
+        _ if !review.status.waits_on_a_human() => return Ok(()),
         ReplyKind::Said => Missed::Said,
         ReplyKind::Approved { commit } | ReplyKind::ChangesRequested { commit, .. }
             if commit != review.head_sha =>
@@ -415,11 +416,13 @@ enum Missed {
 /// how to.
 fn nudge(review: &ReviewRecord, login: &str, missed: &Missed, mention: &str) -> String {
     let asks = review.asks().count();
-    let what = match asks {
-        // The agent could not review: a human reviews the whole PR instead.
-        0 => "the agent could not review it, so it waits for a human's review".to_owned(),
-        1 => "it asks a human about 1 thing".to_owned(),
-        n => format!("it asks a human about {n} things"),
+    let what = match (review.status, asks) {
+        // A human reviews the whole PR instead.
+        (ReviewStatus::Failed, _) => {
+            "the agent's review failed, so it waits for a human's review".to_owned()
+        }
+        (_, 1) => "it asks a human about 1 thing".to_owned(),
+        (_, n) => format!("it asks a human about {n} things"),
     };
     let answer = match asks {
         0 => "Approve the PR, or request changes".to_owned(),
@@ -736,7 +739,7 @@ mod tests {
         );
         assert!(!every_ask_answered(&two, &fine));
         // The agent could not review: its asks are none, and a thread answers nothing.
-        let failed = review(ReviewStatus::Asks, Vec::new());
+        let failed = review(ReviewStatus::Failed, Vec::new());
         assert!(!every_ask_answered(&failed, &BTreeMap::new()));
         let notes = review(ReviewStatus::Asks, vec![finding("f1", "a", false, false)]);
         assert!(!every_ask_answered(&notes, &fine));

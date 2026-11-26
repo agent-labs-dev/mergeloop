@@ -41,6 +41,8 @@ pub enum NeedKind {
     Changes,
     /// It is a draft: publish it once its work is done.
     Draft,
+    /// The agent's review failed: its author may retry it, or a human reviews the PR instead.
+    ReviewFailed,
     /// It waits on a human: nothing for the agent to do.
     Human,
     /// The queue ejected it: fix the cause, then queue it again.
@@ -53,16 +55,17 @@ pub enum NeedKind {
 }
 
 impl NeedKind {
-    /// The `mergeloop` CLI's exit code for it: 0 for work to do, 10 merged, 11 ejected, 12
-    /// waiting on a human. A repo whose queue does not run waits on one too: only a human sets
-    /// it up. 2 is the CLI's own, for an error.
+    /// The `mergeloop` CLI's exit code for it: 0 for work to do, a failed review to retry
+    /// included, 10 merged, 11 ejected, 12 waiting on a human. A repo whose queue does not run
+    /// waits on one too: only a human sets it up. 2 is the CLI's own, for an error.
     fn exit_code(self) -> u8 {
         match self {
             NeedKind::Queue
             | NeedKind::Wait
             | NeedKind::Threads
             | NeedKind::Changes
-            | NeedKind::Draft => 0,
+            | NeedKind::Draft
+            | NeedKind::ReviewFailed => 0,
             NeedKind::Merged => 10,
             NeedKind::Ejected => 11,
             NeedKind::Human | NeedKind::Removed | NeedKind::Off => 12,
@@ -275,6 +278,7 @@ fn need(status: &PullStateView, exit: Option<&ExitRecord>) -> Need {
         HoldReasonView::ReviewChanges | HoldReasonView::UnresolvedThreads => NeedKind::Threads,
         HoldReasonView::ChangesRequested => NeedKind::Changes,
         HoldReasonView::Draft => NeedKind::Draft,
+        HoldReasonView::ReviewFailed => NeedKind::ReviewFailed,
         HoldReasonView::ReviewAsks
         | HoldReasonView::ReviewRequired
         | HoldReasonView::WorkflowApproval
@@ -352,6 +356,9 @@ fn brief(need: &Need, status: &PullStateView, then: &str) -> String {
         ),
         NeedKind::Draft => format!(
             "#{pr} is a draft{on}. If its work is done, publish it with `gh pr ready {pr} --repo {repo}`. If not, finish it first, or tell the user it waits on them. Then run `{then}`."
+        ),
+        NeedKind::ReviewFailed => format!(
+            "MergeLoop's review{on} failed. Read why with `mergeloop call get_agent_review {args}`. If you authored #{pr}, retry the review with `mergeloop call retry_agent_review {args}`, then run `{then}`. If the retry is refused, as when you are not its author or its retries are spent, a human reviews #{pr} on GitHub instead, approving it or requesting changes: tell the user, then run `{then}` in the background."
         ),
         NeedKind::Human => format!(
             "It waits on a human: {detail}. Nothing here is yours to do. Tell the user what it waits for, then run `{then}` in the background: it returns once something changes."
@@ -524,6 +531,7 @@ mod tests {
         assert_eq!(kind(HoldReasonView::ChangesRequested), NeedKind::Changes);
         assert_eq!(kind(HoldReasonView::Draft), NeedKind::Draft);
         assert_eq!(kind(HoldReasonView::ReviewAsks), NeedKind::Human);
+        assert_eq!(kind(HoldReasonView::ReviewFailed), NeedKind::ReviewFailed);
         assert_eq!(kind(HoldReasonView::ReviewRequired), NeedKind::Human);
         assert_eq!(kind(HoldReasonView::Reviewing), NeedKind::Wait);
         assert_eq!(kind(HoldReasonView::PrepFixing), NeedKind::Wait);
@@ -785,6 +793,7 @@ mod tests {
             PrepFixing,
             Reviewing,
             ReviewAsks,
+            ReviewFailed,
             ReviewChanges,
             UnresolvedThreads,
         ];

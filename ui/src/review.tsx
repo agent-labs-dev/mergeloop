@@ -40,6 +40,8 @@ export function reviewBadge(e: Gated): [string, string] | null {
       return ["Reviewing", reviewTones.reviewing];
     case "review_asks":
       return ["Needs a human", reviewTones.asks];
+    case "review_failed":
+      return ["Review failed", reviewTones.asks];
     case "review_changes":
       return ["Sent back", reviewTones.sentBack];
     case "unresolved_threads":
@@ -62,11 +64,15 @@ export function reviewLine(e: Gated): ReactNode {
       case "review_asks":
         return (
           <span className="text-warn">
-            {r.failed
-              ? "The agent could not review it: a human reviews it instead"
-              : `${r.asks} ${r.asks === 1 ? "question" : "questions"} for ${
-                  r.asked.length ? people(r.asked) : "a reviewer"
-                } · ${r.cleared} cleared by the agent`}
+            {`${r.asks} ${r.asks === 1 ? "question" : "questions"} for ${
+              r.asked.length ? people(r.asked) : "a reviewer"
+            } · ${r.cleared} cleared by the agent`}
+          </span>
+        );
+      case "review_failed":
+        return (
+          <span className="text-warn">
+            The agent could not review it: its author can retry, or a human reviews it instead
           </span>
         );
       case "review_changes":

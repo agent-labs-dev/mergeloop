@@ -76,7 +76,7 @@ async fn a_fix_after_an_intervening_failed_review_settles_the_original_request()
     .await
     .unwrap();
     let failed = world.store.review(failed.id).await.unwrap().unwrap();
-    assert_eq!(failed.status, ReviewStatus::Asks);
+    assert_eq!(failed.status, ReviewStatus::Failed);
     assert!(failed.findings.is_empty());
 
     world.gh.with_mut(|s| s.push(1, "fixed"));

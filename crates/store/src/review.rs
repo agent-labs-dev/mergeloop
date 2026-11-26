@@ -162,10 +162,12 @@ pub trait ReviewStore: Send + Sync {
         before: &str,
         after: &str,
     ) -> Result<()>;
-    /// A human answered the review's asks. False if it no longer asks.
+    /// A human answered the review's asks, or reviewed a PR whose review failed. False if it no
+    /// longer waits on a human.
     async fn answer_review(&self, id: i64, answers: &ReviewAnswers) -> Result<bool>;
-    /// Marks the review as having told the PR, on GitHub, how to answer its asks. False
-    /// if it told it already, or it no longer asks.
+    /// Marks the review as having told the PR, on GitHub, how to answer its asks, or review it in
+    /// place of a review that failed. False if it told it already, or it no longer waits on a
+    /// human.
     async fn nudge_review(&self, id: i64) -> Result<bool>;
     /// Undoes `nudge_review`, as when posting the note failed, so a later reply tries again.
     async fn release_nudge(&self, id: i64) -> Result<()>;
@@ -484,7 +486,7 @@ impl ReviewStore for PgStore {
             "UPDATE agent_reviews
              SET status = 'pending', error = NULL, author_attempts = author_attempts + 1,
                  claimed_at = NULL, retry_at = NULL, updated_at = now()
-             WHERE id = $1 AND head_sha = $2 AND status = 'asks' AND error IS NOT NULL
+             WHERE id = $1 AND head_sha = $2 AND status = 'failed'
                AND author_attempts < $3",
         )
         .bind(id)
@@ -519,7 +521,7 @@ impl ReviewStore for PgStore {
         let updated = sqlx::query(
             "UPDATE agent_reviews SET status = $2, error = $3, summary = $4, findings = $5,
                  asked = $6, claimed_at = NULL, retry_at = NULL, updated_at = now(),
-                 asked_at = CASE WHEN $2 = 'asks' THEN now() END
+                 asked_at = CASE WHEN $2 IN ('asks', 'failed') THEN now() END
              WHERE id = $1 AND status = 'running' AND claim = $7",
         )
         .bind(id)
@@ -634,7 +636,7 @@ impl ReviewStore for PgStore {
     async fn answer_review(&self, id: i64, a: &ReviewAnswers) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT findings FROM agent_reviews WHERE id = $1 AND status = 'asks' FOR UPDATE",
+            "SELECT findings FROM agent_reviews WHERE id = $1 AND status IN ('asks', 'failed') FOR UPDATE",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -666,7 +668,7 @@ impl ReviewStore for PgStore {
     async fn nudge_review(&self, id: i64) -> Result<bool> {
         let updated = sqlx::query(
             "UPDATE agent_reviews SET nudged_at = now()
-             WHERE id = $1 AND status = 'asks' AND nudged_at IS NULL",
+             WHERE id = $1 AND status IN ('asks', 'failed') AND nudged_at IS NULL",
         )
         .bind(id)
         .execute(&self.pool)
@@ -1270,7 +1272,7 @@ mod tests {
                 "running is not failed"
             );
             let failed = ReviewDone {
-                status: ReviewStatus::Asks,
+                status: ReviewStatus::Failed,
                 error: Some("worker timeout".into()),
                 summary: String::new(),
                 findings: vec![],

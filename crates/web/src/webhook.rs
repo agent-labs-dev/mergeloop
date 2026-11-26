@@ -197,13 +197,17 @@ impl Off {
                 .any(|t| t.eq_ignore_ascii_case(label))
         };
         let matched = settings.iter().find(|s| queues(s))?;
-        if state.is_some_and(|s| s.enabled == Some(false)) {
-            Some(Off::TurnedOff(matched.label.clone()))
+        // Without a file, the queue once on triggers on `at`'s label, which may differ from the
+        // legacy label that was just applied.
+        let trigger = if file.is_none() {
+            at.inherit(defaults).label
         } else {
-            // Enabled by a new file at `at`, the queue triggers on that path's label, which may
-            // differ from the legacy label that was just applied.
-            file.is_none()
-                .then(|| Off::NoConfig(at.inherit(defaults).label))
+            matched.label.clone()
+        };
+        if state.is_some_and(|s| s.enabled == Some(false)) {
+            Some(Off::TurnedOff(trigger))
+        } else {
+            file.is_none().then(|| Off::NoConfig(trigger))
         }
     }
 
@@ -479,6 +483,11 @@ mod tests {
             Some(Off::TurnedOff("ship".into()))
         );
         assert_eq!(of(Some(&state(Some(false))), file, "mergeloop"), None);
+        // Turned off and no file: turning it on triggers on the current path's label, not the legacy one.
+        assert_eq!(
+            of(Some(&state(Some(false))), None, "mergepatrol"),
+            Some(Off::TurnedOff("mergeloop".into()))
+        );
         // A config file the queue has not read yet: it runs once it does.
         assert_eq!(of(Some(&state(None)), file, "ship"), None);
         // The legacy label was applied, but the queue a new file enables triggers on `mergeloop`.

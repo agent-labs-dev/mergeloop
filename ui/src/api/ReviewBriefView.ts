@@ -16,4 +16,8 @@ sent_back: number,
 /**
  * Findings it cleared alone.
  */
-cleared: number, asked: Array<string>, answered_by: string | null, };
+cleared: number, asked: Array<string>, answered_by: string | null, 
+/**
+ * The agent could not review.
+ */
+failed: boolean, };

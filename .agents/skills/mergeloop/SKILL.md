@@ -28,7 +28,7 @@ mkdir -p ~/.local/bin && gh release download cli-latest -R agent-labs-dev/mergel
   -p "mergeloop-$(uname -s)-$(uname -m).tar.gz" -O - | tar -xz -C ~/.local/bin
 ```
 
-Call it as `~/.local/bin/mergeloop` when that is not on the PATH. It acts as `gh auth token`, against `https://mergeloop.ai`; a self-hosted MergeLoop sets `MERGELOOP_URL`. Then run `mergeloop` (the current branch's PR, or `mergeloop <number>`) in the background. It queues the PR, and exits once the PR needs something of you, printing a `brief` of what to do and a `then` to run once done. Do what the brief says, run `then`, and go on until it exits 10, merged. Exit 12 means it waits on a human: tell the user what for, and run `then` again in the background. Over MCP alone, `next_need` is the same loop.
+Call it as `~/.local/bin/mergeloop` when that is not on the PATH. It acts as `gh auth token`, against `https://mergeloop.ai`; a self-hosted MergeLoop sets `MERGELOOP_URL`. Then run `mergeloop` (the current branch's PR, or `mergeloop <number>`) in the background. It queues the PR, and exits once the PR needs something of you, printing a `brief` of what to do and a `then` to run once done. Do what the brief says, run `then`, and go on until it exits 10, merged, or 11, ejected. Exit 12 means it waits on a human: tell the user what for, and run `then` again in the background, since the PR is still queued. Over MCP alone, `next_need` is the same loop.
 
 ## What the queue does
 
@@ -47,7 +47,7 @@ MergeLoop keeps one comment on each queued PR up to date, from the moment it joi
 - **Added to the queue**: it waits in its place.
 - **Getting ready to merge**: MergeLoop settles a conflict, waits for the checks and fixes failed ones. The comment does not change from one step to the next: `pull_status` over MCP says which step it is at.
 - **On hold**: the PR is a draft, waits for a required review, or has changes requested. MergeLoop comments the reason on the PR. It keeps its place, and runs once GitHub shows it ready.
-- **Under review**: with automatic review on, as it is by default, an agent reviews the PR before it takes its place in line. What it is sure should change it sends back to the PR's author, which is you if you built it, as review comments on their lines. The PR goes on once every review thread on it is resolved, with no human approval. It asks a human only about what the author can't settle: a call on scope or product, access, a change outside the repo. `get_agent_review` over MCP reads the review. If you built the PR, work the review as "After you queue" says, but never answer it.
+- **Under review**: with automatic review on, as it is by default, an agent reviews the PR before it takes its place in line. What it is sure should change it sends back to the PR's author, which is you if you built it, as review comments on their lines. The PR goes on once every review thread on it is resolved, with no human approval. It asks a human only about what the author can't settle: a call on scope or product, access, a change outside the repo. `get_agent_review` over MCP reads the review. If you pushed or queued the PR, work the review as "After you queue" says, but never answer it.
 - **Ejected**: the rebase, the checks or the merge failed, and the comment says which. The trigger label is gone and `<label>:failed` is on. Fix the cause, push, then add `<label>` again.
 - **Merged**: done. The queue labels are removed.
 - **Left the queue**: the label was removed, the PR was closed, or it was merged outside MergeLoop. Nothing is queued.
@@ -56,7 +56,9 @@ If the automatic review itself failed outside the pull request, its author may c
 
 ## After you queue: work the review
 
-Queuing is not the end of your job. If you built the PR, stay with it until it merges, is ejected, or holds only on a human. Go over every review comment yourself, without waiting for the user to tell you to: fix it, or dismiss it with your reasoning, and resolve it. The PR is held while any review thread is unresolved, and goes on to the queue once none is. Ask a human only for a call you can't make from the code, the repo and what the user told you.
+Queuing is not the end of your job. If you pushed the PR or queued it, watch it until it merges or MergeLoop ejects it, and work every MergeLoop comment that lands on it meanwhile. MergeLoop can comment at any point while the PR is queued: its review, a new review after a push, a hold, a fix it committed for failed checks, an ejection. So keep watching after the review threads are all resolved, and while the PR holds on a human: it is still queued. If you have to stop before it merges or is ejected, tell the user plainly that it is still queued and that no one is watching it.
+
+Go over every review comment yourself, without waiting for the user to tell you to: fix it, or dismiss it with your reasoning, and resolve it. The PR is held while any review thread is unresolved, and goes on to the queue once none is. Ask a human only for a call you can't make from the code, the repo and what the user told you.
 
 ### What counts as a comment
 
@@ -88,7 +90,7 @@ A comment is `needs-human` only for one of these: what the PR should do or inclu
 4. **Push once**, if you fixed anything. Fetch the PR's branch and rebase your new commits onto it first. Leave the base branch and its conflicts to MergeLoop.
 5. **Reply in each thread you worked, and resolve the `fixed` and `dismissed` ones.** Never resolve one without a reply that says why.
 6. **Update the ledger** (below).
-7. **Go back to step 1** after a push, for the new head. Stop when no thread is unresolved but the `needs-human` ones, or the PR merged or was ejected. An ejected PR: fix the cause, push, and add `<label>` again.
+7. **Go back to step 1**, for the new head after a push. With nothing left to work but `needs-human` threads, keep polling `pull_status` (or the MergeLoop comment) and the PR's threads and comments every few minutes: anything new starts the loop again. Stop only when the PR merged or was ejected. An ejected PR: fix the cause, push, add `<label>` again, and watch it again from step 1.
 
 A PR with no unresolved thread and nothing asked of a human goes on to the queue by itself. You never need a human to approve it then.
 
@@ -121,10 +123,11 @@ Keep one comment on the PR that lists every comment and its state, and edit it e
 - Don't resolve a thread before the commit that fixes it is pushed, or without a reply that says why.
 - Don't resolve a `needs-human` thread, or one MergeLoop asked a human about, before the human has answered.
 - Don't post a new comment for a reply that belongs in a thread or in the ledger.
+- Don't stop watching a queued PR because its threads are resolved or it waits on a human. Stop at merged or ejected.
 - Don't leave a comment `open` when you stop. Each one ends `fixed`, `dismissed` or `needs-human`.
 - Don't ping a human for something on this list you could do yourself.
 
-When you stop, tell the user where the PR stands: merged, ejected and why, or what each `needs-human` comment needs from whom.
+When you stop, tell the user where the PR stands: merged, or ejected and why. If you stop before either, say it is still queued and unwatched, and what each `needs-human` comment needs from whom.
 
 ## Settings
 

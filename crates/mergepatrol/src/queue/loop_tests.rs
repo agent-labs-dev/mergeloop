@@ -1985,7 +1985,10 @@ async fn a_pr_whose_checks_run_waits_off_the_lane_and_holds_up_no_other() {
     });
     run.tick().await;
     run.tick().await;
-    assert_eq!(run.lane(), [(1, "Held(PrepChecks)".into())]);
+    assert_eq!(
+        run.lane(),
+        [(1, "Held(PrepChecks { waiting: [\"ci\"] })".into())]
+    );
     assert_eq!(run.merged(), [2], "#2 passes #1, which holds no job");
     assert_eq!(run.rebase.count(), 1);
 }
@@ -2002,7 +2005,10 @@ async fn the_review_waits_for_green_checks() {
         ..ReviewSettings::default()
     });
     assert!(matches!(run.tick().await, Ran::Idle));
-    assert_eq!(run.lane(), [(1, "Held(PrepChecks)".into())]);
+    assert_eq!(
+        run.lane(),
+        [(1, "Held(PrepChecks { waiting: [\"ci\"] })".into())]
+    );
     assert!(run.store.reviews.lock().unwrap().is_empty());
 
     run.gh
@@ -2332,7 +2338,10 @@ async fn a_stack_waits_off_the_lane_for_every_layers_checks() {
     });
     run.tick().await;
     run.tick().await;
-    assert_eq!(run.lane(), [(10, "Held(PrepChecks)".into())]);
+    assert_eq!(
+        run.lane(),
+        [(10, "Held(PrepChecks { waiting: [\"ci\"] })".into())]
+    );
     assert_eq!(run.merged(), [3], "#3 passes the stack, which holds no job");
 }
 
@@ -3546,7 +3555,10 @@ async fn a_rerun_github_refuses_goes_on_to_the_fix() {
 async fn a_failed_job_runs_again_off_the_lane_before_a_fix() {
     let run = prep_run(failing_job);
     run.tick().await;
-    assert_eq!(run.lane(), [(1, "Held(PrepChecks)".into())]);
+    assert_eq!(
+        run.lane(),
+        [(1, "Held(PrepChecks { waiting: [\"ci\"] })".into())]
+    );
     let rerun = prep::Work::Rerun {
         layer: 0,
         failed: vec!["ci".into()],
@@ -4132,7 +4144,10 @@ async fn getting_ready_says_so_once_however_many_steps_it_takes() {
         s.checks.insert("ci".into(), CheckState::Pending);
     });
     run.tick().await;
-    assert_eq!(run.lane(), [(1, "Held(PrepChecks)".into())]);
+    assert_eq!(
+        run.lane(),
+        [(1, "Held(PrepChecks { waiting: [\"ci\"] })".into())]
+    );
     run.gh
         .with_mut(|s| s.checks.insert("ci".into(), CheckState::Failed));
     run.tick().await;

@@ -230,7 +230,7 @@ impl From<&Hold> for HoldView {
             Hold::NoSubscription => HoldReasonView::NoSubscription,
             Hold::FairUseLimit => HoldReasonView::FairUseLimit,
             Hold::PrepRebasing => HoldReasonView::PrepRebasing,
-            Hold::PrepChecks => HoldReasonView::PrepChecks,
+            Hold::PrepChecks { .. } => HoldReasonView::PrepChecks,
             Hold::PrepFixing => HoldReasonView::PrepFixing,
             Hold::Reviewing => HoldReasonView::Reviewing,
             Hold::ReviewAsks => HoldReasonView::ReviewAsks,

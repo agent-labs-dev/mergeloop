@@ -2,11 +2,12 @@
 import type { RepoStatusView } from "./RepoStatusView";
 
 /**
- * A PR just queued: what the repo's status says will become of it.
+ * A PR just queued: what the queue says will become of it, once it has the PR.
  */
 export type QueuedView = { 
 /**
- * "Queued.", or that it goes on hold, or what the agent cannot do for it, and why.
+ * "Queued.", that it waits to join the queue, that it goes on hold, or what the agent
+ * cannot do for it, and why.
  */
 message: string, 
 /**

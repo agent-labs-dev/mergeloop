@@ -3188,8 +3188,8 @@ async fn run_job(
                     match verdict {
                         (CheckState::Passed, _) => Event::ChecksPassed,
                         // Getting ready runs the failed jobs again, or fixes them.
-                        (CheckState::Failed, _) if !agent && !reruns.is_empty() => {
-                            Event::OnHold(Hold::PrepChecks)
+                        (CheckState::Failed, failed) if !agent && !reruns.is_empty() => {
+                            Event::OnHold(Hold::PrepChecks { waiting: failed })
                         }
                         (CheckState::Failed, _) if !agent && !rechecking && job.can_fix() => {
                             Event::OnHold(Hold::PrepFixing)

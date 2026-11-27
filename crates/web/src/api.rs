@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::auth::Caller;
-use crate::v1::{RepoStateView, RepoStatusView};
+use crate::v1::{QueueStateView, QueueView, RepoStateView, RepoStatusView};
 use crate::{ApiError, AppState, Wake};
 
 #[derive(Serialize, TS)]
@@ -1265,34 +1265,101 @@ pub(crate) async fn queue_pull(
     tracing::info!(installation = id, %repo, number, priority = body.priority, "queued from the dashboard");
     let state = app.store.repo_state(id, &repo).await?;
     let status = RepoStatusView::read(&app, &repo, Some(id), state.as_ref()).await?;
-    Ok(Json(QueuedView::new(status)))
+    // What the queue knows of the PR itself: the repo's status alone cannot say whether it
+    // joined. This read runs after the label change, so it must not fail the request: a
+    // flaky lane, review, or exit lookup would otherwise report an applied change as an
+    // error.
+    let pull = match crate::v1::statuses(&app, &repo, Some(id), &[number]).await {
+        Ok(mut pulls) => pulls.remove(0),
+        Err(error) => {
+            let detail = reason(error, "the lane read failed");
+            tracing::warn!(installation = id, %repo, number, %detail, "queued, but the lane read failed");
+            return Ok(Json(QueuedView::degraded(status)));
+        }
+    };
+    Ok(Json(QueuedView::new(
+        status,
+        pull.queue,
+        pull.ejected,
+        pull.merged,
+    )))
 }
 
-/// A PR just queued: what the repo's status says will become of it.
+/// A PR just queued: what the queue says will become of it, once it has the PR.
 #[derive(Serialize, TS)]
 #[ts(export)]
 pub struct QueuedView {
-    /// "Queued.", or that it goes on hold, or what the agent cannot do for it, and why.
+    /// "Queued.", that it waits to join the queue, that it goes on hold, or what the agent
+    /// cannot do for it, and why.
     pub message: String,
     /// As `GET /api/v1` says it.
     pub mergeloop: RepoStatusView,
 }
 
 impl QueuedView {
-    fn new(status: RepoStatusView) -> Self {
-        let mut message = match (status.state, &status.hold) {
-            (RepoStateView::Off, _) => {
+    fn new(
+        status: RepoStatusView,
+        queue: Option<QueueView>,
+        ejected: Option<crate::v1::EjectedView>,
+        merged: Option<crate::v1::MergedView>,
+    ) -> Self {
+        // A recorded exit describes the PR's last run through the queue, which may predate
+        // this queueing: report what it says with its timestamp rather than as a verdict on
+        // the current attempt.
+        let mut message = match (status.state, &queue, &status.hold, &ejected, &merged) {
+            (_, None, _, Some(ejected), _) => {
+                format!(
+                    "Labeled, but it was last ejected at {}: {}.",
+                    ejected.at, ejected.reason
+                )
+            }
+            (_, None, _, _, Some(merged)) => {
+                format!(
+                    "Labeled, but it already merged at {} ({}).",
+                    merged.at, merged.sha
+                )
+            }
+            (RepoStateView::Off, _, _, _, _) => {
                 "Labeled, but MergeLoop is off on this repo: nothing merges it.".to_owned()
             }
-            (RepoStateView::Paused, _) => format!(
+            (RepoStateView::Paused, _, _, _, _) => format!(
                 "Queued, but the queue is paused: {}.",
                 status.config_error.as_deref().unwrap_or_default()
             ),
-            (RepoStateView::On, Some(hold)) => {
+            (RepoStateView::On, Some(entry), _, _, _) => {
+                match (&entry.state, &entry.hold, &status.hold) {
+                    (QueueStateView::Held, Some(hold), _) => {
+                        format!("Queued, but it goes on hold: {}.", hold.message)
+                    }
+                    // A repo-wide hold gates everything already queued too: a gate that
+                    // engaged after the lane caught the PR still blocks it.
+                    (_, _, Some(hold)) => {
+                        format!("Queued, but it goes on hold: {}.", hold.message)
+                    }
+                    _ => "Queued.".to_owned(),
+                }
+            }
+            (RepoStateView::On, None, Some(hold), _, _) => {
                 format!("Queued, but it goes on hold: {}.", hold.message)
             }
-            (RepoStateView::On, None) => "Queued.".to_owned(),
+            (RepoStateView::On, None, None, _, _) => {
+                "Queued, waiting to join the queue on its next tick.".to_owned()
+            }
         };
+        if let Some(missing) = &status.missing_key {
+            message.push_str(&format!(" Also, {}.", missing.message));
+        }
+        QueuedView {
+            message,
+            mergeloop: status,
+        }
+    }
+
+    /// The label change landed, but the lane read that would confirm it failed: report the
+    /// queued state without lane detail rather than failing the request after mutating it.
+    fn degraded(status: RepoStatusView) -> Self {
+        let mut message =
+            "Queued. Live queue status is temporarily unavailable; check the queue.".to_owned();
         if let Some(missing) = &status.missing_key {
             message.push_str(&format!(" Also, {}.", missing.message));
         }
@@ -2570,14 +2637,122 @@ mod tests {
                 settings_url: String::new(),
             }),
         };
-        assert_eq!(QueuedView::new(status(None, None)).message, "Queued.");
+        let queued = |hold: Option<Hold>| {
+            hold.map(|h| QueueView {
+                trunk: "main".into(),
+                state: QueueStateView::Held,
+                stage: None,
+                hold: Some(crate::v1::HoldView::from(&h)),
+                priority: false,
+                position: 1,
+                stack: None,
+                batch_pr: None,
+            })
+        };
+        let waiting = || {
+            Some(QueueView {
+                trunk: "main".into(),
+                state: QueueStateView::Waiting,
+                stage: None,
+                hold: None,
+                priority: false,
+                position: 1,
+                stack: None,
+                batch_pr: None,
+            })
+        };
         assert_eq!(
-            QueuedView::new(status(Some(Hold::NoSubscription), None)).message,
+            QueuedView::new(status(None, None), waiting(), None, None).message,
+            "Queued."
+        );
+        // The repo's status alone never says it joined: without a queue entry, the
+        // acknowledgement says it still has to join.
+        assert_eq!(
+            QueuedView::new(status(None, None), None, None, None).message,
+            "Queued, waiting to join the queue on its next tick."
+        );
+        assert_eq!(
+            QueuedView::new(status(Some(Hold::NoSubscription), None), None, None, None).message,
             "Queued, but it goes on hold: private repos need a MergeLoop subscription."
         );
         assert_eq!(
-            QueuedView::new(status(None, Some("the workspace has no key"))).message,
+            QueuedView::new(
+                status(None, None),
+                queued(Some(Hold::PrepChecks {
+                    waiting: vec!["check".into()]
+                })),
+                None,
+                None,
+            )
+            .message,
+            "Queued, but it goes on hold: its checks are running: check."
+        );
+        assert_eq!(
+            QueuedView::new(
+                status(None, Some("the workspace has no key")),
+                waiting(),
+                None,
+                None,
+            )
+            .message,
             "Queued. Also, the workspace has no key."
+        );
+        // An ejection the lane recorded beats the join message: the PR is not waiting.
+        assert_eq!(
+            QueuedView::new(
+                status(None, None),
+                None,
+                Some(crate::v1::EjectedView {
+                    at: "2026-11-23T00:00:00Z".into(),
+                    reason: "unsupported fork stack".into(),
+                }),
+                None,
+            )
+            .message,
+            "Labeled, but it was last ejected at 2026-11-23T00:00:00Z: unsupported fork stack."
+        );
+        // A recorded merge is reported the same honest way, with its timestamp.
+        assert_eq!(
+            QueuedView::new(
+                status(None, None),
+                None,
+                None,
+                Some(crate::v1::MergedView {
+                    at: "2026-11-23T00:00:00Z".into(),
+                    sha: "abc123".into(),
+                }),
+            )
+            .message,
+            "Labeled, but it already merged at 2026-11-23T00:00:00Z (abc123)."
+        );
+        // A repo-wide hold gates everything already queued too: a gate that engaged after
+        // the lane caught the PR still blocks it.
+        assert_eq!(
+            QueuedView::new(
+                status(Some(Hold::NoSubscription), None),
+                waiting(),
+                None,
+                None
+            )
+            .message,
+            "Queued, but it goes on hold: private repos need a MergeLoop subscription."
+        );
+        // The entry's own hold stays more specific than the repo-wide one.
+        assert_eq!(
+            QueuedView::new(
+                status(Some(Hold::NoSubscription), None),
+                queued(Some(Hold::PrepChecks {
+                    waiting: vec!["check".into()]
+                })),
+                None,
+                None,
+            )
+            .message,
+            "Queued, but it goes on hold: its checks are running: check."
+        );
+        assert_eq!(
+            QueuedView::degraded(status(None, None)).message,
+            "Queued. Live queue status is temporarily unavailable; check the queue."
         );
     }
 

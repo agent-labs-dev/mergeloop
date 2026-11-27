@@ -582,6 +582,19 @@ mod tests {
     }
 
     #[test]
+    fn a_passed_commit_missing_a_required_check_waits_for_it_by_name() {
+        // Every reported check passed, but the required `check` never reported: the verdict
+        // still waits, naming the missing check, so the hold can name it too.
+        let c = checks(&[("lint", CheckState::Passed)]);
+        let required = ["check".into()];
+        assert_eq!(
+            c.verdict(&required),
+            (CheckState::Pending, vec!["check".to_owned()])
+        );
+        assert_eq!(c.unreported(&required), ["check"]);
+    }
+
+    #[test]
     fn a_required_check_is_unreported_only_once_every_reported_check_is_done() {
         let required = ["test".into(), "sift".into()];
         let running = checks(&[("test", CheckState::Passed), ("build", CheckState::Pending)]);

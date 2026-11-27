@@ -32,8 +32,13 @@ pub enum Hold {
     FairUseLimit,
     /// Getting ready off the lane: the agent resolves its conflict with the trunk.
     PrepRebasing,
-    /// Getting ready off the lane: its checks run.
-    PrepChecks,
+    /// Getting ready off the lane: its checks run, naming the required checks still pending.
+    PrepChecks {
+        /// The required checks it waits for, bottom layer first. Empty only for a hold saved
+        /// before they were named, which the next tick names again.
+        #[serde(default)]
+        waiting: Vec<String>,
+    },
     /// Getting ready off the lane: the agent fixes its failed checks.
     PrepFixing,
     /// The agent is reviewing it, the queue's first gate.
@@ -75,7 +80,7 @@ impl Hold {
             | Hold::ReviewChanges
             | Hold::UnresolvedThreads { .. } => true,
             Hold::PrepRebasing
-            | Hold::PrepChecks
+            | Hold::PrepChecks { .. }
             | Hold::PrepFixing
             | Hold::Draft
             | Hold::ReviewRequired
@@ -93,7 +98,7 @@ impl Hold {
     pub fn of_prep(&self) -> bool {
         matches!(
             self.innermost(),
-            Hold::PrepRebasing | Hold::PrepChecks | Hold::PrepFixing
+            Hold::PrepRebasing | Hold::PrepChecks { .. } | Hold::PrepFixing
         )
     }
 
@@ -151,7 +156,12 @@ impl fmt::Display for Hold {
             Hold::NoSubscription => f.write_str("private repos need a MergeLoop subscription"),
             Hold::FairUseLimit => f.write_str("over the fair-use limit of public repos"),
             Hold::PrepRebasing => f.write_str("the agent is resolving its conflict"),
-            Hold::PrepChecks => f.write_str("its checks are running"),
+            Hold::PrepChecks { waiting } if waiting.is_empty() => {
+                f.write_str("its checks are running")
+            }
+            Hold::PrepChecks { waiting } => {
+                write!(f, "its checks are running: {}", waiting.join(", "))
+            }
             Hold::PrepFixing => f.write_str("the agent is fixing its checks"),
             Hold::Reviewing => f.write_str("the agent is reviewing it"),
             Hold::ReviewAsks => {
@@ -187,6 +197,21 @@ mod tests {
         assert_eq!(hold.to_string(), "#7 is not ready: the PR is a draft");
         assert_eq!(hold.innermost(), &Hold::Draft);
         assert_eq!(hold.layer(), Some(7));
+    }
+
+    #[test]
+    fn prep_checks_names_the_checks_it_waits_for() {
+        let hold = Hold::PrepChecks {
+            waiting: vec!["check".into(), "sift".into()],
+        };
+        assert_eq!(hold.to_string(), "its checks are running: check, sift");
+        assert!(hold.of_prep());
+        assert!(!hold.of_review());
+        let unnamed = Hold::PrepChecks { waiting: vec![] };
+        assert_eq!(unnamed.to_string(), "its checks are running");
+        // A hold saved before the checks were named still reads.
+        let legacy: Hold = serde_json::from_str(r#"{"kind":"prep_checks"}"#).unwrap();
+        assert_eq!(legacy, unnamed);
     }
 
     #[test]

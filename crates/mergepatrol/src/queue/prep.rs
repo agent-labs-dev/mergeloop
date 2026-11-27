@@ -290,7 +290,7 @@ pub(super) async fn hold(
     }
     let required = gh.branch_rules(&key.repo, &key.trunk).await?.checks;
     // Bottom to top: a fix moves the layers above it.
-    let mut waiting = false;
+    let mut waiting: Vec<String> = Vec::new();
     for (layer, pr) in unit.layers.iter().enumerate() {
         let sha = pr.head_ref_oid.as_str();
         let checks = gh.checks(&key.repo, sha).await?;
@@ -304,13 +304,13 @@ pub(super) async fn hold(
                     .collect();
                 if !runs.is_empty() && !ctx.prep.rerun_refused(key, unit.number, sha) {
                     let runs = runs.into_iter().collect();
-                    let failed = names;
                     let wanted = want(Work::Rerun {
                         layer,
-                        failed,
+                        failed: names.clone(),
                         runs,
                     });
-                    return Ok(Some(ctx.prep.want(id, Hold::PrepChecks, wanted)));
+                    let hold = Hold::PrepChecks { waiting: names };
+                    return Ok(Some(ctx.prep.want(id, hold, wanted)));
                 }
                 let used = unit.fixes_used(gh, &key.repo).await?;
                 return Ok((used < settings.fix_ci.allowed()).then(|| {
@@ -328,11 +328,15 @@ pub(super) async fn hold(
                     Some(running) => running,
                     None => silent && gh.workflows_running(&key.repo, sha).await?,
                 };
-                waiting |= (!silent || running) && ctx.prep.waited(&id, head) < CHECKS_TIMEOUT;
+                if (!silent || running) && ctx.prep.waited(&id, head) < CHECKS_TIMEOUT {
+                    waiting.extend(names);
+                }
             }
         }
     }
-    Ok(waiting.then_some(Hold::PrepChecks))
+    waiting.sort();
+    waiting.dedup();
+    Ok((!waiting.is_empty()).then_some(Hold::PrepChecks { waiting }))
 }
 
 /// Starts what the ticks of `repo` ask for, until the queue stops, which stops the jobs too.

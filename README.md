@@ -352,6 +352,7 @@ A GitHub token reaches only the repos GitHub lets it read: MergeLoop cannot tell
 | `get_changelog` | MergeLoop's newest changelog entries | |
 | `get_session` | Who a sign-in is for, and its workspaces: `signed_out` for a GitHub token | |
 | `list_queue` | The queues, in the order they take PRs: a repo's, or the workspace's | Without `repo` |
+| `list_open_pulls` | The open PRs from when they open, queued or not, with draft, labels, reviews, checks and where the queue has each: a repo's, or the workspace's | Without `repo` |
 | `list_events` | A repo's queue events, newest first | |
 | `list_history` | The PRs that left the queue: merged, ejected, or removed | Yes |
 | `get_history_stats` | The queue's numbers over a window | Yes |

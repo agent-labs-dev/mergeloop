@@ -2510,6 +2510,90 @@ mod tests {
         assert_eq!(names, ["o/r"]);
     }
 
+    /// Open PRs show from when they open, queued or not, in the repos whose queue runs.
+    #[sqlx::test(migrations = false)]
+    async fn open_pulls_list_drafts_and_queued_prs_with_their_queue_state(pool: PgPool) {
+        use mergepatrol_core::{Entry, EntryState, Lane, PrSummary};
+        use mergepatrol_store::LaneKey;
+        let node = |number: u64, draft: bool, author: &str| {
+            serde_json::json!({
+                "number": number, "state": "OPEN", "title": format!("PR {number}"), "body": "",
+                "isDraft": draft, "isCrossRepository": false, "reviewDecision": null,
+                "baseRefName": "main", "headRefName": format!("b{number}"), "headRefOid": "abc",
+                "labels": { "nodes": [] }, "url": format!("https://github.com/o/r/pull/{number}"),
+                "createdAt": "2026-11-01T00:00:00Z", "additions": 1, "deletions": 0,
+                "changedFiles": 1,
+                "author": { "__typename": "User", "login": author, "avatarUrl": "a" },
+                "latestOpinionatedReviews": { "nodes": [] }, "reviewRequests": { "nodes": [] },
+                "commits": { "nodes": [] },
+            })
+        };
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let heard = asked.clone();
+        let github = fake::github(move |call| match (call.token, call.path) {
+            ("ghu_tok", "/graphql") => {
+                let vars: serde_json::Value = serde_json::from_str(call.body).unwrap();
+                heard.lock().push(vars["variables"]["name"].to_string());
+                let nodes = [node(7, true, "ada"), node(8, false, "bob")];
+                let data = serde_json::json!({ "data": { "repository": {
+                    "pullRequests": { "nodes": nodes } } } });
+                (200, data.to_string())
+            }
+            _ => (404, "{}".into()),
+        })
+        .await;
+        let (router, cookie) = with_github(pool.clone(), github).await;
+        let (store, _) = store_and_vault(pool).await;
+        let repo = RepoName::parse("o/r").unwrap();
+        // `o/r` queues; `o/y` the user reads too, but its queue does not run.
+        store.set_has_config(1, &repo, true).await.unwrap();
+        let off = RepoName::parse("o/y").unwrap();
+        store.set_has_config(1, &off, false).await.unwrap();
+        let key = LaneKey {
+            installation_id: 1,
+            repo: repo.clone(),
+            trunk: "main".into(),
+        };
+        let lane = Lane {
+            entries: vec![Entry {
+                number: 8,
+                priority: false,
+                state: EntryState::Waiting,
+                summary: PrSummary::default(),
+                layers: Vec::new(),
+                heads: Vec::new(),
+                recheck: None,
+            }],
+            ..Lane::default()
+        };
+        store.save_lane(&key, &lane).await.unwrap();
+
+        let (status, body) = json(&router, "GET", "/api/w/1/pulls", &cookie, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pulls = body.as_array().unwrap();
+        assert_eq!(pulls.len(), 2, "{body}");
+        assert_eq!(asked.lock().as_slice(), ["\"r\""]);
+        let (draft, queued) = (&pulls[0], &pulls[1]);
+        assert_eq!(
+            (draft["number"].as_u64(), draft["draft"].as_bool()),
+            (Some(7), Some(true))
+        );
+        assert!(draft["queue"].is_null(), "{draft}");
+        assert_eq!(queued["number"], 8);
+        assert_eq!(queued["queue"]["state"], "waiting", "{queued}");
+        assert_eq!(queued["url"], "https://github.com/o/r/pull/8");
+
+        let path = "/api/w/1/pulls?author=ADA";
+        let (_, body) = json(&router, "GET", path, &cookie, None).await;
+        let numbers: Vec<_> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| &p["number"])
+            .collect();
+        assert_eq!(numbers, [7]);
+    }
+
     #[sqlx::test(migrations = false)]
     async fn a_token_is_checked_against_a_faked_github(pool: PgPool) {
         let calls = Arc::new(Mutex::new(Vec::new()));

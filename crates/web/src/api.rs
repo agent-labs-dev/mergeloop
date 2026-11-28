@@ -1352,6 +1352,99 @@ pub(crate) async fn pull_status(
     }))
 }
 
+/// The most open PRs `list_open_pulls` reads of each repo: GitHub's page.
+const OPEN_PULLS: u32 = 100;
+
+/// An open PR, queued or not, and where the queue has it.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct OpenPullView {
+    /// `owner/name`.
+    pub repo: String,
+    pub number: u32,
+    pub draft: bool,
+    /// The branch it merges into.
+    pub base_ref: String,
+    pub labels: Vec<String>,
+    #[serde(flatten)]
+    pub pull: PullView,
+    /// The PR in the dashboard.
+    pub dashboard_url: String,
+    /// Its place in the queue, as `pull_status` says it. Null when it is not queued.
+    pub queue: Option<crate::v1::QueueView>,
+    /// It last left the queue ejected, and is not queued again.
+    pub ejected: Option<crate::v1::EjectedView>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OpenPullsQuery {
+    /// Every repo the queue runs on without one.
+    repo: Option<String>,
+    /// A GitHub login. Every author without one.
+    author: Option<String>,
+}
+
+/// The open PRs, from when they open: drafts, PRs in review and queued PRs, each with where the
+/// queue has it. Read from GitHub as the caller, so each caller spends their own rate limit.
+pub(crate) async fn open_pulls(
+    State(app): State<AppState>,
+    caller: Caller,
+    Path(id): Path<u64>,
+    Query(q): Query<OpenPullsQuery>,
+) -> Result<Json<Vec<OpenPullView>>, ApiError> {
+    let repo = q
+        .repo
+        .map(|r| RepoName::parse(&r).ok_or(ApiError::bad_request("repo must be owner/name")))
+        .transpose()?;
+    let (id, repos) = match repo {
+        Some(repo) => (caller.repo(&app, id, &repo).await?, vec![repo]),
+        None => {
+            let (id, readable) = caller.workspace_repos(&app, id).await?;
+            let mut repos: Vec<RepoName> = app
+                .store
+                .repos()
+                .await?
+                .into_iter()
+                .filter(|s| s.installation_id == id && s.on() && readable.contains(&s.repo))
+                .map(|s| s.repo)
+                .collect();
+            repos.sort_by_key(ToString::to_string);
+            (id, repos)
+        }
+    };
+    let gh = app.github.as_user(&caller.github_token(&app)?)?;
+    let mut views = Vec::new();
+    for repo in repos {
+        let pulls: Vec<_> = as_user(gh.open_pull_requests(&repo, OPEN_PULLS).await, &repo)?
+            .into_iter()
+            .filter(|pr| {
+                q.author.as_deref().is_none_or(|login| {
+                    pr.summary()
+                        .author
+                        .is_some_and(|a| a.login.eq_ignore_ascii_case(login))
+                })
+            })
+            .collect();
+        let numbers: Vec<_> = pulls.iter().map(|pr| pr.number).collect();
+        let states = crate::v1::statuses(&app, &repo, Some(id), &numbers).await?;
+        for (pr, state) in pulls.into_iter().zip(states) {
+            let pull = pr.summary().into();
+            views.push(OpenPullView {
+                repo: state.repo,
+                number: state.number,
+                draft: pr.is_draft,
+                base_ref: pr.base_ref_name,
+                labels: pr.labels,
+                pull,
+                dashboard_url: state.url,
+                queue: state.queue,
+                ejected: state.ejected,
+            });
+        }
+    }
+    Ok(Json(views))
+}
+
 /// Puts the queue labels on the PR with `token`, and wakes the repo's queue.
 pub(crate) async fn queue(
     app: &AppState,

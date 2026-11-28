@@ -440,19 +440,18 @@ const PR_FIELDS: &str = concat!(
 const SNAPSHOT_PAGE: u32 = 25;
 
 impl AsUser {
-    /// The open PRs into `base`, up to `limit`, updated last first. Their code owners are not
-    /// checked, nor their files read: `review_decision` leaves out a code owner's review it
-    /// requires.
+    /// The open PRs into any branch, a stack's layers too, up to `limit` (at most 100), updated
+    /// last first. Their code owners are not checked, nor their files read: `review_decision`
+    /// leaves out a code owner's review it requires.
     pub async fn open_pull_requests(
         &self,
         repo: &RepoName,
-        base: &str,
         limit: u32,
     ) -> Result<Vec<PullRequest>> {
         let query = format!(
-            "query($owner: String!, $name: String!, $base: String!, $limit: Int!) {{
+            "query($owner: String!, $name: String!, $limit: Int!) {{
               repository(owner: $owner, name: $name) {{
-                pullRequests(states: OPEN, baseRefName: $base, first: $limit, orderBy: {{ field: UPDATED_AT, direction: DESC }}) {{
+                pullRequests(states: OPEN, first: $limit, orderBy: {{ field: UPDATED_AT, direction: DESC }}) {{
                   nodes {{ {} }}
                 }}
               }}
@@ -463,7 +462,7 @@ impl AsUser {
             .graphql(
                 "open pull requests",
                 &query,
-                json!({ "owner": repo.owner, "name": repo.name, "base": base, "limit": limit }),
+                json!({ "owner": repo.owner, "name": repo.name, "limit": limit }),
             )
             .await?;
         Ok(serde_json::from_value(
